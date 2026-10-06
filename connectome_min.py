@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from itertools import takewhile
 from config import (CHUNK_TOKENS, DEMO, GAP_RATIO, HEAD_CHUNKS, MAX_FOLD_LEVEL,
                     MERGE_THRESHOLD, SLACK, TAIL_TOKENS)   # config.py documents every knob
+import tiling                                      # the self-contained cut solver
 @dataclass
 class Chunk: id: str; seq: int; text: str; tokens: int; salience: float = 1.0
 @dataclass
@@ -63,53 +64,13 @@ def runs(items, adjacent):
         else:
             out.append([x])
     return out
-_VIOLATION = 1_000_000      # folding past a shape cap: phase-B territory, priced above any in-cap cut
 def relevance_cut(a, caps, target, window):          # the ideal cut: P is never consulted
-    """The ideal cut as a TILING of the timeline by pyramid nodes (kv-control.ts:268): each chunk raw, or
-    covered by exactly one summary -- so group atomicity holds by construction and no repair pass
-    (production's projectToValidCut) or fixpoint exists. One table, dp[position][tokens] = the
-    minimum-badness tiling at exactly that token count -- no Pareto frontier, no dominance pruning:
-    per token count there is nothing to dominate with. Edges are raw, or one node spanning its
-    first..last foldable leaf, priced tokens + badness (salience x level, cap violations priced past
-    any in-cap cut). Selection is lexicographic: fit the window, prefer not violating caps, land near
-    target. The phase-based solver this replaced is byte-identical on the documented runs and lives
-    in legacy/relevance_cut.py."""
-    chunks = a["chunks"]; n = len(chunks)
-    pos = {c.id: i for i, c in enumerate(chunks)}
-    edges = [[(i + 1, c.tokens, 0.0, ((c.id, 0),))] for i, c in enumerate(chunks)]  # raw is always an option
-    for s in a["summaries"].values():
-        idx = sorted(pos[l] for l in s.leaves if l in pos)
-        if len(idx) != len(s.leaves):
-            continue                                   # a tiling needs every leaf to resolve
-        # A node folds its UNPROTECTED leaves; protected ones punch holes and render raw (the
-        # carve-out the legacy phase solver made with `foldable`). One edge spans first..last
-        # foldable leaf, carrying the recall once plus the raw cost of the holes, so the group
-        # stays atomic.
-        foldable = [j for j in idx if caps[chunks[j].id] >= 0]
-        if not foldable:
-            continue                                   # every leaf protected: nothing to fold
-        first, last = foldable[0], foldable[-1]
-        assigns = tuple((chunks[j].id, 0 if caps[chunks[j].id] < 0 else s.level)
-                        for j in range(first, last + 1))
-        etok = s.tokens + sum(chunks[j].tokens for j in range(first, last + 1)
-                              if caps[chunks[j].id] < 0)
-        bad = sum((_VIOLATION if s.level > caps[chunks[j].id] else 0) +
-                  chunks[j].salience * s.level * (1 + 0.01 * j / n)   # taste: fold older first
-                  for j in foldable)
-        edges[first].append((last + 1, etok, bad, assigns))
-    dp = [{0: (0.0, {})}] + [{} for _ in range(n)]   # dp[i][tokens] = (min badness, F)
-    for i in range(n):
-        for t, (bad, F) in dp[i].items():
-            for j, etok, ebad, assigns in edges[i]:
-                nt, nb = t + etok, bad + ebad
-                if nt not in dp[j] or nb < dp[j][nt][0]:
-                    dp[j][nt] = (nb, {**F, **dict(assigns)})
-    final = dp[n]
-    feasible = [t for t in final if t <= window]
-    if not feasible:                                   # escalated: fold floor above W
-        return final[min(final)][1]
-    return final[min(feasible, key=lambda t: (final[t][0] >= _VIOLATION,
-                                              abs(t - target), final[t][0]))][1]
+    """Delegated to the standalone tiling solver (tiling.py: plain data in, one dict out). The
+    phase-based solver it replaced is byte-identical on the documented runs and lives in
+    legacy/relevance_cut.py."""
+    return tiling.cut([(c.id, c.tokens, c.salience) for c in a["chunks"]],
+                      [(s.level, s.leaves, s.tokens) for s in a["summaries"].values()],
+                      caps, target, window)
 def suffix_adopt(a, carried, carried_units, ideal, P):
     """Adopt the ideal's NEWEST changes only. Perturbation is prefix-based (kv_cost), so a later
     adoption boundary is monotonically cheaper -- the cheapest affordable partial is a bisect
