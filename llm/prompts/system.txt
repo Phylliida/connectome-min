@@ -1,0 +1,8 @@
+You are forming a memory of an earlier part of this conversation. The context you see is continuous with your experience - what you read is what happened. Write authentically about what occurred.
+
+# OURS, not production's. Production serves the host's LIVE IDENTITY PROMPT as the request's system
+# turn -- `...(ctx.systemPrompt ? { system: ctx.systemPrompt } : {})`
+# (ref/context-manager/src/strategies/autobiographical.ts:5604), supplied by
+# ref/connectome-host/src/framework-strategy.ts -- and sends no synthetic summarizer header at all.
+# This artifact has no live agent identity, so the text below is a stand-in of our own; it is NOT
+# `summarySystemPrompt`, which production declares (types/strategy.ts:1485) and never sends.
