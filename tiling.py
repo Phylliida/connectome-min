@@ -17,25 +17,27 @@ def cut(chunks, summaries, caps, target, window):
     with leaves chunk ids; caps: {chunk id: max fold level, -1 = protected}. Returns
     {chunk id: level} -- the ideal cut. The trust region is the caller's business."""
     n = len(chunks)
-    pos = {cid: i for i, (cid, _t, _s) in enumerate(chunks)}
-    edges = [[(i + 1, tokens, 0.0, ((cid, 0),))] for i, (cid, tokens, _s) in enumerate(chunks)]
-    for level, leaves, stokens in summaries:         # raw is always an option; these are the folds
+    ids = [c[0] for c in chunks]                   # transpose to columns up front: every loop below
+    toks = [c[1] for c in chunks]                  # reads positionally -- toks[j], cap[j] -- with no
+    sals = [c[2] for c in chunks]                  # chunks[j][1]-style indexing
+    cap = [caps[cid] for cid in ids]
+    pos = {cid: i for i, cid in enumerate(ids)}
+    edges = [[(i + 1, toks[i], 0.0, ((ids[i], 0),))] for i in range(n)]   # raw is always an option
+    for level, leaves, stokens in summaries:                             # these are the folds
         idx = sorted(pos[l] for l in leaves if l in pos)
         if len(idx) != len(leaves):
             continue                                   # a tiling needs every leaf to resolve
         # A node folds its UNPROTECTED leaves; protected ones punch holes and render raw. One
         # edge spans first..last foldable leaf, carrying the recall once plus the raw cost of
         # the holes, so the group stays atomic.
-        foldable = [j for j in idx if caps[chunks[j][0]] >= 0]
+        foldable = [j for j in idx if cap[j] >= 0]
         if not foldable:
             continue                                   # every leaf protected: nothing to fold
         first, last = foldable[0], foldable[-1]
-        assigns = tuple((chunks[j][0], 0 if caps[chunks[j][0]] < 0 else level)
-                        for j in range(first, last + 1))
-        etok = stokens + sum(chunks[j][1] for j in range(first, last + 1)
-                             if caps[chunks[j][0]] < 0)
-        bad = sum((_VIOLATION if level > caps[chunks[j][0]] else 0) +
-                  chunks[j][2] * level * (1 + 0.01 * j / n)   # taste: fold older first
+        assigns = tuple((ids[j], 0 if cap[j] < 0 else level) for j in range(first, last + 1))
+        etok = stokens + sum(toks[j] for j in range(first, last + 1) if cap[j] < 0)
+        bad = sum((_VIOLATION if level > cap[j] else 0) +
+                  sals[j] * level * (1 + 0.01 * j / n)        # taste: fold older first
                   for j in foldable)
         edges[first].append((last + 1, etok, bad, assigns))
     dp = [{0: (0.0, {})}] + [{} for _ in range(n)]   # dp[i][tokens] = (min badness, F)
