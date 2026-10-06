@@ -62,17 +62,17 @@ def tick(log, model, fork_here, label, demanded=(), pressure=True):
     while True:
         item = next((i for kind in ("L1", "merge")
                      for i in work(log, demanded, pressure)
-                     if i[1] == kind and i[0] not in attempted), None)
+                     if i.kind == kind and i.target not in attempted), None)
         if item is None:
             return
-        attempted.add(item[0])
+        attempted.add(item.target)
         v = len(log)
-        if fork_here is not None and item[1] == "L1" and not forked:
+        if fork_here is not None and item.kind == "L1" and not forked:
             forked = True                             # fault injection, one fork per turn: it lands
             emit(log, "msg", 900_000 + fork_here, [("text", "a forked branch lands mid-flight")])
         outcome = step(log, item, model, v)           # while the first call of the drain is out
-        print(f"  {label}        {outcome:<15} {item[0][:30]:<30} "
-              f"attempts={attempts(log, item[0])} streak={streak(log, item[0])}")
+        print(f"  {label}        {outcome:<15} {item.target[:30]:<30} "
+              f"attempts={attempts(log, item.target)} streak={streak(log, item.target)}")
 
 
 def content(t, i):
@@ -181,11 +181,11 @@ def demo():
     for target in stuck:
         print(f"  explicit half: {target} attempts={attempts(log, target)} "
               f"stalled={stalled(log, target)}; derivable work for it: "
-              f"{[i[0] for i in work(log, demand) if i[0] == target]}")
+              f"{[i.target for i in work(log, demand) if i.target == target]}")
         clear_debt(log, target, "operator: the request shape changed")
         print(f"                 clear_debt({target}) -> attempts={attempts(log, target)} "
               f"stalled={stalled(log, target)}, derivable again: "
-              f"{[i[0] for i in work(log, demand) if i[0] == target]}")
+              f"{[i.target for i in work(log, demand) if i.target == target]}")
 
 
 if __name__ == "__main__":

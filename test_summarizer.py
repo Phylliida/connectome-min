@@ -1110,7 +1110,7 @@ def test_demand_path_bypasses_the_holdback():
         check("the two newest chunks are held back, and the head chunk is never compressed at all",
               [c.id for c in a["chunks"] if c.id not in a["l1_of"]], ["c0", "c3", "c4"])
         check("so the derivation derives nothing for them",
-              [i[0] for i in M.work(log) if i[1] == "L1"], [])
+              [i.target for i in M.work(log) if i.kind == "L1"], [])
         plan = cm.plan_controlled_frontier(a, {}, 1200, 1200, ())
         check_true("the plan escalated: even the ideal cut is over W", plan["tokens"] > 1200,
                    f"ideal {plan['tokens']}")
@@ -1119,7 +1119,7 @@ def test_demand_path_bypasses_the_holdback():
         demanded = M.demanded_chunks(plan["produced"], a)
         check("the consumer maps the range back onto a closed chunk", sorted(demanded), ["c3"])
         check("...and demand is what puts it back into the derivation",
-              [i[0] for i in M.work(log, demanded) if i[1] == "L1"], ["L1:c3"])
+              [i.target for i in M.work(log, demanded) if i.kind == "L1"], ["L1:c3"])
         check("a plan that did NOT escalate produces nothing",
               cm.plan_controlled_frontier(a, {}, 100000, 100000, ())["produced"], [])
     finally:
@@ -1172,18 +1172,18 @@ def test_clear_restores_derivable_work():
     burn(log, engine)
     check("the unit burned every attempt", M.attempts(log, "L1:c1"), M.MAX_ATTEMPTS)
     check("so it is terminal debt", M.stalled(log, "L1:c1"), True)
-    check("...and it is no longer derived work", [i[0] for i in M.work(log)], [])
+    check("...and it is no longer derived work", [i.target for i in M.work(log)], [])
     check("the log says so as an event, not as an edited structure",
-          [e for e in log if e[0] == "clear"], [])
+          [e for e in log if isinstance(e, M.Clear)], [])
     M.clear_debt(log, "L1:c1", "operator: request shape changed")
     check("the clear is one event in the log",
-          [e for e in log if e[0] == "clear"], [("clear", "L1:c1", "operator: request shape changed")])
+          [e for e in log if isinstance(e, M.Clear)], [M.Clear("L1:c1", "operator: request shape changed")])
     check("it resets the count the debt is a projection of", M.attempts(log, "L1:c1"), 0)
-    check("so the unit is derivable work again", [i[0] for i in M.work(log)], ["L1:c1"])
+    check("so the unit is derivable work again", [i.target for i in M.work(log)], ["L1:c1"])
     check("a retry starts canonical: the reshape reason is gone with the debt",
           M.last_reason(log, "L1:c1"), None)
     check("everything before the clear is still in the log",
-          len([e for e in log if e[0] == "fail"]), M.MAX_ATTEMPTS)
+          len([e for e in log if isinstance(e, M.Fail)]), M.MAX_ATTEMPTS)
 
     later = session(4)                                   # the automatic half, no clear event
     engine = S.Summarizer(S.MockModel({"c1": ["refusal"] * M.MAX_ATTEMPTS}))
@@ -1191,7 +1191,7 @@ def test_clear_restores_derivable_work():
     check("the unit is terminal debt", M.stalled(later, "L1:c1"), True)
     mint(later, "L1:c1", "L1-c1", 1, ("c1",), "the memory a later shape produced")
     check("a later mint of the same span clears it with no event at all",
-          (M.stalled(later, "L1:c1"), [e for e in later if e[0] == "clear"]), (False, []))
+          (M.stalled(later, "L1:c1"), [e for e in later if isinstance(e, M.Clear)]), (False, []))
 
 
 def test_stale_discard_burns_no_attempt():
@@ -1212,7 +1212,7 @@ def test_stale_discard_burns_no_attempt():
     check("nothing was minted from the stale result", M.mints(log), set())
     check("...and the discard burns no attempt", M.attempts(log, "L1:c1"), 0)
     check("...so the unit is not stalled and stays derivable",
-          (M.stalled(log, "L1:c1"), [i[0] for i in M.work(log) if i[0] == "L1:c1"]),
+          (M.stalled(log, "L1:c1"), [i.target for i in M.work(log) if i.target == "L1:c1"]),
           (False, ["L1:c1"]))
     for _ in range(M.MAX_ATTEMPTS + 1):
         M.emit(log, "fail", "L1:c1", "stale")
@@ -1261,7 +1261,7 @@ def test_compressible_zone_is_the_policys_boundary():
     bare = session(12)
     a2 = M.archive(bare)
     zone2 = cm.raw_zone(a2, ())
-    derived = [i[2] for i in M.work(bare) if i[1] == "L1"]
+    derived = [i.payload for i in M.work(bare) if i.kind == "L1"]
     check("the derivation names every chunk outside the zone, and nothing inside it",
           (derived, [cid for cid in derived if cid in zone2]), (["c1", "c2", "c3", "c4", "c5", "c6",
                                                                "c7", "c8", "c9", "c10"], []))
@@ -1276,7 +1276,7 @@ def test_compressible_zone_is_the_policys_boundary():
     check("a pin joins the zone, which is what keeps it out of the derivation",
           sorted(cm.raw_zone(a3, M.protected_ids(pinned, a3)) - zone2), ["c2"])
     check("so no L1 work is derived for it",
-          [i[2] for i in M.work(pinned) if i[1] == "L1" and i[2] in ("c0", "c2", "c11")], [])
+          [i.payload for i in M.work(pinned) if i.kind == "L1" and i.payload in ("c0", "c2", "c11")], [])
 
 
 def test_head_section_in_a_real_l1_request():
@@ -1338,7 +1338,7 @@ def test_overlap_guard_is_a_span_test():
           [M.chunk_spans(log)[cid] for cid in ("c1", "c2", "c3")],
           [(5, 5, 0), (5, 5, 1), (5, 5, 2)])
     check("the derivation hands out all three",
-          [i[0] for i in M.work(log) if i[1] == "L1"], ["L1:c1", "L1:c2", "L1:c3"])
+          [i.target for i in M.work(log) if i.kind == "L1"], ["L1:c1", "L1:c2", "L1:c3"])
     mint(log, "L1:c3", "L1-c3", 1, ("c3",), "MEMORY-OF-THE-THIRD-SLICE")
 
     for n in range(14, 18):                              # depth past the strip threshold
@@ -1355,7 +1355,7 @@ def test_overlap_guard_is_a_span_test():
           M.overlap_blocked(log, after), [("c1", "L1-c3")])
     check("...and that the arm is not the exact one", M.covered_by_l1(log, after)["c1"][1], False)
     check("so no L1 work is derived for it -- and c1 is the only compressible chunk here",
-          ([i[0] for i in M.work(log)], [c.id for c in after["chunks"]
+          ([i.target for i in M.work(log)], [c.id for c in after["chunks"]
                                          if c.id not in cm.raw_zone(after, ())]), ([], ["c1"]))
 
 
@@ -1392,16 +1392,16 @@ def test_merge_span_guard():
           ["wide-span quarantine -- span 983 msgs > limit 900 (base 150 x 6^1)"])
     check("the quarantined candidate no longer counts toward the six -- and the run it strands "
           "can never grow, so the interior escape consolidates it at 2 (:6718-6721)",
-          [i[0] for i in M.work(wide) if i[1] == "merge"],
+          [i.target for i in M.work(wide) if i.kind == "merge"],
           ["L5:L4-n0+L4-n1+L4-n2+L4-n3+L4-n4"])
     check("...while the L1 work for the session's own chunks is unaffected",
-          len([i for i in M.work(wide) if i[1] == "L1"]) > 0, True)
+          len([i for i in M.work(wide) if i.kind == "L1"]) > 0, True)
 
     long = candidates("c150")                            # 583 messages: long, legal at an L4
     check("a 583-message L4 is NOT quarantined: that is what the level scaling buys",
           [r for _sid, r in M.merge_exclusions(long) if _sid == "L4-x"], [])
     check("so six eligible candidates do merge",
-          [i[0] for i in M.work(long) if i[1] == "merge"],
+          [i.target for i in M.work(long) if i.kind == "merge"],
           ["L5:L4-n0+L4-n1+L4-n2+L4-n3+L4-n4+L4-x"])
 
     flat = candidates("c150")                            # the same fixture, one level down
@@ -1424,13 +1424,13 @@ def test_merge_candidacy_is_an_odometer():
     waiting for a sixth that can never arrive (:6718-6721)."""
     full = memories(session(7))                        # L1s c0..c6: one contiguous run of 7
     check("six contiguous siblings at the live end merge, the first group only",
-          [i[0] for i in M.work(full) if i[1] == "merge"],
+          [i.target for i in M.work(full) if i.kind == "merge"],
           ["L2:L1-c0+L1-c1+L1-c2+L1-c3+L1-c4+L1-c5"])
 
     holed = memories(session(7), skip=("c3",))         # the same six ids, split 3 + 3 by one hole
     check("a hole breaks the run: no six-merge forms, and the half the hole strands "
           "consolidates at 3 instead",
-          [i[0] for i in M.work(holed) if i[1] == "merge"],
+          [i.target for i in M.work(holed) if i.kind == "merge"],
           ["L2:L1-c0+L1-c1+L1-c2"])
 
     stranded = memories(session(7), skip=("c4", "c5", "c6"))
@@ -1438,14 +1438,14 @@ def test_merge_candidacy_is_an_odometer():
     mint(stranded, "L1:c5", "L1-c5", 1, ("c5",), "MEMORY-c5")       # the run ahead of them can
     mint(stranded, "L2:x", "L2-x", 2, ("L1-c4", "L1-c5"), "MEMORY-x")  # never grow past them
     check("a four-run whose successor is already merged consolidates whole, below the six",
-          [i[0] for i in M.work(stranded) if i[1] == "merge"],
+          [i.target for i in M.work(stranded) if i.kind == "merge"],
           ["L2:L1-c0+L1-c1+L1-c2+L1-c3"])
 
     lone = session(7)                                  # two isolated L1s, each a run of one --
     mint(lone, "L1:c0", "L1-c0", 1, ("c0",), "MEMORY-c0")            # one interior, one at the
     mint(lone, "L1:c2", "L1-c2", 1, ("c2",), "MEMORY-c2")            # live end
     check("but a run of one never merges, interior or not",
-          [i[0] for i in M.work(lone) if i[1] == "merge"], [])
+          [i.target for i in M.work(lone) if i.kind == "merge"], [])
 
 
 def test_pressure_gates_l1_derivation():
@@ -1454,11 +1454,11 @@ def test_pressure_gates_l1_derivation():
     holdback and the gate. Eager stays the default, so every fixture above reads unchanged."""
     log = session(4)
     check("under pressure the derivation is production's eager one",
-          [i[0] for i in M.work(log)], ["L1:c1", "L1:c2"])
+          [i.target for i in M.work(log)], ["L1:c1", "L1:c2"])
     check("a calm session derives nothing: no folding pressure, no model calls",
-          [i[0] for i in M.work(log, pressure=False)], [])
+          [i.target for i in M.work(log, pressure=False)], [])
     check("...and demand opens the gate, as it opens the holdback",
-          [i[0] for i in M.work(log, ("c2",), pressure=False)], ["L1:c2"])
+          [i.target for i in M.work(log, ("c2",), pressure=False)], ["L1:c2"])
 
 
 def test_config_status_integrity():

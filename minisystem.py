@@ -15,21 +15,37 @@ from config import (ACTIONS, DEMO, GRACE, IMAGE_CHARS, IMAGE_STRIP_DEPTH_TOKENS,
                     RECALL_PAIR_OVERHEAD, TAIL_HOLDBACK, TRUNCATION_NOTE)
 
 # ================== the log: the only store. Messages carry blocks ==================
-# ("msg", seq, blocks) | blocks: ("text"|"tool_use"|"tool_result", s) | ("image",)
-# ("mint", target, id, level, children, text, ownedSpans) | ("fail", target, reason) | ("clear", target, why)
-# ("frontier", {chunkId: level}) | ("protect", firstSeq, lastSeq, minLevel, maxLevel, why)
-def emit(log, *event):
-    log.append(event)
-    return event
+# Named event records (namedtuples: immutable, still unpack like tuples): the discriminated union
+# the log appends. `kind` strings at emit() map to these; reads are isinstance + field names.
+Msg = namedtuple("Msg", "seq blocks")            # blocks: ("text"|"tool_use"|"tool_result", s) | ("image",)
+Mint = namedtuple("Mint", "target id level children text owned")   # owned: spans stamped at mint time
+Fail = namedtuple("Fail", "target reason")
+Clear = namedtuple("Clear", "target why")
+Emission = namedtuple("Emission", "levels")      # the frontier the host last emitted
+Protect = namedtuple("Protect", "first last lo hi why")
+EVENTS = {"msg": Msg, "mint": Mint, "fail": Fail,
+          "clear": Clear, "frontier": Emission, "protect": Protect}
+
+# Records carried between projections (same drop-in discipline):
+Span = namedtuple("Span", "id first last tokens text salience group")
+Range = namedtuple("Range", "first last ordinal")
+Work = namedtuple("Work", "target kind payload")
+Cand = namedtuple("Cand", "id first last")
 
 
-def commit(log, v, *event):
+def emit(log, kind, *fields):
+    e = EVENTS[kind](*fields)
+    log.append(e)
+    return e
+
+
+def commit(log, v, kind, *fields):
     """The write side is compare-and-swap: append only if the log still matches the version the
     attempt read before its slow call. A mid-flight fork is a failed CAS -- and a failed CAS is
     not an attempt, which is all "stale burns nothing" means."""
     if len(log) != v:
         return None
-    return emit(log, *event)
+    return emit(log, kind, *fields)
 
 
 def project(log, init, step):
@@ -44,7 +60,7 @@ def project(log, init, step):
 
 
 def messages(log):
-    return [(e[1], e[2]) for e in log if e[0] == "msg"]
+    return [(e.seq, e.blocks) for e in log if isinstance(e, Msg)]
 
 
 def chars(blocks):
@@ -131,16 +147,16 @@ def spans(log):
         n = chars(blocks) // 4
         if n > 2 * cm.CHUNK_TOKENS:                          # shard a long message
             if buf:                                          # close the pending chunk rather than drop it
-                out.append((f"c{len(out)}", first, last, tok, "\n".join(buf), least, None))
+                out.append(Span(f"c{len(out)}", first, last, tok, "\n".join(buf), least, None))
                 buf, tok, first, least = [], 0, 0, 1.0
             pieces = -(-n // cm.CHUNK_TOKENS)                 # ceil: every shard fits the target
             share = n // pieces
             text = text_of(blocks)                           # production splits the MESSAGE by
             step = max(1, len(text) // pieces)               # chars (chunkMessage): a shard is a
             for k in range(pieces):                          # slice, never the whole
-                out.append((f"c{len(out)}", seq, seq, share,
-                            text[k * step:(k + 1) * step] if k < pieces - 1 else text[k * step:],
-                            salience(blocks), f"g{seq}"))    # each shard is its own chunk
+                out.append(Span(f"c{len(out)}", seq, seq, share,
+                                text[k * step:(k + 1) * step] if k < pieces - 1 else text[k * step:],
+                                salience(blocks), f"g{seq}"))    # each shard is its own chunk
             continue
         blocks = truncate_blocks(blocks)                     # the cap truncates, then we price
         n = chars(blocks) // 4                               # ...the bytes we will render
@@ -153,7 +169,7 @@ def spans(log):
         least = min(least, salience(blocks))
         has_tool_use = any(b[0] == "tool_use" for b in blocks)
         if tok >= cm.CHUNK_TOKENS and len(buf) >= MIN_MSGS and not has_tool_use:
-            out.append((f"c{len(out)}", first, seq, tok, "\n".join(buf), least, None))
+            out.append(Span(f"c{len(out)}", first, seq, tok, "\n".join(buf), least, None))
             buf, tok, first, least = [], 0, 0, 1.0
     return out
 
@@ -163,18 +179,18 @@ def archive(log):
     question label plus content; the header a positioned pair EMITS is not, and the `+50` is the prompt cap.
     AUDIT.md D6."""
     def minted(a, e):
-        if e[0] != "mint":
+        if not isinstance(e, Mint):
             return a
-        _, _target, sid, level, children, text, _owned = e
-        leaves = tuple(l for c in children for l in (a["summaries"][c].leaves if c in a["summaries"] else (c,)))
-        pair = f"{RECALL_LABEL} {text}"
-        a["summaries"][sid] = cm.Summary(sid, level, leaves, text, max(1, len(pair.split())))
-        a["children"][sid] = tuple(children)
-        if level == 1:
-            a["l1_of"][children[0]] = sid
+        leaves = tuple(l for c in e.children
+                       for l in (a["summaries"][c].leaves if c in a["summaries"] else (c,)))
+        pair = f"{RECALL_LABEL} {e.text}"
+        a["summaries"][e.id] = cm.Summary(e.id, e.level, leaves, e.text, max(1, len(pair.split())))
+        a["children"][e.id] = tuple(e.children)
+        if e.level == 1:
+            a["l1_of"][e.children[0]] = e.id
         else:
-            for c in children:
-                a["parent"][c] = sid
+            for c in e.children:
+                a["parent"][c] = e.id
         return a
     return project(log, {"chunks": [cm.Chunk(cid, last, text, tokens, sal)
                                     for cid, _first, last, tokens, text, sal, _group in spans(log)],
@@ -182,15 +198,15 @@ def archive(log):
 
 
 def frontier(log):
-    return next((e[1] for e in reversed(log) if e[0] == "frontier"), {})
+    return next((e.levels for e in reversed(log) if isinstance(e, Emission)), {})
 
 
 def mints(log):
-    return {e[1] for e in log if e[0] == "mint"}
+    return {e.target for e in log if isinstance(e, Mint)}
 
 
 def fails(log):
-    return [(e[1], e[2]) for e in log if e[0] == "fail"]
+    return [(e.target, e.reason) for e in log if isinstance(e, Fail)]
 
 
 def ledger(log, target):
@@ -200,20 +216,17 @@ def ledger(log, target):
     cannot disagree with itself. `stale` is recorded but burns nothing: not an attempt, not a
     fault -- a failed commit."""
     def count(d, e):
-        if e[1] != target:                       # every event carries its target (or seq) at [1]
-            return d
-        if e[0] == "clear":
+        if isinstance(e, Clear) and e.target == target:
             return {"attempts": 0, "streak": 0, "last": None, "cleared": True}
-        if e[0] == "mint":
+        if isinstance(e, Mint) and e.target == target:
             return {**d, "cleared": True}        # the memory IS the clear; the attempts that
-        if e[0] != "fail":                       # produced it stay visible
+        if not isinstance(e, Fail) or e.target != target:   # produced it stay visible
             return d
-        reason = e[2]
-        if reason == "stale":
-            return {**d, "last": reason}
-        return {**d, "attempts": d["attempts"] + (reason != "provider_error"),
-                "streak": d["streak"] + 1 if reason == "provider_error" else 0,
-                "last": reason}
+        if e.reason == "stale":
+            return {**d, "last": e.reason}
+        return {**d, "attempts": d["attempts"] + (e.reason != "provider_error"),
+                "streak": d["streak"] + 1 if e.reason == "provider_error" else 0,
+                "last": e.reason}
     return project(log, {"attempts": 0, "streak": 0, "last": None, "cleared": False}, count)
 
 
@@ -262,7 +275,7 @@ def chunk_spans(log):
     for cid, first, last, *_ in spans(log):
         ordinal = seen.get((first, last), 0)
         seen[(first, last)] = ordinal + 1
-        out[cid] = (first, last, ordinal)
+        out[cid] = Range(first, last, ordinal)
     return out
 
 
@@ -270,13 +283,13 @@ def l1_spans(log):
     """The spans each live L1 OWNS, stamped into the mint event itself: coverage is a fact recorded at mint
     time (production's sourceRange, :5238), not a re-derivation of chunk_spans(log[:i]) per mint -- the
     mint event already stores the derived text, so it stores the derived span too."""
-    return {e[2]: set(e[6]) for e in log
-            if e[0] == "mint" and e[3] == 1 and e[6]}
+    return {e.id: set(e.owned) for e in log
+            if isinstance(e, Mint) and e.level == 1 and e.owned}
 
 
 def meets(a, b):
     """Plain interval overlap: do two message ranges share lived messages?"""
-    return a[0] <= b[1] and b[0] <= a[1]
+    return a.first <= b.last and b.first <= a.last
 
 
 def iv_overlap(a, b):
@@ -284,7 +297,7 @@ def iv_overlap(a, b):
     ordinal decides (different shards are different slices, not duplicates); different ranges overlap as
     intervals. The one predicate behind both arms of the coverage guard; protections use the plain
     half (`meets`)."""
-    return a == b if a[:2] == b[:2] else meets(a, b)
+    return a == b if (a.first, a.last) == (b.first, b.last) else meets(a, b)
 
 
 def covered_by_l1(log, a=None):
@@ -324,7 +337,7 @@ def merge_candidates(log, a=None):
             if s.id not in a["parent"]:                    # resolves: "can NEVER merge"
                 out.append((s.id, "source position unresolved -- permanently unmergeable, frontier debt"))
             continue
-        first, last = min(o[0] for o in owned), max(o[1] for o in owned)
+        first, last = min(o.first for o in owned), max(o.last for o in owned)
         live_end[s.level] = max(last, live_end.get(s.level, -1))
         if s.id in a["parent"]:
             continue
@@ -334,9 +347,9 @@ def merge_candidates(log, a=None):
                               f"{span_limit(s.level)} (base {MERGE_MAX_SOURCE_SPAN_MESSAGES} x "
                               f"{cm.MERGE_THRESHOLD}^{max(0, s.level - 3)})"))
         else:
-            free.setdefault(s.level, []).append((s.id, first, last))
+            free.setdefault(s.level, []).append(Cand(s.id, first, last))
     for cands in free.values():
-        cands.sort(key=lambda t: (t[1], t[2]))
+        cands.sort(key=lambda c: (c.first, c.last))
     return free, out, live_end
 
 
@@ -374,24 +387,24 @@ def work(log, demanded=(), pressure=True):
     zone = cm.raw_zone(a, protected_ids(log, a))
     covered = covered_by_l1(log, a)
     fresh = [c for i, c in enumerate(a["chunks"]) if (i < cut and pressure) or c.id in demanded]
-    out = [(f"L1:{c.id}", "L1", c.id) for c in fresh
+    out = [Work(f"L1:{c.id}", "L1", c.id) for c in fresh
            if c.id not in zone and c.id not in covered]
     free, _excluded, live_end = merge_candidates(log, a)
     for level in sorted(free):
         # the odometer: merges fire on STRICTLY CONTIGUOUS runs of unmerged siblings (:6698), never
         # bridging a hole; a run that isn't at the level's live end can never grow (summaries are
         # produced at the live end), so it consolidates at 2 instead of 6 (:6718-6721)
-        for run in cm.runs(free[level], lambda p, c: c[1] <= p[2] + 1):
-            interior = run[-1][2] < live_end.get(level, -1)
+        for run in cm.runs(free[level], lambda p, c: c.first <= p.last + 1):
+            interior = run[-1].last < live_end.get(level, -1)
             if len(run) >= cm.MERGE_THRESHOLD:
-                ids = [sid for sid, _f, _l in run[: cm.MERGE_THRESHOLD]]
+                ids = [c.id for c in run[: cm.MERGE_THRESHOLD]]
             elif interior and len(run) >= 2:
-                ids = [sid for sid, _f, _l in run]
+                ids = [c.id for c in run]
             else:
                 continue
-            out.append((f"L{level + 1}:{'+'.join(ids)}", "merge", "+".join(ids)))
+            out.append(Work(f"L{level + 1}:{'+'.join(ids)}", "merge", "+".join(ids)))
     done = mints(log)
-    return [i for i in out if i[0] not in done and not stalled(log, i[0])]
+    return [i for i in out if i.target not in done and not stalled(log, i.target)]
 
 
 class UncoveredDropError(Exception):
@@ -539,13 +552,13 @@ def step(log, item, model, v):
         here = chunk_spans(log)
         owned = lambda leaves: tuple(here[l] for l in leaves if l in here)
         if kind == "L1":
-            event = ("mint", target, f"L1-{payload}", 1, (payload,), text, owned((payload,)))
+            fields = (target, f"L1-{payload}", 1, (payload,), text, owned((payload,)))
         else:
             kids = tuple(payload.split("+"))
             level = a["summaries"][kids[0]].level + 1
             leaves = tuple(l for k in kids for l in a["summaries"][k].leaves)
-            event = ("mint", target, f"L{level}-{kids[0]}", level, kids, text, owned(leaves))
-        if commit(log, v, *event):
+            fields = (target, f"L{level}-{kids[0]}", level, kids, text, owned(leaves))
+        if commit(log, v, "mint", *fields):
             return "done"
     elif commit(log, v, "fail", target, reason or "empty"):
         return policy(log, target, reason or "empty")   # the label matches the state this
@@ -560,12 +573,12 @@ def protected_ids(log, a):
     shard, which is exactly what the coverage guard's `iv_overlap` must NOT say."""
     here = chunk_spans(log)
     return {c.id for c in a["chunks"]
-            for first, last, _lo, _hi, _why in protections(log)
-            if meets((first, last), here[c.id])}
+            for p in protections(log)
+            if meets(p, here[c.id])}
 
 
 def protections(log):
-    return [e[1:] for e in log if e[0] == "protect"]
+    return [e for e in log if isinstance(e, Protect)]
 
 
 class Refused(Exception):
