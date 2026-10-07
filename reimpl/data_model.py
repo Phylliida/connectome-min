@@ -30,7 +30,7 @@ class UserStore:
 
 # --- Messages ---
 
-class MessageDataKind(Enum):
+class MessageBlocksKind(Enum):
     TEXT = auto()
     TOOL_USE = auto()
     TOOL_RESULT = auto()
@@ -39,8 +39,8 @@ class MessageDataKind(Enum):
 
 
 @dataclass
-class MessageData:
-    kind: MessageDataKind
+class MessageBlocks:
+    kind: MessageBlocksKind
     data: Optional[str] = None
     path: Optional[str] = None
 
@@ -50,8 +50,7 @@ class Message:
     id: MessageId
     parent_id: Optional[MessageId]  # previous message
     user_id: UserId
-    data: List[MessageData]
-
+    blocks: List[MessageBlocks]
 
 @dataclass
 class Chunk:
@@ -61,27 +60,62 @@ class Chunk:
     end_message_offset: int
 
 
+MESSAGES_JSON_PATH = "messages.jsonl"
+SESSION_JSON_PATH = "session.json"
+CHUNKS_JSON_PATH = "chunks/chunks{level}.jsonl"
+def chunks_json_path(leve):
+    return CHUNKS_JSON_PATH.format(level)
+
 @dataclass
 class Session:
-    session_id: SessionId
-    session_path: Path
-    parent_session_id: Optional[SessionId]
-    parent_session_message_id: MessageId
+    session_directory: Path
+    parent_session: Optional[Session]
+    parent_session_message_id: Optional[Path] # the message we forked from (if we are a fork)
     # messages are append-only
 
-    def lookup_message(self, message_id: MessageId) -> Message:
-        return Message(binary_search_jsonl(self.path, key="id", value=message_id))
+def ensure_exists(path):
+    os.path.mkdirs(path, make parents too=True)
+    touch file to make it real if it is empty
+    return path
 
-    def get_new_message_id(messages: List[Message]) -> MessageId:
-        last_entry = Message(last_jsonl_entry(self.session_path))
-        return last_entry.id + MessageId(1) if last_entry else MessageId(0)
+def session_messages_json(session_path: Path):
+    return JsonlFile(ensure_exists(os.path.join(session_path, MESSAGES_JSON_PATH)), class_factory=idk some message factory)
 
-    def add_message(self, message: Message):
+def session_chunks_json(session_path: Path, level: int):
+    return JsonlFile(ensure_exists(os.path.join(session_path, chunks_json_path(level)))
+
+def lookup_message(session_path: Path, message_id: MessageId) -> Message:
+    return Message(session_messages_json(session_path).find(key="id", value=message_id))
+
+def get_new_message_id(session_path: Path) -> MessageId:
+    last_entry = session_messages_json(session_path, Message).last()
+    return MessageId(last_entry['id']) + MessageId(1) if last_entry else MessageId(0)
+
+def add_message(session_path: Path, user_id: UserId, blocks: List[MessageBlocks]):
+    id = self.get_new_message_id(session_path)
+    message = Message(id=id, user_id=user_id, blocks=blocks)
+    session_messages_json(session_path).append(message)
+
+def message_to_str(message: Message):
+    # todo: attachments
+    return "\n".join([[image] if b.kind == MessageDataKind.IMAGE else (b.data or "") for b in message.data])
+
+MAX_CHUNK_SIZE
 
 
+def update_chunks(session_path):
+    chunks =
+    chunks_json = session_chunks_json(session_path, level=0)
+    most_recent_chunk = Chunk(last_jsonl_entry(chunks_json) # would be nice if this gives None if input is None
 
-    messages: List[Message] = field(default_factory=list)
-    chunks: List[Chunk] = field(default_factory=list)
+    frontier_message = first_jsonl_entry(chunks_json) # todo: handle fork stuff
+    frontier_message_offset = 0
+    if most_recent_chunk:
+        frontier_message = lookup_message(session_path, most_recent_chunk.end_message_id)
+        frontier_message_offset most_recent_chunk.end_message_offset
+
+    while True:
+
 
 
 @dataclass
@@ -89,29 +123,6 @@ def Config:
     session_directory_path: Path
 
 
-def lookup_message(messages: List[Message], message_id: MessageId) -> Message:
-    # ids are monotonically increasing, so messages is sorted by id
-    index = bisect_left(messages, message_id, key=lambda m: m.id)
-    if index < len(messages) and messages[index].id == message_id:
-        return messages[index]
-    raise ValueError(f"Could not find message with id {message_id}")
-
-
-
-def add_message(session: Session, user_id: UserId,
-                parent_id: Optional[MessageId],
-                data: List[MessageData]) -> Message:
-    if parent_id is not None:
-        lookup_message(session.messages, parent_id)  # validate it exists
-    message = Message(id=get_new_message_id(session.messages),
-                      parent_id=parent_id, user_id=user_id, data=data)
-    session.messages.append(message)
-    update_chunks(session)
-    return message
-
-def message_to_str(message: Message):
-    # todo: attachments
-    return "\n".join([[image] if b.kind == MessageDataKind.IMAGE else (b.data or "") for b in message.data])
 
 # we can look at most recent message and walk back until we find the most recent message in that chain that hasn't had a chunk map to it yet
 # however, how do we know which chunk maps to it?
