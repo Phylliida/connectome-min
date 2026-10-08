@@ -105,16 +105,42 @@ MAX_CHUNK_SIZE = somethin
 def update_chunks(session_path):
     messages = session_messages_json(session_path)
     chunks = session_chunks_json(session_path, level=0)
+
+    def generate_text(messages, max_size):
+        for message in messages:
+            message_str = message_to_str(message)
+            for i in range(0, len(message_str), max_size):
+                yield (message.id, i, i+size, message_str[i:i+size])
+
+    remaining_messages = messages.iter()
+    partial_text = []
     most_recent_chunk = chunks.last()
+    if most_recent_chunk:
+        remaining_messages = messages.iter_at(key="id", value=most_recent_chunk.end_message_id)
+        partial_message = message_to_str(next(remaining_messages))[:most_recent_chunk.end_message_offset]
+        if partial_message: partial_text.append((most_recent_chunk.end_message_id, most_recent_chunk.end_message_offset, partial_message))
+
+
+    for message_id, start_offset, end_offset, message_text in itertools.chain(partial_text, generate_text(remaining_messages)):
+
+
+        def rechunk(sources, size):
+            it = chain.from_iterable(sized(p, size) for s in sources for p in s)
+            while chunk := "".join(islice(it, size)):
+                yield chunk
+
+
+
+    for text in generate_text(remaining_messages):
+
+
+    for remaining_text_piece in itertools.chain([])
+
+        partial_me
+        partial_text = [
+
     frontier_message = messages.first() # todo: handle fork stuff
     frontier_message_offset = 0
-
-    # chunk info
-    first_message_id = None
-    first_message_offset = None
-    last_message_id = None
-    last_message_offset = None
-    strings_in_current_chunk = []
 
     if most_recent_chunk:
         frontier_message = messages.find(key="id", value=most_recent_chunk.end_message_id)
@@ -144,11 +170,6 @@ MAX_CHUNK_SIZE = 100  # whatever your context budget is
 
 
 def update_chunks(messages, chunks):
-    """Append full-chunk records for everything past the last record's end frontier.
-
-    A chunk is only committed once it's full; the underfull tail waits for
-    more messages. Assumes messages is non-empty and ids sort ascending.
-    """
     last = chunks.last()
     start_id, start_off = (last["end_message_id"], last["end_message_offset"]) if last \
         else (messages.first()["id"], 0)
