@@ -5,10 +5,10 @@ import os
 
 # ways of parsing append only jsonl files that don't require loading them all into memory
 
-
 class JsonlFile(object):
-    def __init__(self, path, class_factory):
+    def __init__(self, path, class_factory=dict):
         repair_jsonl_tail(path)  # repair in case of issues
+        open(path, "ab").close()  # create if absent so all readers work
         self.path = path
         self.class_factory = lambda data: None if data is None else class_factory(data)
 
@@ -16,7 +16,8 @@ class JsonlFile(object):
         append_jsonl_entry(self.path, value)
 
     def get(self, key, value):
-        return binary_search_jsonl(self.path, key, value)
+        offset, entry = binary_search_jsonl(self.path, key, value)
+        return self.class_factory(entry)
 
     def first(self):
         return self.class_factory(first_jsonl_entry(self.path))
@@ -26,11 +27,17 @@ class JsonlFile(object):
 
     def __iter__(self):
         for data in iterate_jsonl_forwards(self.path):
-            yield self.class_factory(json)
+            yield self.class_factory(data)
+
+    # iterates returning the given thing first and then stuff after that
+    def iter_at(self, key, value):
+        offset, entry = binary_search_jsonl(self.path, key, value)
+        for data in iterate_jsonl_forwards(self.path, offset=offset):
+            yield self.class_factory(data)
 
     def backwards(self):
         for data in iterate_jsonl_backwards(self.path):
-            yield self.class_factory(json)
+            yield self.class_factory(data)
 
 
 def first_jsonl_entry(path):
@@ -39,8 +46,9 @@ def first_jsonl_entry(path):
         except json.JSONDecodeError: return None
 
 
-def iterate_jsonl_forwards(path):
+def iterate_jsonl_forwards(path, offset=0):
     with open(path, "rb") as f:
+        if offset: f.seek(offset)
         for line in f:
             if line.strip(): yield json.loads(line)
 
@@ -87,21 +95,23 @@ def iterate_jsonl_backwards(path):
 
 
 def binary_search_jsonl(path, key, value, key_max=float("inf")):
+    """Returns (offset_of_line_start, entry). Raises KeyError if absent."""
     with open(path, "rb") as f:
         def read_json_at(offset):
             f.seek(offset)
             if offset:
                 f.readline()  # skip partial line
+            offset = f.tell()
             line = f.readline()
-            return json.loads(line) if line else None
+            return (offset, json.loads(line) if line else None)
 
         def read_key_at(offset):
-            obj = read_json_at(offset)
+            _, obj = read_json_at(offset)
             return obj[key] if obj is not None and key in obj else key_max
 
-        result = read_json_at(
+        offset, result = read_json_at(
             bisect.bisect_left(range(os.path.getsize(path)), value, key=read_key_at)
         )
         if result is None or result.get(key) != value:
             raise KeyError(f"no json with {key}={value!r} in {path}")
-        return result
+        return offset, result

@@ -100,22 +100,98 @@ def message_to_str(message: Message):
     # todo: attachments
     return "\n".join([[image] if b.kind == MessageDataKind.IMAGE else (b.data or "") for b in message.data])
 
-MAX_CHUNK_SIZE
-
+MAX_CHUNK_SIZE = somethin
 
 def update_chunks(session_path):
-    chunks =
-    chunks_json = session_chunks_json(session_path, level=0)
-    most_recent_chunk = Chunk(last_jsonl_entry(chunks_json) # would be nice if this gives None if input is None
-
-    frontier_message = first_jsonl_entry(chunks_json) # todo: handle fork stuff
+    messages = session_messages_json(session_path)
+    chunks = session_chunks_json(session_path, level=0)
+    most_recent_chunk = chunks.last()
+    frontier_message = messages.first() # todo: handle fork stuff
     frontier_message_offset = 0
+
+    # chunk info
+    first_message_id = None
+    first_message_offset = None
+    last_message_id = None
+    last_message_offset = None
+    strings_in_current_chunk = []
+
     if most_recent_chunk:
-        frontier_message = lookup_message(session_path, most_recent_chunk.end_message_id)
-        frontier_message_offset most_recent_chunk.end_message_offset
+        frontier_message = messages.find(key="id", value=most_recent_chunk.end_message_id)
+        frontier_message_offset = most_recent_chunk.end_message_offset
+        chunk_text = message_to_str(most_recent_chunk)
+    for message in messages.iter_at(key="id", value=frontier_message.id): # iterate starting with specified message
+        message_str = message_to_str(message)
+        if frontier_message_offset == message_str: # we have handled this message entirely, skip to next one
+            frontier_message_offset = 0
+        else: # we still need to handle this message
+            # todo: trim stuff?
+            remaining_str = message_str[frontier_message_offset:]
+            total_current_chunk_str = "\n".join(strings_in_current_chunk + [remaining_str])
+            if len(total_current_chunk_str) < MAX_CHUNK_SIZE: strings_in_current_chunk.append(remaining_str)
+            else:
 
-    while True:
 
+            if "\n".join(strings_in_current_chunk + [remaining_str])
+            total_str =
+
+
+
+
+import itertools
+
+MAX_CHUNK_SIZE = 100  # whatever your context budget is
+
+
+def update_chunks(messages, chunks):
+    """Append full-chunk records for everything past the last record's end frontier.
+
+    A chunk is only committed once it's full; the underfull tail waits for
+    more messages. Assumes messages is non-empty and ids sort ascending.
+    """
+    last = chunks.last()
+    start_id, start_off = (last["end_message_id"], last["end_message_offset"]) if last \
+        else (messages.first()["id"], 0)
+    pieces = message_pieces(
+        ((m["id"], message_to_str(m)) for m in messages.iter_at("id", start_id)),
+        MAX_CHUNK_SIZE, first_offset=start_off)
+    for chunk in full_chunks(pieces, MAX_CHUNK_SIZE):
+        chunks.append(chunk_record(chunk))
+
+
+def message_pieces(messages, max_size, first_offset=0):
+    """(message_id, offset, text) slices of <= max_size, in order, from the frontier on."""
+    return ((mid, off, text[off:off + max_size])
+            for i, (mid, text) in enumerate(messages)
+            for off in range(first_offset if i == 0 else 0, len(text), max_size))
+
+
+def full_chunks(pieces, max_size):
+    """Greedily pack pieces into <= max_size chunks; yield only FULL ones.
+    The final open chunk is deferred until more pieces arrive."""
+    size, gid, prev = 0, 0, None
+    def group(piece):
+        nonlocal size, gid, prev
+        cost = len(piece[2]) + (prev is not None and piece[0] != prev)  # "\n" between messages
+        if size and size + cost > max_size:
+            gid, size, cost = gid + 1, 0, len(piece[2])  # overflow -> new group, no leading separator
+        size += cost
+        prev = piece[0]
+        return gid
+    groups = (list(g) for _, g in itertools.groupby(pieces, group))
+    return (closed for closed, _ in itertools.pairwise(groups))  # every group but the last is full
+
+
+def chunk_record(chunk):
+    first, last = chunk[0], chunk[-1]
+    return {"start_message_id": first[0], "start_message_offset": first[1],
+            "end_message_id": last[0], "end_message_offset": last[1] + len(last[2])}
+
+
+def chunk_text(chunk):
+    """The committed text of a chunk; continuation pieces join directly, messages with "\n"."""
+    return chunk[0][2] + "".join(("\n" if b[0] != a[0] else "") + b[2]
+                                 for a, b in itertools.pairwise(chunk))
 
 
 @dataclass
