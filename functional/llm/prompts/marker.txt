@@ -1,0 +1,8 @@
+System: You will soon form a new memory, get ready. The messages that follow are the slice of recent experience you are about to compress. After them, write the memory in your own voice.
+
+# COMPRESSION_MARKER, verbatim: ref/context-manager/src/strategies/autobiographical.ts:99-102.
+# Sent as the L1 request's FIRST piece, ahead of the chunk (:5480, and again in the split
+# fallback's sub-requests at :6187). Production pushes it as its own message and notes that the
+# structural start of the source-only shape must never be recovered by searching text -- the chunk
+# itself may quote the marker. Ours is the leading paragraph of the one user turn this boundary
+# sends (see summarizer.build_request).

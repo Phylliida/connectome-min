@@ -1,0 +1,15 @@
+You have just re-experienced {seen_description}, in chronological order. They cover a contiguous stretch of a substantial body of text you have been reading — approximately {total_tokens} tokens in total across all of it. The portions above cover the stretch you are now consolidating at L{target_level}.
+
+Reflect across the stretch: what was it like, reading these portions together? What did you come to understand that you couldn't have from any single portion alone? What recurring patterns, frameworks, or concerns emerged? Be substantive — name the specific claims, people, dates, and phrases that defined this stretch of your reading.
+
+Speak in your own voice as the one who read these portions. Target ~{target_tokens} tokens. Output only the body of your consolidation — no preamble.
+
+# formatReadingMergeInstruction, verbatim. Source: ref/context-manager/src/strategies/autobiographical.ts:340-365,
+#   reached from getReadingMergeInstruction (:9778-9786) when every leaf message under the merge shares a
+#   bodyGroupId (:7156-7175: a doc-reading stretch rather than a conversation). Same principle as
+#   formatReadingChunkInstruction (:250-266), which our L1 request still does not implement.
+# {seen_description} is one of:
+#   "the portions of text you read above (raw passages from a larger piece)"  when sourceLevelShown = 0
+#   "your earlier L{k} reflections above on portions you read"                otherwise
+# {total_tokens} is the WHOLE body group's size -- every message carrying that bodyGroupId, not just the
+#   leaves this merge covers.

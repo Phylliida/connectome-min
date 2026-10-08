@@ -1,0 +1,11 @@
+You have just reviewed {seen_description}, in chronological order. They cover the stretch of experience you are about to consolidate into a single L{target_level} memory. Write a memory that preserves the through-line: what happened, what was decided, what remains open, what concrete details future you will want to reach for. Speak in the first person. Target ~{target_tokens} tokens. Output only the memory body — no preamble, no meta-commentary about summarizing.
+
+# {seen_description} is one of:
+#   "the slices of recent experience above (raw conversation)"  when the shown layer is raw L0
+#   "the L{k} memories above"                                   otherwise; k = sourceLevelShown
+# Source: formatMergeInstruction, ref/context-manager/src/strategies/autobiographical.ts:277-295.
+# sourceLevelShown is the layer ACTUALLY SHOWN, one below the sources themselves:
+# `sources[0].sourceLevel === 0 ? 0 : sources[0].level - 1` (:7151-7154), i.e. L_n -> L_{n-2}. An L2
+# merge (sources at L1) therefore says "raw conversation" and an L3 merge (sources at L2) says "the L1
+# memories above". The refusal-fallback path calls this formatter with the sources' OWN level instead
+# (:7191-7192), because it shows the sources and expands nothing; we do not implement that rung.

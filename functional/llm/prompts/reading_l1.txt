@@ -1,0 +1,15 @@
+You have just been reading a substantial body of text — approximately {total_tokens} tokens total in this piece, of which what you just read is a portion. Earlier portions are in your memory above as your prior reflections; what comes after, you have not yet read.
+
+Reflect on this reading: what was it like? What did you learn? What stood out? Be substantive — name the specific claims, frameworks, people, dates, and phrases that struck you. What is now in your understanding that wasn't before you read this portion?
+
+Speak in your own voice as the one reading. Target ~{target_tokens} tokens. Output only the body of your reflection — no preamble.
+
+# formatReadingChunkInstruction, verbatim. Source: ref/context-manager/src/strategies/autobiographical.ts:250-266,
+#   reached from getReadingChunkInstruction (:9696-9701) and pushed as the L1 directive's text at :5497-5506
+#   whenever detectDocContext (:9716-9757) finds the chunk is a portion of a larger sharded message.
+# This is the L1 counterpart of reading_merge.txt: same principle (the agent is reading a document, not
+#   conversing), different sentence -- the merge one consolidates a stretch, this one reflects on a portion.
+# {total_tokens} is the WHOLE body group's size -- every message carrying that bodyGroupId, not just this
+#   shard (:9738-9744).
+# {target_tokens} is `targetTokens` at the call site: summarizer.TARGET_TOKENS, i.e. config.py's
+# summaryTargetTokens, scaled /10 for the demo.

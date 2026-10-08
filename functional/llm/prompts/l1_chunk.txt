@@ -1,0 +1,10 @@
+Write the memory of events since the most recent memory system notification. Speak in the first person from your own perspective. Preserve concrete details — file paths, exact values, decisions, unresolved questions, the user's active asks. Target ~{target_tokens} tokens. Output only the memory body — no preamble, no section headers unless they help preservation, no meta-commentary about summarizing. Memorize only what actually happened in that slice: if it holds little beyond routine system traffic (heartbeats, empty turns, failure notices), a short memory saying so is correct — do not pad it by re-narrating events you already remember from earlier as if they had just happened again.
+
+# formatInstruction(targetTokens), verbatim. Source: ref/context-manager/src/strategies/autobiographical.ts:192-206
+#   reached from getCompressionInstruction (:9683) and pushed as the L1 directive's text at :5503-5506.
+# This is the string production SENDS. It replaces summaryUserPrompt (types/strategy.ts:1486),
+# which is declared and read by nothing in src/, bench/, test/ or scripts/ -- the copy this
+# artifact used to send (the audit's D8a).
+#
+# {target_tokens} is `targetTokens` at the call site: summarizer.TARGET_TOKENS, i.e. config.py's
+# summaryTargetTokens, scaled /10 for the demo.
