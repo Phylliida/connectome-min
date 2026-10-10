@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, NewType, Optional
 from bisect import bisect_left
+from itertools import batched, chain, repeat
 
 UserId = NewType("UserId", str) # UUID string
 SessionId = NewType("SessionId", str) # UUID string
@@ -110,57 +111,39 @@ def update_chunks(session_path):
         for message in messages:
             message_str = message_to_str(message)
             for i in range(0, len(message_str), max_size):
-                yield (message.id, i, i+size, message_str[i:i+size])
+                yield (message.id, i, message_str[i:i+size])
 
-    remaining_messages = messages.iter()
-    partial_text = []
     most_recent_chunk = chunks.last()
-    if most_recent_chunk:
-        remaining_messages = messages.iter_at(key="id", value=most_recent_chunk.end_message_id)
-        partial_message = message_to_str(next(remaining_messages))[:most_recent_chunk.end_message_offset]
-        if partial_message: partial_text.append((most_recent_chunk.end_message_id, most_recent_chunk.end_message_offset, partial_message))
+    # skip ahead if there are chunks available
+    remaining_messages = messages.iter_at(key="id", value=most_recent_chunk.end_message_id) if most_recent_chunk else messages.iter()
+    partial_text = [(
+        most_recent_chunk.end_message_id,
+        most_recent_chunk.end_message_offset,
+        message_to_str(next(remaining_messages))[most_recent_chunk.end_message_offset:]
+    )] if most_recent_chunk else []
 
+    # convert (id, start_offset, chars) -> [(id, start_offset, char1), (id, start_offset+1, char2), ...] but in an efficient way that doesn't duplicate stuff'
+    def bundle_offsets(messages_with_offsets):
+        for message_id, start_offset, message_text in messages_with_offsets:
+            yield zip(
+                repeat(message_id, len(message_text)),
+                range(start_offset, start_offset+len(message_text)),
+                message_text)
 
-    for message_id, start_offset, end_offset, message_text in itertools.chain(partial_text, generate_text(remaining_messages)):
-
-
-        def rechunk(sources, size):
-            it = chain.from_iterable(sized(p, size) for s in sources for p in s)
-            while chunk := "".join(islice(it, size)):
-                yield chunk
-
-
-
-    for text in generate_text(remaining_messages):
-
-
-    for remaining_text_piece in itertools.chain([])
-
-        partial_me
-        partial_text = [
-
-    frontier_message = messages.first() # todo: handle fork stuff
-    frontier_message_offset = 0
-
-    if most_recent_chunk:
-        frontier_message = messages.find(key="id", value=most_recent_chunk.end_message_id)
-        frontier_message_offset = most_recent_chunk.end_message_offset
-        chunk_text = message_to_str(most_recent_chunk)
-    for message in messages.iter_at(key="id", value=frontier_message.id): # iterate starting with specified message
-        message_str = message_to_str(message)
-        if frontier_message_offset == message_str: # we have handled this message entirely, skip to next one
-            frontier_message_offset = 0
-        else: # we still need to handle this message
-            # todo: trim stuff?
-            remaining_str = message_str[frontier_message_offset:]
-            total_current_chunk_str = "\n".join(strings_in_current_chunk + [remaining_str])
-            if len(total_current_chunk_str) < MAX_CHUNK_SIZE: strings_in_current_chunk.append(remaining_str)
-            else:
-
-
-            if "\n".join(strings_in_current_chunk + [remaining_str])
-            total_str =
-
+    for chunk in batched(chain(
+                        bundle_offsets(chain(partial_text, generate_text(remaining_messages)))
+                        ), chunk_size):
+        # only do complete chunks
+        if len(chunk) == chunk_size:
+            start_message_id, start+message_offset, _ = chunk[0]
+            end_message_id, end_message_offset, _ = chunk[-1]
+            new_chunk = Chunk(
+                start_message_id=start_message_id,
+                start_message_offset=start_message_offset,
+                end_message_id=end_message_id,
+                end_message_offset=end_message_offset+1 # +1 so we can do [:end]
+            )
+            chunks.append(new_chunk)
 
 
 
