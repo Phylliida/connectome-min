@@ -114,7 +114,7 @@ def update_chunks(session_path):
                 yield (message.id, i, message_str[i:i+size])
 
     most_recent_chunk = chunks.last()
-    # skip ahead if there are chunks available
+    # skip ahead if there are already existing chunks
     remaining_messages = messages.iter_at(key="id", value=most_recent_chunk.end_message_id) if most_recent_chunk else messages.iter()
     partial_text = [(
         most_recent_chunk.end_message_id,
@@ -122,7 +122,7 @@ def update_chunks(session_path):
         message_to_str(next(remaining_messages))[most_recent_chunk.end_message_offset:]
     )] if most_recent_chunk else []
 
-    # convert (id, start_offset, chars) -> [(id, start_offset, char1), (id, start_offset+1, char2), ...] but in an efficient way that doesn't duplicate stuff'
+    # convert (id, start_offset, chars) -> [(id, start_offset, char1), (id, start_offset+1, char2), ...] (for chunking) but in an efficient way that doesn't duplicate stuff
     def bundle_offsets(messages_with_offsets):
         for message_id, start_offset, message_text in messages_with_offsets:
             yield zip(
