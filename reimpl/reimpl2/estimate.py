@@ -19,6 +19,7 @@ PROSE, DENSE = 2.9, 2.3             # chars per token; DENSE also prices all too
 HIDDEN_THINKING = 600               # signed thinking whose text was removed; bare redacted_thinking
 _PLAIN = re.compile(r'[^\x7f-\U0010ffff{}\[\]":_/=`]')   # code units the density probe counts as prose
 _LONE_SURROGATE = re.compile(r'[\ud800-\udfff]')         # json.dumps keeps these raw; JS writes \uXXXX
+_INDEX = re.compile(r'0|[1-9][0-9]*')                    # an array-index key, if under 2**32 - 1
 _JS_SPACE = '\t\n\v\f\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff'
 _LINK = re.compile(f'https?://[^{_JS_SPACE}]+')          # a bare link line, after JS's trim()
 
@@ -35,30 +36,37 @@ def js_round(x: float) -> int:
     return (whole := math.floor(x)) + (x - whole >= 0.5)
 
 
-def number_len(x: float) -> int:
-    """len(JSON.stringify(x)), from Number::toString: 1.0 is '1', 1e-7 is '1e-7', 1e16 is '10000000000000000'."""
-    if not math.isfinite(x := float(x)): return 4                       # null
-    if x == 0: return 1
+def js_number(x: float) -> str:
+    """Number::toString, as JSON.stringify writes it: 1.0 is '1', 1e-7 is '1e-7', 1e21 is '1e+21'."""
+    if not math.isfinite(x := float(x)): return 'null'
+    if x == 0: return '0'
     _, digits, exponent = Decimal(repr(abs(x))).normalize().as_tuple()   # repr's digits are JS's
-    k = len(digits)
+    d, k = ''.join(map(str, digits)), len(digits)
     n = exponent + k                                                     # |x| = 0.d1..dk * 10^n
-    return (x < 0) + (n if k <= n <= 21 else                             # 1200
-                      k + 1 if 0 < n <= 21 else                          # 1.2
-                      k + 2 - n if -6 < n <= 0 else                      # 0.0012
-                      k + (k > 1) + 2 + len(str(abs(n - 1))))            # 1.2e-7
+    return '-' * (x < 0) + (d + '0' * (n - k) if k <= n <= 21 else      # 1200
+                            d[:n] + '.' + d[n:] if 0 < n <= 21 else      # 1.2
+                            '0.' + '0' * -n + d if -6 < n <= 0 else      # 0.0012
+                            d[0] + '.' * (k > 1) + d[1:] + 'e' + '-+'[n > 1] + str(abs(n - 1)))   # 1.2e-7
+
+
+def js_json(value) -> str:
+    """JSON.stringify(value) for a JSON value. JavaScript lists an object's array-index keys first, in
+    numeric order, and escapes lone surrogates."""
+    match value:
+        case None: return 'null'
+        case True: return 'true'
+        case False: return 'false'
+        case str(): return _LONE_SURROGATE.sub(lambda c: f'\\u{ord(c[0]):04x}', json.dumps(value, ensure_ascii=False))
+        case int() | float(): return js_number(value)
+        case list() | tuple(): return f'[{",".join(map(js_json, value))}]'
+        case dict():
+            index = lambda key: (0, int(key)) if _INDEX.fullmatch(key) and int(key) < 2**32 - 1 else (1, 0)
+            return f'{{{",".join(js_json(k) + ":" + js_json(value[k]) for k in sorted(value, key=index))}}}'
+    raise TypeError(f'not a JSON value: {value!r}')
 
 
 def json_len(value) -> int:
-    """len(JSON.stringify(value)) for a value parsed from JSON. Measuring it rather than building the
-    string makes JS's key order (integer-like keys first) irrelevant."""
-    match value:
-        case None | True: return 4
-        case False: return 5
-        case str(): return js_len(json.dumps(value, ensure_ascii=False)) + 5 * len(_LONE_SURROGATE.findall(value))
-        case int() | float(): return number_len(value)
-        case list(): return 1 + sum(json_len(v) + 1 for v in value) + (not value)
-        case dict(): return 1 + sum(json_len(k) + json_len(v) + 2 for k, v in value.items()) + (not value)
-    raise TypeError(f'not a JSON value: {value!r}')
+    return js_len(js_json(value))
 
 
 # --- block prices ---
@@ -116,7 +124,7 @@ def price(message) -> Priced:
     """message: {'id': ..., 'content': [blocks]}."""
     content = message['content']
     raw = tuple(map(raw_tokens, content))
-    images = tuple((r, _image_bytes(b)) for r, b in zip(raw, content) if b['type'] == 'image')
+    images = tuple((r, image_bytes(b)) for r, b in zip(raw, content) if b['type'] == 'image')
     return Priced(message['id'], frozenset(b['type'] for b in content), raw, images,
                   sum(map(text_only_tokens, content)), static_salience(content))
 
@@ -152,7 +160,8 @@ def static_salience(content) -> float:
     return 1 if total <= 0 else max(0.2, 1 - 0.8 * min(1, external / total))
 
 
-def _image_bytes(block) -> int:
+def image_bytes(block) -> int:
+    """An image block's base64 length (imageBlockBytes); 0 for anything else."""
     match block:
         case {'source': {'data': str() as data}}: return js_len(data)
     return 0

@@ -22,23 +22,14 @@ projected.
 """
 import math
 from bisect import bisect_left
-from dataclasses import dataclass
 from functools import cache, reduce
 from itertools import groupby, product, takewhile
 from operator import add
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import chunking
+from config import Config
 from estimate import Priced, js_len
-
-
-@dataclass(frozen=True)
-class Config:
-    slack: float = 0.1                    # compressionSlackRatio: target = W * (1 - slack)
-    merge_threshold: int = 6              # the pyramid's base, which sets the age bands
-    reach_tokens: float | None = None     # kvStableReachTokens, the trust region P; None = W
-    quality_gap_ratio: float = 0.35       # kvStableQualityGapRatio
-    over_budget_grace: float = 0.02       # overBudgetGraceRatio
 
 
 class Leaf(NamedTuple):
@@ -54,23 +45,30 @@ class Leaf(NamedTuple):
 class Summary(NamedTuple):
     id: str
     level: int
-    tokens: float                         # its recall pair's price
+    tokens: float                         # its recall pair's price (recall_tokens)
     sources: tuple                        # message ids for an L1, child summary ids above
     parent: str | None = None
+    text: str = ''                        # the memory, as its recall pair's answer renders it
 
 
 class Inputs(NamedTuple):
-    leaves: list                          # Leaf, in log order
+    leaves: list                          # Leaf, in log order: the messages between the windows
     summaries: list                       # Summary
-    head_tokens: float
-    tail_tokens: float
-    zone_size: int                        # messages in the head and tail windows
-    now: int                              # the newest message's position
+    head: int                             # messages in the head window; the leaves follow them
+    prices: list                          # every message's post-strip store price, in log order
+
+    @property
+    def head_tokens(self) -> float:
+        return sum(self.prices[:self.head])
+
+    @property
+    def tail_tokens(self) -> float:
+        return sum(self.prices[self.head + len(self.leaves):])
 
 
 class Plan(NamedTuple):
     levels: dict                          # message id -> level, for every leaf
-    tokens: float
+    tokens: float                         # head + middle + tail (the picker's finalTokens)
     perturbation: float                   # tokens the provider re-reads against the carried frontier
     branch: str                           # hold | ideal | suffix | infeasible | quality-gap
     escalated: bool                       # even the ideal exceeds W
@@ -86,11 +84,24 @@ def kv_cost(before: list, after: list) -> float:
     return size(after[sum(1 for _ in takewhile(lambda pair: pair[0][0] == pair[1][0], zip(before, after))):])
 
 
+def ancestry(summaries: list[Summary]) -> Callable[[Leaf, int], Summary | None]:
+    """The summary that renders a leaf at a level, if any (SummaryTree.ancestorAt): its L1's chain
+    of parents, read as a table of level -> summary."""
+    nodes = {s.id: s for s in summaries}
+
+    @cache
+    def lineage(sid) -> dict:
+        return {**lineage(s.parent), s.level: s} if (s := nodes.get(sid)) else {}
+
+    return lambda leaf, level: lineage(leaf.l1).get(level)
+
+
 def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
     leaves, nodes = inputs.leaves, {s.id: s for s in inputs.summaries}
     middle = {leaf.id for leaf in leaves}
     target, P = W * (1 - cfg.slack), W if cfg.reach_tokens is None else cfg.reach_tokens
     top, k = max((s.level for s in inputs.summaries), default=0), max(2, cfg.merge_threshold)
+    at, head_tokens, tail_tokens = ancestry(inputs.summaries), inputs.head_tokens, inputs.tail_tokens
 
     @cache
     def members(sid) -> tuple:
@@ -99,24 +110,24 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
         return tuple(m for m in s.sources if m in middle) if s.level == 1 else \
             tuple(m for child in s.sources if child in nodes for m in members(child))
 
-    @cache
-    def lineage(sid) -> dict:
-        """level -> the summary at that level on `sid`'s chain of parents."""
-        return {**lineage(s.parent), s.level: s} if (s := nodes.get(sid)) else {}
-
-    def at(leaf: Leaf, level: int) -> Summary | None:
-        return lineage(leaf.l1).get(level)
+    def middle_units(F: dict) -> list:
+        """The middle's rendered units in order, as (identity, tokens): siblings share one recall."""
+        unit = lambda m, node: (('raw', m.id), m.tokens) if node is None else (('recall', node.id), node.tokens)
+        return list(dict.fromkeys(unit(m, at(m, F[m.id])) for m in leaves))
 
     def layout(F: dict) -> list:
-        """The rendered units in order, as (identity, tokens): siblings share one recall unit.
-        Zero-token head and tail units change no total or kv_cost, so they are always present."""
-        unit = lambda m, node: (('raw', m.id), m.tokens) if node is None else (('recall', node.id), node.tokens)
-        return [('head', inputs.head_tokens), *dict.fromkeys(unit(m, at(m, F[m.id])) for m in leaves),
-                ('tail', inputs.tail_tokens)]
+        """renderLayout, which kv_cost and the hold, suffix and escalation tests measure: the head
+        and tail join only when their totals are positive (stripped images can make them negative)."""
+        return [('head', head_tokens)] * (head_tokens > 0) + middle_units(F) + [('tail', tail_tokens)] * (tail_tokens > 0)
+
+    def accounted(F: dict) -> float:
+        """The token ledger the fold phases steer by, and the picker's reported total: head and tail
+        always count."""
+        return head_tokens + tail_tokens + size(middle_units(F))
 
     def band(leaf: Leaf) -> int:
         """foldDepthCap: how deep the message's age allows, counted in base-k digits."""
-        ratio = max(0, inputs.now - leaf.seq) / max(1, inputs.zone_size)
+        ratio = max(0, len(inputs.prices) - 1 - leaf.seq) / max(1, len(inputs.prices) - len(leaves))   # age / zone size
         return 0 if ratio < 1 else max(0, min(top, math.floor(math.log(ratio) / math.log(k)) + 1))
 
     cap = {leaf.id: band(leaf) for leaf in leaves}
@@ -141,7 +152,7 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
 
     # 1. The ideal cut.
     ideal = dict.fromkeys(middle, 0)
-    tokens = size(layout(ideal))
+    tokens = accounted(ideal)
     priority = sorted(leaves, key=lambda m: (salience[m.id], m.seq))
     for within_bands, limit in ((True, target), (False, W)):    # phase A, and phase B only past W
         if tokens > limit:
@@ -149,7 +160,7 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
                 node = at(leaf, level) if tokens > target and ideal[leaf.id] < level else None
                 if node and (not within_bands or min(cap[m] for m in members(node.id)) >= level):
                     ideal |= dict.fromkeys(members(node.id), level)
-                    tokens = size(layout(ideal))
+                    tokens = accounted(ideal)
     if tokens <= W:     # phase C: unfold each group at a level once, youngest-first, if that nears the target
         for level in range(top, 0, -1):
             # Unfolding a group moves the total by a fixed amount and only other groups' unfolds came
@@ -157,9 +168,9 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
             for node in dict.fromkeys(at(m, level) for m in reversed(leaves) if ideal[m.id] == level):
                 if tokens < target:
                     trial = ideal | dict.fromkeys(members(node.id), level - 1)
-                    if (t := size(layout(trial))) <= W and abs(t - target) < abs(tokens - target):
+                    if (t := accounted(trial)) <= W and abs(t - target) < abs(tokens - target):
                         ideal, tokens = trial, t
-    escalated = tokens > W
+    escalated = size(layout(ideal)) > W
     produced = [(run[0].id, run[-1].id) for run in
                 (list(run) for uncovered, run in groupby(leaves, lambda m: not m.l1) if uncovered and escalated)]
 
@@ -168,11 +179,11 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
     carried_units, ideal_loss = layout(carried), loss(ideal)
     gap = cfg.quality_gap_ratio * max(1, ideal_loss)
     if target <= (held := size(carried_units)) <= W and loss(carried) - ideal_loss <= gap:
-        return Plan(carried, held, 0, 'hold', False, [])
+        return Plan(carried, accounted(carried), 0, 'hold', False, [])
 
     # 3. Adopt the ideal within the trust region.
     if (pert := kv_cost(carried_units, layout(ideal))) <= P:
-        return Plan(ideal, tokens, pert, 'ideal', escalated, produced)
+        return Plan(ideal, accounted(ideal), pert, 'ideal', escalated, produced)
 
     # 4. Adopt the ideal from a boundary on: the oldest of its changes the trust region affords,
     #    found by the library's binary search (len(changes) adopts nothing).
@@ -185,10 +196,10 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
 
     F, units, partial_pert = suffix(bisect_left(range(len(changes)), True, key=lambda i: suffix(i)[2] <= P))
     if (partial := size(units)) <= W and loss(F) - ideal_loss <= gap:
-        return Plan(F, partial, partial_pert, 'suffix', False, [])
+        return Plan(F, accounted(F), partial_pert, 'suffix', False, [])
 
     # 5. The trust region loses.
-    return Plan(ideal, tokens, pert, 'infeasible' if partial > W else 'quality-gap', escalated, produced)
+    return Plan(ideal, accounted(ideal), pert, 'infeasible' if partial > W else 'quality-gap', escalated, produced)
 
 
 def fits(tokens: float, W: float, cfg: Config) -> bool:
@@ -199,19 +210,19 @@ def fits(tokens: float, W: float, cfg: Config) -> bool:
 
 
 def inputs(messages: list[Priced], summaries: list[Summary], levels: dict, multiplier: float,
-           cfg: chunking.Config) -> Inputs:
+           cfg: Config) -> Inputs:
     """The planner's view of the log (selectAdaptive): the messages between the windows at their
     post-strip prices, each with the first L1 that lists it and its carried level."""
     priced = chunking.post_strip_tokens(messages, multiplier, cfg)
     lo = chunking.head_end(messages, multiplier, cfg)
-    hi = max(chunking.recent_start(messages, multiplier, cfg), lo)
+    hi = chunking.recent_start(messages, multiplier, cfg)                # a tail reaching into the head starts after it
     l1 = {m: s.id for s in reversed(summaries) if s.level == 1 for m in s.sources}   # reversed: the first wins
     leaves = [Leaf(m.id, i, priced[i], levels.get(m.id, 0), l1.get(m.id), m.salience)
               for i, m in enumerate(messages[lo:hi], lo)]
-    return Inputs(leaves, summaries, sum(priced[:lo]), sum(priced[hi:]), lo + len(messages) - hi, len(messages) - 1)
+    return Inputs(leaves, summaries, lo, priced)
 
 
-def recall_tokens(text: str) -> int:
+def recall_tokens(text: str, cfg: Config) -> int:
     """A plain-text summary's recall-pair price (recallPairCost, default envelope, no reasoning
-    carriers): its label, 'What do you remember from earlier?', plus its text, each chars/4."""
-    return 9 + math.ceil(js_len(text) / 4)
+    carriers): its label plus its text, each chars/4."""
+    return math.ceil(js_len(cfg.summary_label) / 4) + math.ceil(js_len(text) / 4)
