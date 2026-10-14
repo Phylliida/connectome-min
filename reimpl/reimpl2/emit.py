@@ -3,10 +3,11 @@ adaptive path, then ContextManager.compile's tool-message split), reproduced exa
 
 A compile plans the levels (fold.py), refuses if the plan exceeds W plus the grace, then renders:
 the head raw; each middle message raw, or its ancestor's recall pair (a 'Context Manager' turn with
-the summary label, then the summary as the agent) once, where its first message would be; the tail
-raw. Passes over the result: trailing tool calls with no result are dropped, tool pairing is
-repaired, images beyond the live limits become placeholders, and up to three cache breakpoints are
-placed. Only a compile that completes commits its levels and arms calibration.
+the summary label, then the memory as answer() renders it, as the agent) once, where its first
+message would be; the tail raw. Passes over the result: trailing tool calls with no result are
+dropped, tool pairing is repaired, images beyond the live limits become placeholders, and up to
+three cache breakpoints are placed. Only a compile that completes commits its levels and arms
+calibration.
 
 The renderer checks its running total, not just the plan's: the middle in order, then the tail
 newest-first, against W plus the grace. A message whose stripped image priced it below zero can
@@ -14,15 +15,13 @@ make a prefix exceed what the whole fits under, and then the compile is refused.
 full-coverage assertion, which cannot fire when every unit renders as planned. Close chunks
 (chunking.close_chunks) before each compile, as select's rebuild does.
 """
-import math
-from dataclasses import dataclass, field, replace
 from itertools import groupby, takewhile
 from typing import NamedTuple
 
 import chunking
 import fold
 from config import Config
-from estimate import Calibration, Priced, image_bytes, store_tokens
+from estimate import Calibration, Priced, image_bytes, js_trim, store_tokens
 
 PICKER = 'Adaptive picker exhausted'
 EMISSION = 'Emission overran the plan (planner/emitter estimator drift)'
@@ -32,6 +31,7 @@ OMITTED = {'type': 'text', 'text': '[tool call omitted]'}
 STUB = '[tool result unavailable — omitted during context compression]'
 IMAGE_PLACEHOLDER = {'type': 'text', 'text': '[image dropped from live context]'}
 LOOKAHEAD = 6                             # entries searched for a displaced tool result
+REASONING = ('thinking', 'redacted_thinking')
 
 
 class Refusal(NamedTuple):
@@ -41,25 +41,27 @@ class Refusal(NamedTuple):
     budget: int
 
 
-@dataclass(frozen=True)
-class Session:
+class Session(NamedTuple):
     """What compiles carry between them besides the log."""
-    levels: dict = field(default_factory=dict)           # carried level per message id
-    demanded: frozenset = frozenset()                     # chunk indices the planner asked an L1 for
+    levels: dict = {}                                     # carried level per message id
+    demanded: dict = {}                                   # chunk indices the planner asked an L1 for, keys in that order
     calibration: Calibration = Calibration()
     cache_keys: list | None = None                        # the last compile's entries, for cache markers
 
 
-def select(messages: list[dict], priced: list[Priced], chunks: list, summaries: list[fold.Summary],
-           session: Session, W: float, cfg: Config) -> tuple[Session, list | Refusal]:
-    """messages: {'id', 'participant', 'content'} in log order; priced: estimate.price of each."""
+def select(messages: list[dict], priced: list[Priced], chunks: list, memories: list, session: Session, W: float,
+           cfg: Config) -> tuple[Session, list | Refusal]:
+    """messages: {'id', 'participant', 'content'} in log order; priced: estimate.price of each;
+    memories: mint.Entry, or anything with its id, level, content, sources, parent and blocks."""
+    answers = {s.id: answer(s) for s in memories}
+    summaries = [fold.Summary(s.id, s.level, fold.recall_tokens(answers[s.id], cfg), s.sources, s.parent) for s in memories]
     view = fold.inputs(priced, summaries, session.levels, session.calibration.multiplier, cfg)
-    limit = math.floor(W * (1 + cfg.over_budget_grace))
+    limit = fold.ceiling(W, cfg)
     if view.head_tokens + view.tail_tokens > limit:
         return session, Refusal(PICKER, view.head_tokens + view.tail_tokens, limit)
     plan = fold.plan(view, W, cfg)
-    session = replace(session, demanded=session.demanded.union(
-        *(chunking.demand(chunks, first, last) for first, last in plan.produced)))
+    session = session._replace(demanded=session.demanded | dict.fromkeys(
+        c for first, last in plan.produced for c in chunking.demand(chunks, first, last)))
     if plan.tokens > limit:
         return session, Refusal(PICKER, plan.tokens, limit)
 
@@ -73,7 +75,7 @@ def select(messages: list[dict], priced: list[Priced], chunks: list, summaries: 
         elif node.id not in shown:
             shown.add(node.id)
             unit, cost = [{'participant': 'Context Manager', 'content': [{'type': 'text', 'text': cfg.summary_label}], 'source': None},
-                          {'participant': cfg.summary_participant, 'content': [{'type': 'text', 'text': node.text}], 'source': None}], node.tokens
+                          {'participant': cfg.summary_participant, 'content': answers[node.id], 'source': None}], node.tokens
         else:
             continue
         if total + cost > room:
@@ -93,9 +95,18 @@ def select(messages: list[dict], priced: list[Priced], chunks: list, summaries: 
         return session, Refusal(NEWEST, plan.tokens, limit)
 
     marks, keys = cache_marks(entries, {m['id'] for m in messages[:view.head]}, {m['id'] for m in tail}, session.cache_keys)
-    session = replace(session, levels=session.levels | plan.levels, calibration=session.calibration.arm(plan.tokens),
-                      cache_keys=keys)
+    session = session._replace(levels=session.levels | plan.levels, calibration=session.calibration.arm(plan.tokens),
+                               cache_keys=keys)
     return session, [part for i, e in enumerate(entries) for part in split(e, i in marks)]
+
+
+def answer(memory) -> list[dict]:
+    """A memory's recall answer as the live window renders it under the harness's carrierPolicy
+    'live-strip' (liveWindowAnswerProse): the reply's stored blocks without their reasoning, block
+    for block, when a text block among them has visible text; else the memory's text. Its pair's
+    price follows this render (recallPairCost), so the summarizer's token count doesn't enter it."""
+    stripped = [b for b in memory.blocks or () if b['type'] not in REASONING]
+    return stripped if any(js_trim(b['text']) for b in stripped) else [{'type': 'text', 'text': memory.content}]   # all text
 
 
 def has(entry: dict, kind: str) -> bool:
@@ -103,27 +114,23 @@ def has(entry: dict, kind: str) -> bool:
 
 
 def pair_tools(entries: list[dict]) -> list[dict]:
-    """enforceToolPairing: a tool_result must answer a tool_use in the entry just before it, once;
-    others are dropped. A tool_use the next entry doesn't answer gets its result moved up from the
-    next six entries, else a stub; results join that entry, or a new user entry before it."""
-    entries, uses, i = [dict(e) for e in entries], {}, 0
+    """enforceToolPairing, in place: a tool_result must answer a tool_use in the entry just before it,
+    once; others are dropped. A tool_use the next entry doesn't answer gets its result moved up from
+    the next six entries, else a stub; results join that entry, or a new user entry before it."""
+    uses, i = {}, 0
     while i < len(entries):
-        entry = entries[i]
-        if has(entry, 'tool_result'):
-            seen = set()
-            kept = [b for b in entry['content'] if b['type'] != 'tool_result'
-                    or (b['toolUseId'] in uses and b['toolUseId'] not in seen and not seen.add(b['toolUseId']))]
-            if len(kept) != len(entry['content']):
-                entry['content'] = kept or [OMITTED]
+        entry, seen = entries[i], set()
+        kept = [b for b in entry['content'] if b['type'] != 'tool_result'
+                or (b['toolUseId'] in uses and b['toolUseId'] not in seen and not seen.add(b['toolUseId']))]
+        if len(kept) != len(entry['content']):
+            entry['content'] = kept or [OMITTED]
         answered = {b['toolUseId'] for b in entry['content'] if b['type'] == 'tool_result'}
         if missing := [u for u in uses if u not in answered]:
             results = [take_result(entries, i, u) for u in missing]
-            if answered:
-                entry['content'] = results + entry['content']
-            else:
+            if not answered:                   # the new entry is checked next, and answers them
                 entries.insert(i, {'participant': 'user', 'content': results, 'source': None})
-                uses, i = {}, i + 1
                 continue
+            entry['content'] = results + entry['content']
         uses = dict.fromkeys(b['id'] for b in entry['content'] if b['type'] == 'tool_use')
         i += 1
     if uses:
@@ -132,14 +139,10 @@ def pair_tools(entries: list[dict]) -> list[dict]:
 
 
 def take_result(entries: list[dict], i: int, use_id: str) -> dict:
-    """relocateOrDropMissingResults: the result for `use_id` from the next LOOKAHEAD entries, removed
-    from there; else a stub."""
-    for later in entries[i + 1:i + 1 + LOOKAHEAD]:
-        for k, block in enumerate(later['content']):
-            if block['type'] == 'tool_result' and block['toolUseId'] == use_id:
-                later['content'] = later['content'][:k] + later['content'][k + 1:] or [OMITTED]
-                return block
-    return stub(use_id)
+    """relocateOrDropMissingResults: the result for `use_id` from the next LOOKAHEAD entries, else a
+    stub. The library also removes it there; the entry left holding it drops it when checked."""
+    return next((b for later in entries[i + 1:i + 1 + LOOKAHEAD] for b in later['content']
+                 if b['type'] == 'tool_result' and b['toolUseId'] == use_id), stub(use_id))
 
 
 def stub(use_id: str) -> dict:
@@ -147,18 +150,16 @@ def stub(use_id: str) -> dict:
 
 
 def strip_images(entries: list[dict], priced: list[Priced], multiplier: float, cfg: Config) -> list[dict]:
-    """applyImageStripping: newest entry first, an image becomes a placeholder when its message is
-    deeper than the strip depth (walked on store prices) or the kept images reach the count or byte
-    limit."""
-    if not (cfg.max_live_images or cfg.image_strip_depth_tokens or cfg.max_live_image_bytes):
-        return entries
+    """applyImageStripping, in place: newest entry first, an image becomes a placeholder when its
+    message is deeper than the strip depth (walked on store prices) or the kept images reach the
+    count or byte limit."""
     position = {m.id: i for i, m in enumerate(priced)}
     deep = chunking.crossing(reversed([store_tokens(m, multiplier) for m in priced]), cfg.image_strip_depth_tokens)
     start = 0 if deep is None else len(priced) - deep
     pos = lambda i: position.get(entries[i]['source'], -1)
-    entries, kept, kept_bytes = list(entries), 0, 0
-    for i in sorted((i for i, e in enumerate(entries) if has(e, 'image')), key=lambda i: -pos(i)):
-        too_deep = cfg.image_strip_depth_tokens > 0 and (pos(i) < 0 or pos(i) < start)
+    kept = kept_bytes = 0
+    for i in sorted(range(len(entries)), key=lambda i: -pos(i)):
+        too_deep = cfg.image_strip_depth_tokens > 0 and pos(i) < start
         content = []
         for block in entries[i]['content']:
             size = image_bytes(block)

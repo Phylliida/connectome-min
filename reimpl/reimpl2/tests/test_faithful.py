@@ -1,6 +1,6 @@
 """Differential test of estimate.py and chunking.py against the real library (oracle.mjs).
 
-    python3 tests/test_faithful.py [scenarios] [seed]
+    python3 tests/test_faithful.py [scenarios] [seed] [shard k/n]
 
 Needs node and the harness's node_modules (or CONTEXT_MANAGER, see oracle.mjs). Each scenario is a
 random message log with random config, calibration samples, demands and summarizer progress;
@@ -16,9 +16,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
 import fold  # noqa: E402
-from chunking import close_chunks, demand, head_end, l1_queue, post_strip_tokens, recent_start  # noqa: E402
+from chunking import close_chunks, demand, enqueue, head_end, l1_queue, post_strip_tokens, recent_start  # noqa: E402
 from config import Config  # noqa: E402
-from library import replay  # noqa: E402
+from library import cases, compare  # noqa: E402
 from estimate import Calibration, price, store_tokens  # noqa: E402
 
 CONFIG_FIELDS = {
@@ -37,18 +37,22 @@ CONFIG_FIELDS = {
 
 def simulate(config, events):
     cfg = Config(**{CONFIG_FIELDS[k]: v for k, v in config.items()})
-    messages, chunks, summarized, demanded, cal = [], [], set(), set(), Calibration()
+    messages, chunks, summarized, demanded, queue, cal = [], [], set(), {}, [], Calibration()
     states = []
     for event in events:
         kind, planner = event['kind'], None
         if kind == 'append':
             messages.append(price(event['message']))
             chunks += close_chunks(messages, chunks, cal.multiplier, cfg)
+            queue = l1_queue(chunks, summarized, demanded, cfg)
         elif kind == 'compile':
             chunks += close_chunks(messages, chunks, cal.multiplier, cfg)
+            queue = l1_queue(chunks, summarized, demanded, cfg)
             l1s = [fold.Summary(f'L1-{i}', 1, 0, chunks[i]) for i in sorted(summarized)]
             view = fold.inputs(messages, l1s, {}, cal.multiplier, cfg)
-            if fold.fits(view.head_tokens + view.tail_tokens, event['budget'], Config()):
+            if 'within' in event:                # a budget whose grace the windows land in, or just past
+                event['budget'] = max(1, round((view.head_tokens + view.tail_tokens) / event.pop('within')))
+            if view.head_tokens + view.tail_tokens <= fold.ceiling(event['budget'], Config()):
                 planner = {'leaves': [list(leaf) for leaf in view.leaves], 'headTokens': view.head_tokens,
                            'tailTokens': view.tail_tokens, 'zone': len(view.prices) - len(view.leaves),
                            'now': len(view.prices) - 1}
@@ -56,15 +60,17 @@ def simulate(config, events):
         elif kind == 'usage':
             cal = cal.observe(event['tokens'])
         elif kind == 'demand':
-            demanded |= demand(chunks, event['first'], event['last'])
+            wanted = demand(chunks, event['first'], event['last'])
+            demanded |= dict.fromkeys(wanted)
+            queue = enqueue(queue, wanted, summarized)
         elif kind == 'summarize':
             for _ in range(event['count']):
-                if queue := l1_queue(chunks, summarized, demanded, cfg):
-                    summarized.add(queue[0])
+                if queue:
+                    summarized.add(queue.pop(0))
         m = cal.multiplier
         states.append({
             'chunks': [list(chunk) for chunk in chunks],
-            'queue': l1_queue(chunks, summarized, demanded, cfg),
+            'queue': list(queue),
             'multiplier': m,
             'head': head_end(messages, m, cfg),
             'tail': recent_start(messages, m, cfg),
@@ -82,7 +88,8 @@ def simulate(config, events):
 POOLS = ['abcdefghijklmnopqrstuvwxyz     ', 'ABC .,;!?-', '{}[]":_/=`', 'éüñßø漢字かな',
          '😀🎉🧠', '\x00\x01\x1f\t\n\r"\\\x7f', '\ud800􏰀\udfff']
 NUMBERS = [0, 1, -1, 7, 2**53 + 1, 10**21, 123456789012345678901, 1.0, -0.0, 0.1, 2.5, 1e-7, 1e-6,
-           1.5e-10, 1e20, 1e21, 1.5e300, 5e-324, 1.7976931348623157e308, 123456.789]
+           1.5e-10, 1e20, 1e21, 1.5e300, 5e-324, 1.7976931348623157e308, 123456.789,
+           9999999999999999]                  # a double rounds it up a digit: 10000000000000000
 
 
 def rand_text(r):
@@ -133,7 +140,7 @@ def rand_block(r, depth=0):
                      'tokenEstimate', 0, 99, 12.5, True)
     if kind == 'tool_use':
         return {'type': 'tool_use', 'id': 'tu', 'name': 'tool',
-                'input': {rand_text(r)[:8]: rand_json(r) for _ in range(r.randint(0, 5))}}
+                'input': None if r.random() < 0.05 else {rand_text(r)[:8]: rand_json(r) for _ in range(r.randint(0, 5))}}
     if kind == 'tool_result':
         stamps = [{'type': 'thinking', 'thinking': '', 'tokenEstimate': v} for v in (0.6, 0.7, 0.2)]   # 1.4999999999999998 in JS
         content = r.choice([rand_text(r), '', None, [], stamps,
@@ -161,8 +168,6 @@ def scenario(r):
     drift = r.random() < 0.25
     if drift:
         config |= {'targetChunkTokens': 30, 'recentWindowTokens': 0, 'headWindowTokens': 300}
-    # l1_queue documents a transient ordering difference after demands with holdback >= 2.
-    demands = config['l1HoldbackChunks'] <= 1
     events = []
     for i in range(r.randint(5, 90)):
         if r.random() < 0.15:   # a tool call, then its result
@@ -176,16 +181,18 @@ def scenario(r):
         events.append({'kind': 'append', 'message': {'id': i + 1000, 'content': content}})
         if r.random() < (0.5 if drift else 0.2):
             window = r.choice([0, r.uniform(1, 20000), r.randint(1, 5000)])
-            budget = r.choice([10**12, r.randint(1, 3000), r.randint(1, 30000)])   # small ones refuse
-            events.append({'kind': 'compile', 'window': window, 'budget': budget})
+            budget = r.choice([{'budget': 10**12}, {'budget': r.randint(1, 3000)}, {'budget': r.randint(1, 30000)},   # small ones refuse
+                               {'within': r.uniform(1, 1.025)}])
+            events.append({'kind': 'compile', 'window': window, **budget})
             if r.random() < 0.8:
                 ratio = 1.8 if drift and r.random() < 0.7 else r.uniform(0.3, 2.2)
                 events.append({'kind': 'usage', 'tokens': r.choice([window * ratio, 0, -3])})
         if r.random() < 0.05:
             events.append({'kind': 'usage', 'tokens': r.uniform(1, 20000)})
-        if demands and r.random() < 0.12:
+        if r.random() < 0.12:
             ids = [e['message']['id'] for e in events if e['kind'] == 'append']
             a, b = sorted(r.sample(range(len(ids)), 2)) if len(ids) > 1 else (0, 0)
+            a, b = (b, a) if r.random() < 0.2 else (a, b)        # a range given newest end first
             events.append({'kind': 'demand', 'first': ids[a], 'last': ids[b] if r.random() < 0.8 else 99999})
         if r.random() < 0.25:
             events.append({'kind': 'summarize', 'count': r.randint(1, 3)})
@@ -199,21 +206,29 @@ def first_difference(expected, actual):
     return None
 
 
-def main(count=300, seed=0):
-    rng = random.Random(seed)
-    written = [scenario(rng) for _ in range(count)]
-    scenarios = json.loads(json.dumps(written))   # as the oracle reads them, ASCII-escaped: both sides parse identical values
-    events = 0
-    for index, (line, s) in enumerate(zip(replay(HERE / 'oracle.mjs', written), scenarios, strict=True)):
-        for step, (expected, actual) in enumerate(zip(json.loads(line), simulate(s['config'], s['events']), strict=True)):
+def main(count=300, seed=0, shard='0/1'):
+    checked = events = 0
+
+    def port(s):
+        parsed = json.loads(json.dumps(s))   # as the oracle reads it, ASCII-escaped: both sides parse identical values
+        states = list(simulate(parsed['config'], parsed['events']))     # first: it fills in budgets
+        return parsed, states
+
+    def check(index, s, states, line):
+        nonlocal checked, events
+        for step, (expected, actual) in enumerate(zip(json.loads(line), states, strict=True)):
             if (diff := first_difference(expected, actual)) is not None:
                 (HERE / 'failing_scenario.json').write_text(json.dumps([s]))
-                print(f'scenario {index} event {step} {s["events"][step]["kind"]}, config {s["config"]}\n{diff}')
-                return 1
+                return f'scenario {index} event {step} {s["events"][step]["kind"]}, config {s["config"]}\n{diff}'
             events += 1
-    print(f'{count} scenarios, {events} events: identical')
+        checked += 1
+
+    scenarios = cases([], lambda i: scenario(random.Random(f'{seed}/{i}')), int(count), shard)
+    if message := compare(HERE / 'oracle.mjs', scenarios, port, check):
+        print(message)
+        return 1
+    print(f'{checked} scenarios, {events} events: identical')
     return 0
 
-
 if __name__ == '__main__':
-    sys.exit(main(*map(int, sys.argv[1:])))
+    sys.exit(main(*sys.argv[1:]))

@@ -1,11 +1,15 @@
-// Replays sessions through the real library's AutobiographicalStrategy.tick (L1s and merges) against a
-// scripted model, and prints one JSON line per session: the state after every event. test_l1.py diffs it.
+// Replays sessions through the real library's AutobiographicalStrategy against a scripted model, and
+// prints one JSON line per session: the state after every event. test_l1.py diffs its ticks (L1s and
+// merges); test_drive.py its passes, which run the harness's own sequence (compaction-autobiographical
+// index.ts: foldPass, compileFolds, driveTick, releaseRetryableQuarantine), transcribed below.
 //
 //   node oracle_l1.mjs sessions.json
 //
-// The strategy is initialized on an in-memory state store with Chronicle's slot semantics. The model
-// records each request as JSON.stringify sends it and answers from the tick's script, then a default.
-// CONTEXT_MANAGER overrides the library entry point (default: the harness's node_modules).
+// The strategy is initialized on an in-memory state store with Chronicle's slot semantics, with the
+// harness's carrierPolicy. The model records each request as JSON.stringify sends it and answers from
+// the event's script, then a default; it counts the calls it starts and notes a retryable failure, as
+// the harness's bridge hooks do. CONTEXT_MANAGER overrides the library entry point (default: the
+// harness's node_modules).
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
@@ -13,7 +17,7 @@ const entry = process.env.CONTEXT_MANAGER ?? fileURLToPath(new URL(
   '../../../../../node_modules/.pnpm/@animalabs+context-manager@0.10.1/node_modules/@animalabs/context-manager/dist/src/index.js',
   import.meta.url,
 ))
-const { MessageStore, AutobiographicalStrategy } = await import(entry)
+const { MessageStore, AutobiographicalStrategy, splitMixedToolMessages } = await import(entry)
 const DEFAULT_REPLY = { stopReason: 'end_turn', content: [{ type: 'text', text: 'Nothing else stood out.' }] }
 
 // The message store reaches its Chronicle store only to persist; estimation never does.
@@ -86,12 +90,16 @@ for (const { config, events } of JSON.parse(readFileSync(process.argv[2], 'utf8'
   }
   let requests = []
   let replies = []
+  let started = 0
+  let transientFailed = false
   const membrane = {
     async complete(request) {
+      started++
       requests.push(JSON.stringify(request))
       const reply = replies.shift() ?? DEFAULT_REPLY
       if (reply.throw) {
         const { message, status, type, retryable } = reply.throw
+        if (retryable === true) transientFailed = true
         throw Object.assign(new Error(message), { httpStatus: status, type, retryable })
       }
       return copy(reply)
@@ -99,11 +107,28 @@ for (const { config, events } of JSON.parse(readFileSync(process.argv[2], 'utf8'
   }
   const store = new StateStore()
   const ctx = { messageStore: view, membrane, store, namespace: 'cm', currentSequence: 0, tools: undefined, systemPrompt: undefined }
-  const strategy = new AutobiographicalStrategy({ ...config, adaptiveResolution: true, foldingStrategy: 'kv-stable' })
+  const strategy = new AutobiographicalStrategy({ ...config, adaptiveResolution: true, foldingStrategy: 'kv-stable', carrierPolicy: 'live-strip' })
+  const compile = (maxTokens, reserveForResponse) => {
+    try {
+      const entries = strategy.select(view, null, { maxTokens, reserveForResponse })
+      return { messages: entries.flatMap((e) => {
+        const parts = splitMixedToolMessages([{ participant: e.participant, content: e.content }])
+        return parts.map((part, i) => ({ ...part, ...(e.cacheMarker && i === parts.length - 1 ? { cacheBreakpoint: true } : {}) }))
+      }) }
+    } catch (error) {
+      if (error.name !== 'OverBudgetError') throw error
+      return { refusal: [error.message.split(' but ')[0], error.actual, error.budget] }
+    }
+  }
+  const queued = () => {
+    const { l1QueueLength, mergeQueueLength } = strategy.getProgressSnapshot()
+    return l1QueueLength + mergeQueueLength
+  }
   await strategy.initialize(ctx)
   const states = []
   for (const event of events) {
     let error = false
+    let compiled = null
     requests = []
     switch (event.kind) {
       case 'append':
@@ -125,6 +150,44 @@ for (const { config, events } of JSON.parse(readFileSync(process.argv[2], 'utf8'
           error = true
         }
         break
+      case 'pass': {                       // foldPass
+        for (const message of event.messages) {
+          messages.push(message)
+          strategy.rebuildChunks(view)
+        }
+        if (event.host) {
+          ctx.tools = event.host.tools ?? undefined
+          ctx.systemPrompt = event.host.system ?? undefined
+        }
+        if (event.usage != null) strategy.reportRealInputTokens(event.usage)
+        // compileFolds
+        compiled = compile(event.budget, event.reserve)
+        if (compiled.refusal) {
+          const [, actual, budget] = compiled.refusal
+          const affordable = actual + event.reserve
+          if (!(actual <= budget || affordable > event.window)) compiled = compile(affordable, event.reserve)
+        }
+        // kickTick: driveTick, then releaseRetryableQuarantine
+        replies = [...event.replies]
+        const quarantined = new Set(strategy.getCompressionQuarantineStatus().keys)
+        transientFailed = false
+        try {
+          for (;;) {
+            const calls = started
+            const before = queued()
+            await strategy.tick(ctx)
+            if (started !== calls || queued() >= before) break
+          }
+        } catch {
+          error = true
+        }
+        if (transientFailed) {
+          for (const key of strategy.getCompressionQuarantineStatus().keys) {
+            if (!quarantined.has(key)) await strategy.clearCompressionRefusalQuarantine(key)
+          }
+        }
+        break
+      }
       default:
         throw new Error(`unknown event ${event.kind}`)
     }
@@ -147,6 +210,10 @@ for (const { config, events } of JSON.parse(readFileSync(process.argv[2], 'utf8'
         lastOutcome: m.lastOutcome ?? null, hadRefusal: m.hadRefusal === true, serverErrorStreak: m.serverErrorStreak ?? 0,
       })),
       mergeQuarantine: [...strategy.mergeQuarantine.values()].map((r) => JSON.stringify(r.sourceIds)).sort(),
+      compiled,
+      levels: Object.fromEntries([...strategy.resolutions].filter(([, level]) => level !== 0)),
+      multiplier: strategy._calibration,
+      armed: strategy._calibrationArmed ? strategy._lastCompileEstimate : 0,
     })
   }
   console.log(JSON.stringify(states))

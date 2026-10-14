@@ -5,7 +5,8 @@
 //   node oracle_compile.mjs sessions.json
 //
 // CONTEXT_MANAGER overrides the library entry point (default: the harness's node_modules). Summaries
-// and merges are injected as the library would record them; no model is called.
+// and merges are injected as the library would record them; no model is called. The strategy runs
+// with the harness's carrierPolicy, 'live-strip'.
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
@@ -30,7 +31,7 @@ for (const { config, events } of JSON.parse(readFileSync(process.argv[2], 'utf8'
     setTokenCalibration: (factor) => store.setTokenCalibration(factor),
     getTokenCalibration: () => store.getTokenCalibration(),
   }
-  const strategy = new AutobiographicalStrategy({ ...config, adaptiveResolution: true, foldingStrategy: 'kv-stable' })
+  const strategy = new AutobiographicalStrategy({ ...config, adaptiveResolution: true, foldingStrategy: 'kv-stable', carrierPolicy: 'live-strip' })
   // Branch guards need a ContextManager-opened store; nothing here switches branches.
   strategy.requireBranchMutation = strategy.requireLoadedBranch = () => {}
   strategy._storeView = view
@@ -47,26 +48,30 @@ for (const { config, events } of JSON.parse(readFileSync(process.argv[2], 'utf8'
         strategy.reportRealInputTokens(event.tokens)
         break
       case 'summarize':                    // what completed ticks leave behind
-        for (const text of event.texts) {
+        for (const memory of event.memories) {
           if (strategy.compressionQueue.length === 0) break
           const chunk = strategy.chunks[strategy.compressionQueue.shift()]
           const id = `L1-${chunk.index}`
           const ids = chunk.messages.map((m) => m.id)
           chunk.compressed = true
           strategy.markChunkRecordCompressed(chunk.recordId, id)
-          strategy.summaries.push({ id, level: 1, content: text, tokens: Math.ceil(text.length / 4), sourceLevel: 0,
-            sourceIds: ids, sourceRange: { first: ids[0], last: ids.at(-1) }, created: 0 })
+          strategy.summaries.push({ id, level: 1, content: memory.text, tokens: memory.tokens, sourceLevel: 0, sourceIds: ids,
+            sourceRange: { first: ids[0], last: ids.at(-1) }, created: 0, ...(memory.blocks ? { responseContent: memory.blocks } : {}) })
         }
         break
-      case 'merge':                        // what a completed merge leaves behind
-        if (event.children.length > 0) {
-          const children = event.children.map(byId)
-          strategy.summaries.push({ id: event.id, level: children[0].level + 1, content: event.text,
-            tokens: Math.ceil(event.text.length / 4), sourceLevel: children[0].level, sourceIds: event.children,
-            sourceRange: { first: children[0].sourceRange.first, last: children.at(-1).sourceRange.last }, created: 0 })
+      case 'merge': {                      // what a completed merge leaves behind
+        // The port picks the children; one this store lacks means the two already disagree, which
+        // the next compared state shows.
+        const children = event.children.map(byId)
+        if (children.length > 0 && children.every(Boolean)) {
+          strategy.summaries.push({ id: event.id, level: children[0].level + 1, content: event.text, tokens: event.tokens,
+            sourceLevel: children[0].level, sourceIds: event.children,
+            sourceRange: { first: children[0].sourceRange.first, last: children.at(-1).sourceRange.last }, created: 0,
+            ...(event.blocks ? { responseContent: event.blocks } : {}) })
           for (const child of children) child.parentId = event.id
         }
         break
+      }
       case 'compile':
         try {
           const entries = strategy.select(view, null, { maxTokens: event.budget, reserveForResponse: 0 })

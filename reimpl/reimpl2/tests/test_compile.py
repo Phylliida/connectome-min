@@ -1,28 +1,28 @@
 """End-to-end differential test of a compile (emit.select) against the real library's
 AutobiographicalStrategy.select plus ContextManager.compile's split (oracle_compile.mjs).
 
-    python3 tests/test_compile.py [sessions] [seed]
+    python3 tests/test_compile.py [sessions] [seed] [shard k/n]
 
 Sessions mix conversation, tool cycles (paired, bundled into one turn, orphaned, dangling), images
 and reasoning, with summaries arriving late, merges, usage reports and budgets near the session's
-size. After every event the compiled messages (or the refusal), committed levels, L1 queue,
+size. Memories arrive as mint stores them, some with the reply's reasoning and text blocks, and are
+rendered under the harness's carrierPolicy 'live-strip'. After every event the compiled messages (or the refusal), committed levels, L1 queue,
 multiplier and armed calibration must match.
 """
 import json
 import random
 import sys
-from dataclasses import replace
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
 import emit  # noqa: E402
-from chunking import close_chunks, l1_queue, post_strip_tokens  # noqa: E402
+import mint  # noqa: E402
+from chunking import close_chunks, enqueue, l1_queue, post_strip_tokens  # noqa: E402
 from config import Config  # noqa: E402
 from estimate import price  # noqa: E402
-from fold import Summary, recall_tokens  # noqa: E402
-from library import replay  # noqa: E402
+from library import cases, compare  # noqa: E402
 
 LIBRARY_NAMES = {
     'target_chunk_tokens': 'targetChunkTokens', 'recent_window_tokens': 'recentWindowTokens',
@@ -40,7 +40,7 @@ def simulate(cfg, events):
     leave to the session's state: a merge's children (the oldest k parentless summaries at the lowest
     level that has k), a usage report given as a ratio of the armed estimate, a budget given as a
     fraction of the priced total."""
-    messages, priced, chunks, summaries, summarized = [], [], [], [], set()
+    messages, priced, chunks, summaries, summarized, queue = [], [], [], [], set(), []
     session, states = emit.Session(), []
     for event in events:
         compiled = None
@@ -48,16 +48,17 @@ def simulate(cfg, events):
             messages.append(event['message'])
             priced.append(price(event['message']))
             chunks += close_chunks(priced, chunks, session.calibration.multiplier, cfg)
+            queue = l1_queue(chunks, summarized, session.demanded, cfg)
         elif event['kind'] == 'usage':
             if 'ratio' in event:
                 event['tokens'] = max(1, round(session.calibration.armed * event.pop('ratio')))
-            session = replace(session, calibration=session.calibration.observe(event['tokens']))
+            session = session._replace(calibration=session.calibration.observe(event['tokens']))
         elif event['kind'] == 'summarize':
-            for text in event['texts']:
-                if not (queue := l1_queue(chunks, summarized, session.demanded, cfg)):
+            for memory in event['memories']:
+                if not queue:
                     break
-                summarized.add(queue[0])
-                summaries.append(Summary(f'L1-{queue[0]}', 1, recall_tokens(text, cfg), tuple(chunks[queue[0]]), None, text))
+                summarized.add(index := queue.pop(0))
+                summaries.append(entry(f'L1-{index}', 1, tuple(chunks[index]), memory))
         elif event['kind'] == 'merge':
             if 'children' not in event:
                 event['children'] = next(([s.id for s in orphans[:event['k']]] for level in range(1, 9)
@@ -66,18 +67,25 @@ def simulate(cfg, events):
             if event['children']:
                 level = next(s.level for s in summaries if s.id == event['children'][0]) + 1
                 summaries = [s._replace(parent=event['id']) if s.id in event['children'] else s for s in summaries]
-                summaries.append(Summary(event['id'], level, recall_tokens(event['text'], cfg), tuple(event['children']), None, event['text']))
+                summaries.append(entry(event['id'], level, tuple(event['children']), event))
         elif event['kind'] == 'compile':
             chunks += close_chunks(priced, chunks, session.calibration.multiplier, cfg)
+            queue = l1_queue(chunks, summarized, session.demanded, cfg)
             if 'fraction' in event:
                 priced_total = sum(post_strip_tokens(priced, session.calibration.multiplier, cfg))
                 event['budget'] = max(1, round(priced_total * event.pop('fraction')))
             session, result = emit.select(messages, priced, chunks, summaries, session, event['budget'], cfg)
+            queue = enqueue(queue, session.demanded, summarized)
             compiled = {'refusal': list(result)} if isinstance(result, emit.Refusal) else {'messages': result}
         states.append({'compiled': compiled, 'levels': {k: v for k, v in session.levels.items() if v != 0},
-                       'queue': l1_queue(chunks, summarized, session.demanded, cfg),
+                       'queue': list(queue),
                        'multiplier': session.calibration.multiplier, 'armed': session.calibration.armed})
     return states
+
+
+def entry(sid, level, sources, memory):
+    """A memory as mint stores it. (A compile never reads its range.)"""
+    return mint.Entry(sid, level, memory['text'], memory['tokens'], sources, None, None, tuple(memory['blocks']) if 'blocks' in memory else None)
 
 
 # --- session generation ---
@@ -89,9 +97,23 @@ def words(r, n):
     return ' '.join(r.choice(WORDS) for _ in range(n))
 
 
+def memory(r, text):
+    """A memory's text, the summarizer's token count and, when the reply reasoned, its reasoning and
+    text blocks, which need not join to the text: mint joins them and strips a <thinking> preamble."""
+    tokens = r.choice([-(-len(text) // 4), r.randint(1, 6000)])
+    if r.random() < 0.5:
+        return {'text': text, 'tokens': tokens}
+    reasoning = r.choice([{'type': 'thinking', 'thinking': words(r, 5), 'signature': 'c2ln'}, {'type': 'thinking', 'thinking': '', 'signature': 'c2ln'},
+                          {'type': 'redacted_thinking', 'data': 'ZW5j' * r.randint(1, 30)}])
+    prose = r.choice([[{'type': 'text', 'text': text}], [{'type': 'text', 'text': ''}, {'type': 'text', 'text': text}],
+                      [{'type': 'text', 'text': '<thinking>first</thinking>\n' + text}], [{'type': 'text', 'text': words(r, 4)}, {'type': 'text', 'text': text}],
+                      [{'type': 'text', 'text': text, 'citations': []}], [{'type': 'text', 'text': ' \n'}], [{'type': 'text', 'text': '\x85'}], []])
+    return {'text': text, 'tokens': tokens, 'blocks': [reasoning] + prose if r.random() < 0.8 else prose + [reasoning]}
+
+
 def session(r):
     cfg = Config(target_chunk_tokens=r.choice([20, 60, 150]), recent_window_tokens=r.choice([0, 60, 200, 600]),
-                 head_window_tokens=r.choice([0, 0, 30, 120]), l1_holdback_chunks=r.choice([0, 1, 1]),
+                 head_window_tokens=r.choice([0, 0, 30, 120]), l1_holdback_chunks=r.choice([0, 1, 1, 2, 3]),
                  image_strip_depth_tokens=r.choice([0, 50, 400, 30000]), max_live_images=r.choice([0, 1, 2, 6]),
                  max_live_image_bytes=r.choice([0, 300, 20 * 1024 * 1024]), slack=r.choice([0.1, 0.1, 0.0, 0.3]),
                  merge_threshold=r.choice([2, 3, 6]), reach_tokens=r.choice([None, None, 0, 50, 400]),
@@ -106,9 +128,11 @@ def session(r):
         size += sum(len(json.dumps(b)) for b in content) // 3
         events.append({'kind': 'append', 'message': {'id': f'm{next(ids)}', 'participant': participant, 'content': content}})
 
+    if r.random() < 0.2:                               # a compile before the log holds anything
+        events.append({'kind': 'compile', 'budget': r.choice([10**9, 50])})
     for _ in range(r.randint(4, 45)):
-        shape = r.choices(['user', 'reply', 'tools', 'bundled', 'orphan', 'dangling', 'image', 'empty', 'duplicate', 'late', 'relayed'],
-                          [30, 25, 20, 4, 3, 4, 40 if pictures else 8, 2, 2, 4, 4])[0]
+        shape = r.choices(['user', 'reply', 'tools', 'bundled', 'orphan', 'dangling', 'image', 'empty', 'duplicate', 'late', 'relayed',
+                           'distant'], [30, 25, 20, 4, 3, 4, 40 if pictures else 8, 2, 2, 4, 4, 2])[0]
         if shape == 'user':
             say(r.choice(['user', 'user', 'User', 'Alice']), [{'type': 'text', 'text': words(r, r.randint(1, 40))}])
         elif shape == 'reply':
@@ -117,7 +141,8 @@ def session(r):
         elif shape in ('tools', 'dangling'):
             uses = [f'tu{next(calls)}' for _ in range(r.randint(1, 3))]
             say('assistant', [{'type': 'text', 'text': words(r, 5)}] * (r.random() < 0.5)
-                + [{'type': 'tool_use', 'id': u, 'name': r.choice(['read', 'bash']), 'input': {'path': words(r, 2)}} for u in uses])
+                + [{'type': 'tool_use', 'id': u, 'name': r.choice(['read', 'bash']), 'input': None if r.random() < 0.05 else {'path': words(r, 2)}}
+                   for u in uses])
             if shape == 'tools':
                 result = lambda u: {'type': 'tool_result', 'toolUseId': u, 'content': r.choice(
                     [words(r, r.randint(0, 80)), [{'type': 'text', 'text': words(r, 20)}]])}
@@ -141,15 +166,21 @@ def session(r):
             say('user', [{'type': 'tool_result', 'toolUseId': u, 'content': words(r, 4)}] * 2)
         elif shape == 'orphan':
             say('user', [{'type': 'tool_result', 'toolUseId': f'tu-gone{next(calls)}', 'content': words(r, 5)}])
+        elif shape == 'distant':                    # the result arrives past the six entries searched for it
+            u = f'tu{next(calls)}'
+            say('assistant', [{'type': 'tool_use', 'id': u, 'name': 'read', 'input': {}}])
+            for _ in range(r.randint(5, 8)):
+                say(r.choice(['user', 'assistant']), [{'type': 'text', 'text': words(r, 2)}])
+            say('user', [{'type': 'tool_result', 'toolUseId': u, 'content': words(r, 4)}])
         elif shape == 'image':
             say('user', [{'type': 'text', 'text': words(r, 3)},
                          {'type': 'image', 'source': {'type': 'base64', 'data': 'A' * r.randint(10, 400)}}])
         else:
-            say('user', [])
+            say(r.choice(['user', 'assistant']), [])
         if r.random() < 0.35:
-            events.append({'kind': 'summarize', 'texts': [words(r, r.randint(3, 120)) for _ in range(r.randint(1, 3))]})
+            events.append({'kind': 'summarize', 'memories': [memory(r, words(r, r.randint(3, 120))) for _ in range(r.randint(1, 3))]})
         if r.random() < 0.15:
-            events.append({'kind': 'merge', 'k': cfg.merge_threshold, 'text': words(r, r.randint(3, 80))})
+            events.append({'kind': 'merge', 'k': cfg.merge_threshold, **memory(r, words(r, r.randint(3, 80)))})
         if r.random() < 0.4:
             events.append(r.choice([{'kind': 'compile', 'budget': 10**9},
                                     {'kind': 'compile', 'budget': max(1, round(size * r.uniform(0.15, 1.3)))},
@@ -163,27 +194,33 @@ def library_config(cfg):
     return {LIBRARY_NAMES[k]: v for k, v in vars(cfg).items() if k in LIBRARY_NAMES and v is not None}
 
 
-def main(count=150, seed=0):
-    rng = random.Random(seed)
-    sessions = [session(rng) for _ in range(count)]
-    expected = [simulate(s['cfg'], s['events']) for s in sessions]      # first: it fills in the events
-    lines = replay(HERE / 'oracle_compile.mjs', [{'config': library_config(s['cfg']), 'events': s['events']} for s in sessions])
-    compiles = refusals = 0
-    for index, (line, s, mine) in enumerate(zip(lines, sessions, expected, strict=True)):
-        for step, (library, port) in enumerate(zip(json.loads(line), json.loads(json.dumps(mine)), strict=True)):
-            for key in port:
-                if port[key] != library[key]:
+def main(count=150, seed=0, shard='0/1'):
+    checked = compiles = refusals = 0
+
+    def port(s):
+        states = json.loads(json.dumps(simulate(s['cfg'], s['events'])))      # first: it fills in the events
+        return {'config': library_config(s['cfg']), 'events': s['events']}, states
+
+    def check(index, s, states, line):
+        nonlocal checked, compiles, refusals
+        for step, (library, mine) in enumerate(zip(json.loads(line), states, strict=True)):
+            for key in mine:
+                if mine[key] != library[key]:
                     (HERE / 'failing_session.json').write_text(json.dumps(
                         {'config': library_config(s['cfg']), 'events': s['events'][:step + 1]}))
-                    print(f'session {index} event {step} ({s["events"][step]["kind"]}): {key}\n'
-                          f'  library {json.dumps(library[key])[:1500]}\n  port    {json.dumps(port[key])[:1500]}')
-                    return 1
-            if port['compiled']:
+                    return (f'session {index} event {step} ({s["events"][step]["kind"]}): {key}\n'
+                            f'  library {json.dumps(library[key])[:1500]}\n  port    {json.dumps(mine[key])[:1500]}')
+            if mine['compiled']:
                 compiles += 1
-                refusals += 'refusal' in port['compiled']
-    print(f'{count} sessions, {compiles} compiles ({refusals} refused): identical')
+                refusals += 'refusal' in mine['compiled']
+        checked += 1
+
+    sessions = cases([], lambda i: session(random.Random(f'{seed}/{i}')), int(count), shard)
+    if message := compare(HERE / 'oracle_compile.mjs', sessions, port, check):
+        print(message)
+        return 1
+    print(f'{checked} sessions, {compiles} compiles ({refusals} refused): identical')
     return 0
 
-
 if __name__ == '__main__':
-    sys.exit(main(*map(int, sys.argv[1:])))
+    sys.exit(main(*sys.argv[1:]))

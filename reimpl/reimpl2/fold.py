@@ -5,7 +5,8 @@ Each compile picks a level for every message between the head and tail windows: 
 k renders its L_k ancestor's recall pair, once for all the messages that share it.
   1. The ideal cut, from scratch: fold whole groups in (salience, age) order, level by level,
      first no deeper than each message's log-age band, then deeper if the window W demands it;
-     then unfold youngest-first while that brings the total closer to the target.
+     then unfold youngest-first while that brings the total closer to the target; again, up to three
+     rounds in all, while the render still exceeds W (a negative head or tail can leave it there).
   2. Hold the carried frontier if its total is in [target, W] and its misallocation is not much
      worse than the ideal's.
   3. Otherwise adopt the ideal if switching to it re-reads at most P tokens (kv_cost).
@@ -15,7 +16,7 @@ k renders its L_k ancestor's recall pair, once for all the messages that share i
 Default mode: no pins or locked messages and no prepared-window transition. Summaries must form
 the library's nested pyramid: each L_k merges whole L_(k-1)s, so a message's ancestors have levels
 1, 2, 3, ... The ideal cut then only ever moves whole groups and stays group-consistent, so the
-library's projection, fixpoint rounds, overlap tolerance and unfold eligibility never act on it;
+library's projection, overlap tolerance and unfold eligibility never act on it;
 the bootstrap branch needs an empty log. Carried frontiers and suffix candidates can cut through a
 group (a message returning from the tail with a stale level, a boundary inside a group), and are
 projected.
@@ -48,7 +49,6 @@ class Summary(NamedTuple):
     tokens: float                         # its recall pair's price (recall_tokens)
     sources: tuple                        # message ids for an L1, child summary ids above
     parent: str | None = None
-    text: str = ''                        # the memory, as its recall pair's answer renders it
 
 
 class Inputs(NamedTuple):
@@ -100,7 +100,7 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
     leaves, nodes = inputs.leaves, {s.id: s for s in inputs.summaries}
     middle = {leaf.id for leaf in leaves}
     target, P = W * (1 - cfg.slack), W if cfg.reach_tokens is None else cfg.reach_tokens
-    top, k = max((s.level for s in inputs.summaries), default=0), max(2, cfg.merge_threshold)
+    top, k = max((s.level for s in inputs.summaries), default=0), cfg.merge_threshold
     at, head_tokens, tail_tokens = ancestry(inputs.summaries), inputs.head_tokens, inputs.tail_tokens
 
     @cache
@@ -108,7 +108,7 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
         """A summary's leaves; its head and tail messages render raw beside its recall."""
         s = nodes[sid]
         return tuple(m for m in s.sources if m in middle) if s.level == 1 else \
-            tuple(m for child in s.sources if child in nodes for m in members(child))
+            tuple(m for child in s.sources for m in members(child))
 
     def middle_units(F: dict) -> list:
         """The middle's rendered units in order, as (identity, tokens): siblings share one recall."""
@@ -126,16 +126,16 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
         return head_tokens + tail_tokens + size(middle_units(F))
 
     def band(leaf: Leaf) -> int:
-        """foldDepthCap: how deep the message's age allows, counted in base-k digits."""
-        ratio = max(0, len(inputs.prices) - 1 - leaf.seq) / max(1, len(inputs.prices) - len(leaves))   # age / zone size
-        return 0 if ratio < 1 else max(0, min(top, math.floor(math.log(ratio) / math.log(k)) + 1))
+        """foldDepthCap: how deep the message's age allows, counted in base-k digits. (The library caps
+        it at the top level, which no fold passes anyway.)"""
+        ratio = (len(inputs.prices) - 1 - leaf.seq) / max(1, len(inputs.prices) - len(leaves))   # age / zone size
+        return 0 if ratio < 1 else math.floor(math.log(ratio) / math.log(k)) + 1
 
     cap = {leaf.id: band(leaf) for leaf in leaves}
-    salience = {leaf.id: min(1, max(0, leaf.salience)) if math.isfinite(leaf.salience) else 1 for leaf in leaves}
 
     def loss(F: dict) -> float:
         """Misallocation: salience-weighted depth past each band, added oldest first."""
-        return reduce(add, (salience[m.id] * (F[m.id] - cap[m.id]) for m in leaves if F[m.id] > cap[m.id]), 0)
+        return reduce(add, (m.salience * (F[m.id] - cap[m.id]) for m in leaves if F[m.id] > cap[m.id]), 0)
 
     def project(F: dict) -> dict:
         """projectToValidCut: each pass lowers by one, in place, every leaf whose group disagrees
@@ -150,26 +150,31 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
                     F[leaf.id], changed = level - 1, True
         return F
 
-    # 1. The ideal cut.
-    ideal = dict.fromkeys(middle, 0)
-    tokens = accounted(ideal)
-    priority = sorted(leaves, key=lambda m: (salience[m.id], m.seq))
-    for within_bands, limit in ((True, target), (False, W)):    # phase A, and phase B only past W
-        if tokens > limit:
-            for level, leaf in product(range(1, top + 1), priority):
-                node = at(leaf, level) if tokens > target and ideal[leaf.id] < level else None
-                if node and (not within_bands or min(cap[m] for m in members(node.id)) >= level):
-                    ideal |= dict.fromkeys(members(node.id), level)
-                    tokens = accounted(ideal)
-    if tokens <= W:     # phase C: unfold each group at a level once, youngest-first, if that nears the target
+    # 1. The ideal cut, in rounds: the ledger steers the phases, but a round ends on the render, which
+    #    leaves out a negative window. While that exceeds W and shrinks, another round, three at most.
+    ideal, rendered = dict.fromkeys(middle, 0), math.inf
+    priority = sorted(leaves, key=lambda m: (m.salience, m.seq))
+    for _ in range(3):
+        tokens = accounted(ideal)
+        for within_bands, limit in ((True, target), (False, W)):    # phase A, and phase B only past W
+            if tokens > limit:
+                for level, leaf in product(range(1, top + 1), priority):
+                    node = at(leaf, level) if tokens > target and ideal[leaf.id] < level else None
+                    if node and (not within_bands or min(cap[m] for m in members(node.id)) >= level):
+                        ideal |= dict.fromkeys(members(node.id), level)
+                        tokens = accounted(ideal)
+        # Phase C, when the total is under W: unfold each group at a level once, youngest-first, if that
+        # nears the target. Unfolding a group moves the total by a fixed amount and only other groups'
+        # unfolds came before, so the library's retries of a refused group after each accept always refuse.
         for level in range(top, 0, -1):
-            # Unfolding a group moves the total by a fixed amount and only other groups' unfolds came
-            # before, so the library's retries of a refused group after each accept always refuse.
             for node in dict.fromkeys(at(m, level) for m in reversed(leaves) if ideal[m.id] == level):
                 if tokens < target:
                     trial = ideal | dict.fromkeys(members(node.id), level - 1)
                     if (t := accounted(trial)) <= W and abs(t - target) < abs(tokens - target):
                         ideal, tokens = trial, t
+        if (now := size(layout(ideal))) <= W or now >= rendered:
+            break
+        rendered = now
     escalated = size(layout(ideal)) > W
     produced = [(run[0].id, run[-1].id) for run in
                 (list(run) for uncovered, run in groupby(leaves, lambda m: not m.l1) if uncovered and escalated)]
@@ -202,11 +207,9 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
     return Plan(ideal, accounted(ideal), pert, 'infeasible' if partial > W else 'quality-gap', escalated, produced)
 
 
-def fits(tokens: float, W: float, cfg: Config) -> bool:
-    """The library rejects a compile (OverBudgetError) whose plan, or whose head and tail alone,
-    exceeds W by more than the grace; the carried frontier then stays, and only demand for the
-    plan's produced ranges goes ahead."""
-    return tokens <= math.floor(W * (1 + cfg.over_budget_grace))
+def ceiling(W: float, cfg: Config) -> int:
+    """The most a compile may render, W plus the grace: OverBudgetError's budget."""
+    return math.floor(W * (1 + cfg.over_budget_grace))
 
 
 def inputs(messages: list[Priced], summaries: list[Summary], levels: dict, multiplier: float,
@@ -216,13 +219,13 @@ def inputs(messages: list[Priced], summaries: list[Summary], levels: dict, multi
     priced = chunking.post_strip_tokens(messages, multiplier, cfg)
     lo = chunking.head_end(messages, multiplier, cfg)
     hi = chunking.recent_start(messages, multiplier, cfg)                # a tail reaching into the head starts after it
-    l1 = {m: s.id for s in reversed(summaries) if s.level == 1 for m in s.sources}   # reversed: the first wins
+    l1 = {m: s.id for s in summaries if s.level == 1 for m in s.sources}
     leaves = [Leaf(m.id, i, priced[i], levels.get(m.id, 0), l1.get(m.id), m.salience)
               for i, m in enumerate(messages[lo:hi], lo)]
     return Inputs(leaves, summaries, lo, priced)
 
 
-def recall_tokens(text: str, cfg: Config) -> int:
-    """A plain-text summary's recall-pair price (recallPairCost, default envelope, no reasoning
-    carriers): its label plus its text, each chars/4."""
-    return math.ceil(js_len(cfg.summary_label) / 4) + math.ceil(js_len(text) / 4)
+def recall_tokens(answer, cfg: Config) -> int:
+    """A recall pair's price (recallPairCost, default envelope, reasoning carriers stripped): its label
+    plus each of its answer's blocks, all text, chars/4."""
+    return math.ceil(js_len(cfg.summary_label) / 4) + sum(math.ceil(js_len(b['text']) / 4) for b in answer)

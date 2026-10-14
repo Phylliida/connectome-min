@@ -1,6 +1,7 @@
 """The AutobiographicalStrategy options this port reads, at @animalabs/context-manager 0.10.1's
 defaults for adaptive resolution with the kv-stable planner (the library's name in each comment).
-The harness sets compression_model to the session's model and summary_participant to 'assistant'."""
+The harness sets compression_model to the session's model and summary_participant to 'assistant',
+and carrierPolicy to 'live-strip', the only policy emit.answer renders."""
 from dataclasses import dataclass
 
 
@@ -17,7 +18,7 @@ class Config:
     max_live_image_bytes: int = 20 * 1024 * 1024    # maxLiveImageBytes
     # planning
     slack: float = 0.1                              # compressionSlackRatio: target = W * (1 - slack)
-    merge_threshold: int = 6                        # mergeThreshold: the pyramid's base, which sets the age bands
+    merge_threshold: int = 6                        # mergeThreshold: the pyramid's base, which sets the age bands; 2 or more
     reach_tokens: float | None = None               # kvStableReachTokens, the trust region P; None = W
     quality_gap_ratio: float = 0.35                 # kvStableQualityGapRatio
     over_budget_grace: float = 0.02                 # overBudgetGraceRatio

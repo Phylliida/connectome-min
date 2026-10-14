@@ -6,9 +6,7 @@ messages it owns; chunks are listed in close order and never change, so an index
 
 Call close_chunks wherever the library rebuilds: after every appended message and at the start of
 every compile, with the multiplier then in effect. Closed chunks are permanent, so rebuild timing
-decides which exist by a given moment. The harness's agent step: append the step's messages,
-Calibration.observe the last request's usage, compile (close_chunks, then Calibration.arm), then make
-at most one summarizer call, for l1_queue's head or, when the queue is empty, a merge.
+decides which exist by a given moment. drive.py rebuilds as the harness's pass does.
 
 Not reproduced, because an append-only log with stored chunks never reaches them: the library's
 repairs for records that lost their messages, chunks overlapping existing L1s, and crashes between
@@ -82,21 +80,25 @@ def close_chunks(messages: list[Priced], chunks, multiplier: float, cfg: Config)
     return [tuple(messages[i].id for i in run) for run in closed + [run] * full]
 
 
-def l1_queue(chunks, summarized: set[int], demanded: set[int], cfg: Config) -> list[int]:
-    """Indices of the chunks awaiting an L1, in the order the summarizer takes them: close order, minus
-    the newest l1_holdback_chunks unless demanded. This is the library's queue as of its latest rebuild;
-    until the next one, it appends demanded chunks in its own order, which differs from this only when
-    two or more held-back chunks are demanded at once (l1_holdback_chunks >= 2)."""
+def l1_queue(chunks, summarized: set[int], demanded, cfg: Config) -> list[int]:
+    """The queue of chunks awaiting an L1 as a rebuild leaves it: close order, minus the newest
+    l1_holdback_chunks unless demanded. Until the next rebuild, demand appends to it (enqueue)."""
     cutoff = len(chunks) - cfg.l1_holdback_chunks
     return [i for i in range(len(chunks)) if i not in summarized and (i < cutoff or i in demanded)]
 
 
-def demand(chunks, first_id, last_id) -> set[int]:
-    """The chunks to add to `demanded` when the folder needs an L1 over first_id..last_id
-    (enqueueL1ForRange): those at either end and between. A last_id in the open run reaches the newest
-    chunk; a first_id in no chunk leaves only last_id's."""
+def enqueue(queue: list[int], candidates, summarized: set[int]) -> list[int]:
+    """enqueueL1ForRange's queueing: `queue` with each candidate neither summarized nor queued
+    appended, in order."""
+    return queue + [c for c in dict.fromkeys(candidates) if c not in summarized and c not in queue]
+
+
+def demand(chunks, first_id, last_id) -> dict:
+    """The chunks the folder demands an L1 for when it needs one over first_id..last_id
+    (enqueueL1ForRange), as keys in the order it queues them: first_id's, last_id's, then those between. A
+    last_id in the open run reaches the newest chunk; a first_id in no chunk leaves only last_id's."""
     owner = {mid: i for i, chunk in enumerate(chunks) for mid in chunk}
     first, last = owner.get(first_id), owner.get(last_id)
     if first is None: first = last
     elif last is None: last = len(chunks) - 1
-    return set() if first is None else set(range(min(first, last), max(first, last) + 1))
+    return {} if first is None else dict.fromkeys([first, last, *range(min(first, last), max(first, last) + 1)])

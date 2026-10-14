@@ -1,6 +1,6 @@
 """Differential test of fold.py against the real library's kv-stable picker (oracle_fold.mjs).
 
-    python3 tests/test_fold.py [sessions] [seed]
+    python3 tests/test_fold.py [sessions] [seed] [shard k/n]
 
 Each session grows a log turn by turn: chunks close outside a tail window whose size wanders (so
 it later covers folded messages again), L1s arrive late, merges of k form, and the window, reach
@@ -17,8 +17,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
 from config import Config  # noqa: E402
-from fold import Inputs, Leaf, Summary, fits, plan, recall_tokens  # noqa: E402
-from library import replay  # noqa: E402
+from fold import Inputs, Leaf, Summary, ceiling, plan, recall_tokens  # noqa: E402
+from library import cases, compare  # noqa: E402
 
 
 def session(r):
@@ -40,7 +40,7 @@ def session(r):
     for _ in range(r.randint(3, 40)):
         for _ in range(r.randint(1, 5)):
             tokens.append(r.choice([0, r.randint(1, 60), r.randint(60, 400), r.randint(-300, -1)]))   # < 0: a stripped image
-            salience.append(r.choice([1, 1, 0.2, 0.5, 0.7333333333333334, r.random(), 1.5, -0.25]))
+            salience.append(r.choice([1, 1, 0.2, 0.5, 0.7333333333333334, r.uniform(0.2, 1)]))   # static_salience's range
         n = len(tokens)
         if r.random() < 0.3:
             tail_budget = r.choice([0, 50, 200, 600, 1500])
@@ -69,15 +69,15 @@ def session(r):
                     parent[child] = sid
                 orphans = orphans[cfg.merge_threshold:]
 
-        summaries = [Summary(s, level_of[s], recall_tokens(text[s], cfg), sources[s], parent.get(s), text[s]) for s in level_of]
+        summaries = [Summary(s, level_of[s], recall_tokens([{'type': 'text', 'text': text[s]}], cfg), sources[s], parent.get(s)) for s in level_of]
         l1 = {m: s.id for s in summaries if s.level == 1 for m in s.sources}
         leaves = [Leaf(f'm{i}', i, tokens[i], levels.get(f'm{i}', 0), l1.get(f'm{i}'), salience[i]) for i in range(lo, hi)]
         inputs = Inputs(leaves, summaries, lo, tokens[:])
-        if not fits(inputs.head_tokens + inputs.tail_tokens, W, cfg):
+        if inputs.head_tokens + inputs.tail_tokens > ceiling(W, cfg):
             continue                           # refused before the picker runs
         result = plan(inputs, W, cfg)
         turns.append((library_inputs(inputs, range(lo), range(hi, n), tokens, text, W, cfg), result))
-        if fits(result.tokens, W, cfg):
+        if result.tokens <= ceiling(W, cfg):
             levels |= result.levels
         if result.produced:                    # demand lets held-back chunks through
             while pending and r.random() < 0.8:
@@ -113,23 +113,24 @@ def expected(result, recorded):
             'recall': [s['recall'] for s in recorded['summaries']]}
 
 
-def main(count=200, seed=0):
-    rng = random.Random(seed)
-    sessions = [session(rng) for _ in range(count)]
-    lines = replay(HERE / 'oracle_fold.mjs', [[recorded for recorded, _ in turns] for turns in sessions])
+def main(count=200, seed=0, shard='0/1'):
     branches = {}
-    for index, (line, turns) in enumerate(zip(lines, sessions, strict=True)):
+
+    def check(index, _, turns, line):
         for step, (library, (recorded, result)) in enumerate(zip(json.loads(line), turns, strict=True)):
             mine = expected(result, recorded)
             for key in mine:
                 if mine[key] != library[key]:
                     (HERE / 'failing_session.json').write_text(json.dumps([[recorded]]))
-                    print(f'session {index} turn {step} ({result.branch}): {key}\n  library {library[key]!r}\n  port    {mine[key]!r}')
-                    return 1
+                    return f'session {index} turn {step} ({result.branch}): {key}\n  library {library[key]!r}\n  port    {mine[key]!r}'
             branches[result.branch] = branches.get(result.branch, 0) + 1
-    print(f'{count} sessions, {sum(branches.values())} compiles: identical; branches {dict(sorted(branches.items()))}')
+
+    sessions = cases([], lambda i: session(random.Random(f'{seed}/{i}')), int(count), shard)
+    if message := compare(HERE / 'oracle_fold.mjs', sessions, lambda turns: ([recorded for recorded, _ in turns], turns), check):
+        print(message)
+        return 1
+    print(f'{sum(branches.values())} compiles: identical; branches {dict(sorted(branches.items()))}')
     return 0
 
-
 if __name__ == '__main__':
-    sys.exit(main(*map(int, sys.argv[1:])))
+    sys.exit(main(*sys.argv[1:]))

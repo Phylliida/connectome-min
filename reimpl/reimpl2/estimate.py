@@ -31,16 +31,20 @@ def js_len(s: str) -> int:
     return len(s.encode('utf-16-le', 'surrogatepass')) // 2
 
 
+def js_trim(s: str) -> str:
+    """String.prototype.trim, which keeps U+0085 and the other spaces Python's strip() takes."""
+    return s.strip(_JS_SPACE)
+
+
 def js_round(x: float) -> int:
     """Math.round: halves go up, where Python's round() goes to even (12.5 -> 13, not 12)."""
     return (whole := math.floor(x)) + (x - whole >= 0.5)
 
 
 def js_number(x: float) -> str:
-    """Number::toString, as JSON.stringify writes it: 1.0 is '1', 1e-7 is '1e-7', 1e21 is '1e+21'."""
-    if not math.isfinite(x := float(x)): return 'null'
-    if x == 0: return '0'
-    _, digits, exponent = Decimal(repr(abs(x))).normalize().as_tuple()   # repr's digits are JS's
+    """Number::toString, as JSON.stringify writes a JSON number: 1.0 is '1', 1e-7 is '1e-7', 1e21 is
+    '1e+21', and an integer past 2**53 rounds as a double."""
+    _, digits, exponent = Decimal(repr(x := float(x))).normalize().as_tuple()   # repr's digits are JS's
     d, k = ''.join(map(str, digits)), len(digits)
     n = exponent + k                                                     # |x| = 0.d1..dk * 10^n
     return '-' * (x < 0) + (d + '0' * (n - k) if k <= n <= 21 else      # 1200
@@ -137,27 +141,20 @@ def store_tokens(message: Priced, multiplier: float = 1.0) -> int:
 def static_salience(content) -> float:
     """1 for conversation, down to 0.2 for content that exists elsewhere: fenced code, bare link
     lines, tool payloads, images (computeStaticSalience)."""
-    total = external = 0
-    for block in content:
+    def weigh(block) -> tuple[int, int]:
+        """(characters, how many of them exist elsewhere)."""
         match block:
-            case {'type': 'text'}:
-                text = block.get('text') or ''
-                total += js_len(text)
-                external += sum(js_len(fence) for fence in text.split('```')[1::2])
-                external += sum(js_len(s) for line in text.split('\n') if _LINK.fullmatch(s := line.strip(_JS_SPACE)))
-            case {'type': 'tool_use'}:
-                n = json_len({} if block.get('input') is None else block['input'])
-                total, external = total + n, external + n
-            case {'type': 'tool_result', 'content': str() as text}:
-                total, external = total + js_len(text), external + js_len(text)
-            case {'type': 'tool_result'}:
-                n = json_len('' if block.get('content') is None else block['content'])
-                total, external = total + n, external + n
-            case {'type': 'image'}:
-                total, external = total + 6400, external + 6400     # 1600 tokens' worth
-            case _:
-                total += js_len(block.get('text') or '')
-    return 1 if total <= 0 else max(0.2, 1 - 0.8 * min(1, external / total))
+            case {'type': 'text', 'text': text}:
+                links = (s for line in text.split('\n') if _LINK.fullmatch(s := js_trim(line)))
+                return js_len(text), sum(map(js_len, text.split('```')[1::2])) + sum(map(js_len, links))
+            case {'type': 'tool_use'}: n = json_len({} if block.get('input') is None else block['input'])
+            case {'type': 'tool_result', 'content': str() as text}: n = js_len(text)
+            case {'type': 'tool_result'}: n = json_len('' if block.get('content') is None else block['content'])
+            case {'type': 'image'}: n = 6400                       # 1600 tokens' worth
+            case _: return 0, 0
+        return n, n
+    total, external = (sum(column) for column in zip((0, 0), *map(weigh, content)))
+    return 1 if total <= 0 else max(0.2, 1 - 0.8 * (external / total))     # fences and links can overlap: the floor caps it
 
 
 def image_bytes(block) -> int:
@@ -182,7 +179,7 @@ class Calibration(NamedTuple):
     def observe(self, real_tokens: float) -> 'Calibration':
         """real_tokens: input + cache-read + cache-write. A ratio outside 0.6..1.8 is a request the
         compile didn't build: it disarms without learning."""
-        if not (math.isfinite(real_tokens) and real_tokens > 0 and self.armed > 0): return self
+        if not (real_tokens > 0 and self.armed > 0): return self
         ratio, m = real_tokens / self.armed, self.multiplier
         if not 0.6 <= ratio <= 1.8: return Calibration(m)
         return Calibration(min(1.8, max(0.6, m + 0.2 * (ratio * m - m))))   # JS's operation order
