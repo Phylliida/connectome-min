@@ -99,7 +99,7 @@ def l1_queue(chunks, summarized: set[int], demanded, cfg: Config) -> list[int]:
 def enqueue(queue: list[int], candidates, summarized: set[int]) -> list[int]:
     """enqueueL1ForRange's queueing: `queue` with each candidate neither summarized nor queued
     appended, in order."""
-    return queue + [c for c in dict.fromkeys(candidates) if c not in summarized and c not in queue]
+    return [*queue, *(c for c in dict.fromkeys(candidates) if c not in summarized and c not in queue)]
 
 
 def demand(chunks, first_id, last_id) -> dict:

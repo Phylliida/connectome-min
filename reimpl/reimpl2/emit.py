@@ -1,7 +1,7 @@
 """The compiled context of @animalabs/context-manager 0.10.1 (AutobiographicalStrategy.select on the
 adaptive path, then ContextManager.compile's tool-message split), reproduced exactly in default mode.
 
-A compile plans the levels (fold.py), refuses if the plan exceeds W plus the grace, then renders:
+A compile plans the levels (planner.py), refuses if the plan exceeds W plus the grace, then renders:
 the head raw; each middle message raw, or its ancestor's recall pair (a 'Context Manager' turn with
 the summary label, then the memory as answer() renders it, as the agent) once, where its first
 message would be; the tail raw. Passes over the result: trailing tool calls with no result are
@@ -14,24 +14,24 @@ newest-first, against W plus the grace. A message whose stripped image priced it
 make a prefix exceed what the whole fits under, and then the compile is refused. Not reproduced: the
 full-coverage assertion, which cannot fire when every unit renders as planned.
 """
-from itertools import groupby, takewhile
+import math
+from itertools import takewhile
 from typing import NamedTuple
 
 import chunking
-import fold
+import planner
+from blocks import REASONING, image_bytes
 from config import Config
-from estimate import Priced, image_bytes, js_trim, store_tokens
+from cut import Summary
+from estimate import Priced, store_tokens
+from js import js_len, js_trim
 from state import State
+from turns import IMAGE_PLACEHOLDER, has, pair_tools, split
 
 PICKER = 'Adaptive picker exhausted'
 EMISSION = 'Emission overran the plan (planner/emitter estimator drift)'
 TAIL = 'Tail emission dropped reserved recent-window messages'
 NEWEST = 'Structural repair did not retain the newest turn'
-OMITTED = {'type': 'text', 'text': '[tool call omitted]'}
-STUB = '[tool result unavailable — omitted during context compression]'
-IMAGE_PLACEHOLDER = {'type': 'text', 'text': '[image dropped from live context]'}
-LOOKAHEAD = 6                             # entries searched for a displaced tool result
-REASONING = ('thinking', 'redacted_thinking')
 
 
 class Refusal(NamedTuple):
@@ -47,12 +47,12 @@ def select(state: State, W: float, cfg: Config) -> tuple[State, list | Refusal]:
     state = chunking.rebuild(state, cfg)
     messages, priced, multiplier = state.messages, state.priced, state.calibration.multiplier
     answers = {s.id: answer(s) for s in state.entries}
-    summaries = [fold.Summary(s.id, s.level, fold.recall_tokens(answers[s.id], cfg), s.sources, s.parent) for s in state.entries]
-    view = fold.inputs(priced, summaries, state.levels, multiplier, cfg)
-    limit = fold.ceiling(W, cfg)
+    summaries = [Summary(s.id, s.level, recall_tokens(answers[s.id], cfg), s.sources, s.parent) for s in state.entries]
+    view = planner.inputs(priced, summaries, state.levels, multiplier, cfg)
+    limit = planner.ceiling(W, cfg)
     if view.head_tokens + view.tail_tokens > limit:
         return state, Refusal(PICKER, view.head_tokens + view.tail_tokens, limit)
-    plan = fold.plan(view, W, cfg)
+    plan = planner.plan(view, W, cfg)
     wanted = [c for first, last in plan.produced for c in chunking.demand(state.chunks, first, last)]
     state = state._replace(demanded=state.demanded | dict.fromkeys(wanted), queue=chunking.enqueue(state.queue, wanted, state.summarized))
     if plan.tokens > limit:
@@ -94,44 +94,10 @@ def answer(memory) -> list[dict]:
     return stripped if any(js_trim(b['text']) for b in stripped) else [{'type': 'text', 'text': memory.content}]   # all text
 
 
-def has(entry: dict, kind: str) -> bool:
-    return any(block['type'] == kind for block in entry['content'])
-
-
-def pair_tools(entries: list[dict]) -> list[dict]:
-    """enforceToolPairing, in place: a tool_result must answer a tool_use in the entry just before it,
-    once; others are dropped. A tool_use the next entry doesn't answer gets its result moved up from
-    the next six entries, else a stub; results join that entry, or a new user entry before it."""
-    uses, i = {}, 0
-    while i < len(entries):
-        entry, seen = entries[i], set()
-        kept = [b for b in entry['content'] if b['type'] != 'tool_result'
-                or (b['toolUseId'] in uses and b['toolUseId'] not in seen and not seen.add(b['toolUseId']))]
-        if len(kept) != len(entry['content']):
-            entry['content'] = kept or [OMITTED]
-        answered = {b['toolUseId'] for b in entry['content'] if b['type'] == 'tool_result'}
-        if missing := [u for u in uses if u not in answered]:
-            results = [take_result(entries, i, u) for u in missing]
-            if not answered:                   # the new entry is checked next, and answers them
-                entries.insert(i, {'participant': 'user', 'content': results, 'source': None})
-                continue
-            entry['content'] = results + entry['content']
-        uses = dict.fromkeys(b['id'] for b in entry['content'] if b['type'] == 'tool_use')
-        i += 1
-    if uses:
-        entries.append({'participant': 'user', 'content': [stub(u) for u in uses], 'source': None})
-    return entries
-
-
-def take_result(entries: list[dict], i: int, use_id: str) -> dict:
-    """relocateOrDropMissingResults: the result for `use_id` from the next LOOKAHEAD entries, else a
-    stub. The library also removes it there; the entry left holding it drops it when checked."""
-    return next((b for later in entries[i + 1:i + 1 + LOOKAHEAD] for b in later['content']
-                 if b['type'] == 'tool_result' and b['toolUseId'] == use_id), stub(use_id))
-
-
-def stub(use_id: str) -> dict:
-    return {'type': 'tool_result', 'toolUseId': use_id, 'content': STUB}
+def recall_tokens(answer, cfg: Config) -> int:
+    """A recall pair's price (recallPairCost, default envelope, reasoning carriers stripped): its label
+    plus each of its answer's blocks, all text, chars/4."""
+    return math.ceil(js_len(cfg.summary_label) / 4) + sum(math.ceil(js_len(b['text']) / 4) for b in answer)
 
 
 def strip_images(entries: list[dict], priced: list[Priced], multiplier: float, cfg: Config) -> list[dict]:
@@ -172,14 +138,3 @@ def cache_marks(entries: list[dict], head: set, tail: set, previous: list | None
     else:
         stable = sum(1 for _ in takewhile(lambda pair: pair[0] == pair[1], zip(keys, previous))) - 1
     return {len(entries) - 1} | {last_head} - {-1} | ({stable} if stable > last_head else set()), keys
-
-
-def split(entry: dict, marked: bool) -> list[dict]:
-    """ContextManager.compile's splitMixedToolMessages: a non-user turn carrying tool results becomes
-    runs of its own blocks and user turns of results; a marked entry's last part carries the marker."""
-    user = entry['participant'].lower() == 'user' or not has(entry, 'tool_result')
-    parts = [(entry['participant'], entry['content'])] if user else \
-        [('user' if result else entry['participant'], list(run))
-         for result, run in groupby(entry['content'], lambda b: b['type'] == 'tool_result')]
-    return [{'participant': p, 'content': c, **({'cacheBreakpoint': True} if marked and k == len(parts) - 1 else {})}
-            for k, (p, c) in enumerate(parts)]

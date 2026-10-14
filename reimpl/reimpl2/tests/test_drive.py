@@ -23,10 +23,10 @@ sys.path[:0] = [str(HERE.parent), str(HERE)]
 
 import drive  # noqa: E402
 import emit  # noqa: E402
-import mint  # noqa: E402
+from calls import Host  # noqa: E402
 import test_l1  # noqa: E402
 from chunking import post_strip_tokens  # noqa: E402
-from estimate import js_json  # noqa: E402
+from js import js_json  # noqa: E402
 from config import Config  # noqa: E402
 from library import cases, compare  # noqa: E402
 from state import State  # noqa: E402
@@ -38,7 +38,7 @@ def simulate(cfg, events):
     """The port, driven as the oracle drives the library. Fills in, for the oracle, what a pass leaves
     to the port's state: its usage report from the armed estimate, a budget from the priced total,
     and the window above the budget."""
-    state, host, states = State(), mint.Host(None), []
+    state, host, states = State(), Host(None), []
     for event in events:
         if 'host' in event:
             host = host._replace(tools=event['host']['tools'], system=event['host']['system'])

@@ -18,6 +18,7 @@ harness runs them behind the turn.
 """
 import emit
 import mint
+from calls import Host
 from chunking import rebuild
 from config import Config
 from estimate import price
@@ -25,7 +26,7 @@ from state import State
 
 
 def step(state: State, messages: list[dict], usage: float | None, budget: float, reserve: float, window: float,
-         host: mint.Host, cfg: Config) -> tuple[State, list | emit.Refusal, Exception | None]:
+         host: Host, cfg: Config) -> tuple[State, list | emit.Refusal, Exception | None]:
     """foldPass: the messages the log gained, the last step's usage (None without a new report), the
     compile and the ticks. Returns the compile's result and the error a tick threw, if one did."""
     for message in messages:
@@ -57,7 +58,7 @@ def compile(state: State, budget: float, reserve: float, window: float, cfg: Con
     return state, result
 
 
-def drive(state: State, host: mint.Host, cfg: Config) -> tuple[State, Exception | None]:
+def drive(state: State, host: Host, cfg: Config) -> tuple[State, Exception | None]:
     """kickTick: driveTick, then releaseRetryableQuarantine. A quarantined chunk returns to the
     queue's front at every rebuild and is consumed without a call, so one tick per pass would spend
     every pass on it; the loop moves past it, still making at most one call."""

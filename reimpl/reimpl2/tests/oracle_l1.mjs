@@ -100,7 +100,7 @@ for (const { config, events } of JSON.parse(readFileSync(process.argv[2], 'utf8'
       if (reply.throw) {
         const { message, status, type, retryable } = reply.throw
         if (retryable === true) transientFailed = true
-        throw Object.assign(new Error(message), { httpStatus: status, type, retryable })
+        throw Object.assign(new Error(message), { httpStatus: status, type, retryable, scripted: true })
       }
       return copy(reply)
     },
@@ -146,8 +146,8 @@ for (const { config, events } of JSON.parse(readFileSync(process.argv[2], 'utf8'
         replies = [...event.replies]
         try {
           await strategy.tick(ctx)
-        } catch {
-          error = true
+        } catch (thrown) {
+          error = thrown?.scripted ? thrown.message : true   // the provider's own error, or another
         }
         break
       case 'pass': {                       // foldPass
@@ -178,8 +178,8 @@ for (const { config, events } of JSON.parse(readFileSync(process.argv[2], 'utf8'
             await strategy.tick(ctx)
             if (started !== calls || queued() >= before) break
           }
-        } catch {
-          error = true
+        } catch (thrown) {
+          error = thrown?.scripted ? thrown.message : true   // the provider's own error, or another
         }
         if (transientFailed) {
           for (const key of strategy.getCompressionQuarantineStatus().keys) {

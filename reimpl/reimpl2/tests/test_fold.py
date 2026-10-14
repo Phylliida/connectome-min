@@ -1,4 +1,4 @@
-"""Differential test of fold.py against the real library's kv-stable picker (oracle_fold.mjs).
+"""Differential test of planner.py and cut.py against the real library's kv-stable picker (oracle_fold.mjs).
 
     python3 tests/test_fold.py [sessions] [seed] [shard k/n]
 
@@ -17,8 +17,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
 from config import Config  # noqa: E402
-from fold import Inputs, Leaf, Summary, ceiling, plan, recall_tokens  # noqa: E402
+from cut import Inputs, Leaf, Summary  # noqa: E402
+from emit import recall_tokens  # noqa: E402
 from library import cases, compare  # noqa: E402
+from planner import ceiling, plan  # noqa: E402
 
 
 def session(r):

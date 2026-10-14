@@ -25,9 +25,12 @@ sys.path.insert(0, str(HERE.parent))
 
 import drive  # noqa: E402
 import mint  # noqa: E402
+import prompts  # noqa: E402
+from calls import Host  # noqa: E402
 from chunking import close_chunks  # noqa: E402
 from config import Config  # noqa: E402
-from estimate import Calibration, js_json, js_len, price  # noqa: E402
+from estimate import Calibration, price  # noqa: E402
+from js import js_json, js_len, js_trim, sha256  # noqa: E402
 from state import State  # noqa: E402
 from library import cases, compare  # noqa: E402
 
@@ -67,7 +70,7 @@ class ProviderError(Exception):
 
 def simulate(cfg, events):
     """The port, driven as the oracle drives the library."""
-    state, host, states = State(), mint.Host(None), []
+    state, host, states = State(), Host(None), []
     for event in events:
         requests, error = [], None
         match event:
@@ -100,14 +103,14 @@ def scripted(replies, requests):
 def observed(state, requests, error):
     """The state the oracle reports after an event, from the port's."""
     return {
-        'requests': requests, 'error': error is not None,
+        'requests': requests, 'error': error is not None and (str(error) if isinstance(error, ProviderError) else True),
         'summaries': [{'id': s.id, 'level': s.level, 'content': s.content, 'tokens': s.tokens, 'sourceIds': list(s.sources),
                        'sourceRange': {'first': s.span[0], 'last': s.span[1]}, 'mergedInto': s.parent,
                        'responseContent': list(s.blocks) if s.blocks else None,
                        'provenance': dict(zip(('stopReason', 'requestHash', 'model'), s.provenance)) if s.provenance else None}
                       for s in state.entries],
         'chunks': [list(c) for c in state.chunks], 'compressed': sorted(state.summarized), 'queue': list(state.queue),
-        'quarantine': sorted([mint.sha256(list(ids)), hashlib.sha256(request.encode()).hexdigest()] for ids, request in state.quarantine),
+        'quarantine': sorted([sha256(list(ids)), hashlib.sha256(request.encode()).hexdigest()] for ids, request in state.quarantine),
         'counter': len(state.entries),
         'merges': [{'level': m.level, 'sourceIds': list(m.sources), 'attempts': len(m.failures), 'lastStopReason': m.stop,
                     'lastOutcome': m.outcome, 'hadRefusal': m.refused, 'serverErrorStreak': m.streak} for m in state.merges],
@@ -245,7 +248,7 @@ def session(r):
         elif shape == 'image':
             say('user', [{'type': 'text', 'text': words(r, 3)}, {'type': 'image', 'source': {'type': 'base64', 'mediaType': 'image/png', 'data': 'A' * r.choice([r.randint(10, 400), 50, 100, 300])}}])
         elif shape == 'cm':                         # turns that look like the request's own
-            say('Context Manager', [{'type': 'text', 'text': r.choice(['[CM] Recall memory L1-0.', '[CM] Recall memory L1-0. Again', mint.MARKER, words(r, 4)])}])
+            say('Context Manager', [{'type': 'text', 'text': r.choice(['[CM] Recall memory L1-0.', '[CM] Recall memory L1-0. Again', prompts.MARKER, words(r, 4)])}])
         elif shape == 'cached':
             say('user', [{'type': 'text', 'text': words(r, 30), 'cache_control': {'type': 'ephemeral'}}])
         else:
@@ -271,7 +274,7 @@ def session(r):
                 priced.append(price(e['message']))
                 chunks += close_chunks(priced, chunks, multiplier, cfg)
         by_id = {m['id']: m for m in messages}
-        lengths = [sum(js_len(mint.js_trim(b['text'])) for i in c for b in by_id[i]['content']) for c in chunks
+        lengths = [sum(js_len(js_trim(b['text'])) for i in c for b in by_id[i]['content']) for c in chunks
                    if all(b['type'] == 'text' for i in c for b in by_id[i]['content'])]
         cfg = replace(cfg, min_chunk_chars=r.choice(lengths)) if lengths else cfg
     return {'cfg': cfg, 'events': events}

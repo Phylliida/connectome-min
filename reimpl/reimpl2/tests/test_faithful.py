@@ -15,10 +15,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-import fold  # noqa: E402
 from chunking import close_chunks, demand, enqueue, head_end, l1_queue, post_strip_tokens, windows  # noqa: E402
 from config import Config  # noqa: E402
+from cut import Summary  # noqa: E402
 from library import cases, compare  # noqa: E402
+from planner import ceiling, inputs  # noqa: E402
 from estimate import Calibration, price, store_tokens  # noqa: E402
 
 CONFIG_FIELDS = {
@@ -48,11 +49,11 @@ def simulate(config, events):
         elif kind == 'compile':
             chunks += close_chunks(messages, chunks, cal.multiplier, cfg)
             queue = l1_queue(chunks, summarized, demanded, cfg)
-            l1s = [fold.Summary(f'L1-{i}', 1, 0, chunks[i]) for i in sorted(summarized)]
-            view = fold.inputs(messages, l1s, {}, cal.multiplier, cfg)
+            l1s = [Summary(f'L1-{i}', 1, 0, chunks[i]) for i in sorted(summarized)]
+            view = inputs(messages, l1s, {}, cal.multiplier, cfg)
             if 'within' in event:                # a budget whose grace the windows land in, or just past
                 event['budget'] = max(1, round((view.head_tokens + view.tail_tokens) / event.pop('within')))
-            if view.head_tokens + view.tail_tokens <= fold.ceiling(event['budget'], Config()):
+            if view.head_tokens + view.tail_tokens <= ceiling(event['budget'], Config()):
                 planner = {'leaves': [list(leaf) for leaf in view.leaves], 'headTokens': view.head_tokens,
                            'tailTokens': view.tail_tokens, 'zone': len(view.prices) - len(view.leaves),
                            'now': len(view.prices) - 1}

@@ -19,10 +19,9 @@ sys.path.insert(0, str(HERE.parent))
 
 import drive  # noqa: E402
 import emit  # noqa: E402
-import mint  # noqa: E402
 from chunking import post_strip_tokens  # noqa: E402
 from config import Config  # noqa: E402
-from state import State  # noqa: E402
+from state import Entry, State  # noqa: E402
 from library import cases, compare  # noqa: E402
 
 LIBRARY_NAMES = {
@@ -80,7 +79,7 @@ def simulate(cfg, events):
 
 def entry(sid, level, sources, memory):
     """A memory as mint stores it. (A compile never reads its range.)"""
-    return mint.Entry(sid, level, memory['text'], memory['tokens'], sources, None, None, tuple(memory['blocks']) if 'blocks' in memory else None)
+    return Entry(sid, level, memory['text'], memory['tokens'], sources, None, None, tuple(memory['blocks']) if 'blocks' in memory else None)
 
 
 # --- session generation ---
