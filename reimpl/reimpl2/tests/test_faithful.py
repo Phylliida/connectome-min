@@ -16,7 +16,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
 import fold  # noqa: E402
-from chunking import close_chunks, demand, enqueue, head_end, l1_queue, post_strip_tokens, recent_start  # noqa: E402
+from chunking import close_chunks, demand, enqueue, head_end, l1_queue, post_strip_tokens, windows  # noqa: E402
 from config import Config  # noqa: E402
 from library import cases, compare  # noqa: E402
 from estimate import Calibration, price, store_tokens  # noqa: E402
@@ -73,7 +73,7 @@ def simulate(config, events):
             'queue': list(queue),
             'multiplier': m,
             'head': head_end(messages, m, cfg),
-            'tail': recent_start(messages, m, cfg),
+            'tail': windows(messages, m, cfg)[1],
             'postStrip': post_strip_tokens(messages, m, cfg),
             'store': [store_tokens(msg, m) for msg in messages],
             'textOnly': [msg.text_only for msg in messages],

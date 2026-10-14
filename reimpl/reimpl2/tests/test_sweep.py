@@ -25,7 +25,7 @@ import test_mutants  # noqa: E402
 TESTS = {                                 # the tests that reach each module, the one written for it first
     'estimate.py': ['faithful', 'l1', 'compile', 'fold', 'drive'], 'chunking.py': ['faithful', 'compile', 'l1', 'drive'],
     'fold.py': ['fold', 'compile', 'faithful', 'drive'], 'emit.py': ['compile', 'l1', 'drive'],
-    'mint.py': ['l1', 'drive'], 'drive.py': ['drive'],
+    'state.py': ['l1', 'compile', 'drive'], 'mint.py': ['l1', 'drive'], 'drive.py': ['drive'],
 }
 WRAPPERS = {'sorted', 'list', 'tuple', 'set', 'frozenset', 'dict', 'reversed', 'abs', 'int', 'float', 'bool', 'str'}
 STATEMENTS = (ast.Expr, ast.Assign, ast.AugAssign, ast.AnnAssign, ast.If, ast.For, ast.With, ast.Try)

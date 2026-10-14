@@ -16,22 +16,12 @@ Not reproduced: what the harness writes to its session log from this state (plan
 appendMemory), and concurrency. Here a pass's ticks finish before the next pass begins, where the
 harness runs them behind the turn.
 """
-from typing import NamedTuple
-
 import emit
 import mint
-from chunking import close_chunks, enqueue, l1_queue
+from chunking import rebuild
 from config import Config
 from estimate import price
-
-
-class State(NamedTuple):
-    """The strategy's state between passes."""
-    messages: tuple = ()                  # the log: {'id', 'participant', 'content'}, in order
-    priced: tuple = ()                    # estimate.price of each
-    chunks: tuple = ()                    # chunking.close_chunks's, in close order
-    memory: mint.Memory = mint.Memory()
-    session: emit.Session = emit.Session()
+from state import State
 
 
 def step(state: State, messages: list[dict], usage: float | None, budget: float, reserve: float, window: float,
@@ -54,26 +44,17 @@ def append(state: State, message: dict, cfg: Config) -> State:
 
 def observe(state: State, tokens: float) -> State:
     """reportRealInputTokens: the last request's input, cache reads and cache writes."""
-    return state._replace(session=state.session._replace(calibration=state.session.calibration.observe(tokens)))
+    return state._replace(calibration=state.calibration.observe(tokens))
 
 
 def compile(state: State, budget: float, reserve: float, window: float, cfg: Config) -> tuple[State, list | emit.Refusal]:
     """compileFolds: ContextManager.compile with maxTokens `budget` and reserveForResponse `reserve`,
     retried once at maxTokens actual + reserve after a refusal for size whose total fits `window`.
     A refusal within its budget is structural, and no budget fixes it."""
-    state, result = select(state, budget - reserve, cfg)
+    state, result = emit.select(state, budget - reserve, cfg)
     if isinstance(result, emit.Refusal) and result.actual > result.budget and result.actual + reserve <= window:
-        state, result = select(state, (result.actual + reserve) - reserve, cfg)     # as the library takes it back out
+        state, result = emit.select(state, (result.actual + reserve) - reserve, cfg)     # as the library takes it back out
     return state, result
-
-
-def select(state: State, W: float, cfg: Config) -> tuple[State, list | emit.Refusal]:
-    """AutobiographicalStrategy.select: rebuild, compile, then queue what the plan demanded. Chunks
-    demanded before are already queued or summarized, so only the new ones join."""
-    state = rebuild(state, cfg)
-    session, result = emit.select(state.messages, state.priced, state.chunks, state.memory.entries, state.session, W, cfg)
-    queue = enqueue(state.memory.queue, session.demanded, mint.summarized(state.memory, state.chunks))
-    return state._replace(session=session, memory=state.memory._replace(queue=queue)), result
 
 
 def drive(state: State, host: mint.Host, cfg: Config) -> tuple[State, Exception | None]:
@@ -91,24 +72,12 @@ def drive(state: State, host: mint.Host, cfg: Config) -> tuple[State, Exception 
             failed = failed or getattr(error, 'retryable', None) is True
             raise
 
-    memory, error, length = state.memory, None, lambda m: len(m.queue) + len(m.merges)
+    ticked, error, length = state, None, lambda s: len(s.queue) + len(s.merges)
     while error is None:
-        started, before = calls, length(memory)
-        memory, error = mint.tick(state.messages, state.priced, state.chunks, memory, state.session.calibration.multiplier,
-                                  host._replace(complete=complete), cfg)
-        if calls != started or length(memory) >= before:
+        started, before = calls, length(ticked)
+        ticked, error = mint.tick(ticked, host._replace(complete=complete), cfg)
+        if calls != started or length(ticked) >= before:
             break
     if failed:
-        memory = memory._replace(quarantine=memory.quarantine & state.memory.quarantine)
-    return state._replace(memory=memory), error
-
-
-def rebuild(state: State, cfg: Config) -> State:
-    """rebuildChunks: the chunks that can close do, and the L1 queue is cut afresh."""
-    chunks = state.chunks + tuple(close_chunks(state.priced, state.chunks, state.session.calibration.multiplier, cfg))
-    return queued(state._replace(chunks=chunks), cfg)
-
-
-def queued(state: State, cfg: Config) -> State:
-    queue = l1_queue(state.chunks, mint.summarized(state.memory, state.chunks), state.session.demanded, cfg)
-    return state._replace(memory=state.memory._replace(queue=queue))
+        ticked = ticked._replace(quarantine=ticked.quarantine & state.quarantine)
+    return ticked, error

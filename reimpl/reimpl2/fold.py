@@ -73,6 +73,7 @@ class Plan(NamedTuple):
     branch: str                           # hold | ideal | suffix | infeasible | quality-gap
     escalated: bool                       # even the ideal exceeds W
     produced: list                        # when escalated: (first, last) id of each run of leaves with no L1
+    units: list                           # the middle as it renders, in order: (('raw', seq) | ('recall', summary id), tokens)
 
 
 def size(units: list) -> float:
@@ -112,7 +113,7 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
 
     def middle_units(F: dict) -> list:
         """The middle's rendered units in order, as (identity, tokens): siblings share one recall."""
-        unit = lambda m, node: (('raw', m.id), m.tokens) if node is None else (('recall', node.id), node.tokens)
+        unit = lambda m, node: (('raw', m.seq), m.tokens) if node is None else (('recall', node.id), node.tokens)
         return list(dict.fromkeys(unit(m, at(m, F[m.id])) for m in leaves))
 
     def layout(F: dict) -> list:
@@ -184,11 +185,11 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
     carried_units, ideal_loss = layout(carried), loss(ideal)
     gap = cfg.quality_gap_ratio * max(1, ideal_loss)
     if target <= (held := size(carried_units)) <= W and loss(carried) - ideal_loss <= gap:
-        return Plan(carried, accounted(carried), 0, 'hold', False, [])
+        return Plan(carried, accounted(carried), 0, 'hold', False, [], middle_units(carried))
 
     # 3. Adopt the ideal within the trust region.
     if (pert := kv_cost(carried_units, layout(ideal))) <= P:
-        return Plan(ideal, accounted(ideal), pert, 'ideal', escalated, produced)
+        return Plan(ideal, accounted(ideal), pert, 'ideal', escalated, produced, middle_units(ideal))
 
     # 4. Adopt the ideal from a boundary on: the oldest of its changes the trust region affords,
     #    found by the library's binary search (len(changes) adopts nothing).
@@ -201,10 +202,10 @@ def plan(inputs: Inputs, W: float, cfg: Config) -> Plan:
 
     F, units, partial_pert = suffix(bisect_left(range(len(changes)), True, key=lambda i: suffix(i)[2] <= P))
     if (partial := size(units)) <= W and loss(F) - ideal_loss <= gap:
-        return Plan(F, accounted(F), partial_pert, 'suffix', False, [])
+        return Plan(F, accounted(F), partial_pert, 'suffix', False, [], middle_units(F))
 
     # 5. The trust region loses.
-    return Plan(ideal, accounted(ideal), pert, 'infeasible' if partial > W else 'quality-gap', escalated, produced)
+    return Plan(ideal, accounted(ideal), pert, 'infeasible' if partial > W else 'quality-gap', escalated, produced, middle_units(ideal))
 
 
 def ceiling(W: float, cfg: Config) -> int:
@@ -216,13 +217,10 @@ def inputs(messages: list[Priced], summaries: list[Summary], levels: dict, multi
            cfg: Config) -> Inputs:
     """The planner's view of the log (selectAdaptive): the messages between the windows at their
     post-strip prices, each with the first L1 that lists it and its carried level."""
-    priced = chunking.post_strip_tokens(messages, multiplier, cfg)
-    lo = chunking.head_end(messages, multiplier, cfg)
-    hi = chunking.recent_start(messages, multiplier, cfg)                # a tail reaching into the head starts after it
+    head, tail, prices = chunking.windows(messages, multiplier, cfg)    # a tail reaching into the head starts after it
     l1 = {m: s.id for s in summaries if s.level == 1 for m in s.sources}
-    leaves = [Leaf(m.id, i, priced[i], levels.get(m.id, 0), l1.get(m.id), m.salience)
-              for i, m in enumerate(messages[lo:hi], lo)]
-    return Inputs(leaves, summaries, lo, priced)
+    leaves = [Leaf(m.id, i, prices[i], levels.get(m.id, 0), l1.get(m.id), m.salience) for i, m in enumerate(messages[head:tail], head)]
+    return Inputs(leaves, summaries, head, prices)
 
 
 def recall_tokens(answer, cfg: Config) -> int:

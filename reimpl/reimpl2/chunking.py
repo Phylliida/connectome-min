@@ -4,9 +4,9 @@ compression queue), reproduced exactly.
 Messages are estimate.Priced records in log order. A chunk is the tuple of ids of the consecutive
 messages it owns; chunks are listed in close order and never change, so an index names one.
 
-Call close_chunks wherever the library rebuilds: after every appended message and at the start of
-every compile, with the multiplier then in effect. Closed chunks are permanent, so rebuild timing
-decides which exist by a given moment. drive.py rebuilds as the harness's pass does.
+The library rebuilds (rebuild) after every appended message and at the start of every compile, with
+the multiplier then in effect. Closed chunks are permanent, so rebuild timing decides which exist by
+a given moment.
 
 Not reproduced, because an append-only log with stored chunks never reaches them: the library's
 repairs for records that lost their messages, chunks overlapping existing L1s, and crashes between
@@ -52,12 +52,15 @@ def head_end(messages: list[Priced], multiplier: float, cfg: Config) -> int:
     return len(messages) if end is None else end - (end > 0 and 'tool_use' in messages[end - 1].kinds)
 
 
-def recent_start(messages: list[Priced], multiplier: float, cfg: Config) -> int:
-    """Index of the first message in the tail window. The crossing message is outside it, unless the
-    first tail message is a tool_result, which keeps its call."""
-    inside = crossing(reversed(post_strip_tokens(messages, multiplier, cfg)), cfg.recent_window_tokens)
-    start = 0 if inside is None else len(messages) - inside
-    return start - (0 < start < len(messages) and 'tool_result' in messages[start].kinds)
+def windows(messages: list[Priced], multiplier: float, cfg: Config) -> tuple[int, int, list[float]]:
+    """Where the raw windows fall: the index of the first message after the head window (head_end), of
+    the first in the tail window, and each message's post-strip price, which sizes the tail. The tail
+    window holds the newest messages after the one whose price takes their total past
+    recent_window_tokens; a tool_result first in it brings its call in."""
+    prices = post_strip_tokens(messages, multiplier, cfg)
+    inside = crossing(reversed(prices), cfg.recent_window_tokens)
+    tail = 0 if inside is None else len(messages) - inside
+    return head_end(messages, multiplier, cfg), tail - (0 < tail < len(messages) and 'tool_result' in messages[tail].kinds), prices
 
 
 def close_chunks(messages: list[Priced], chunks, multiplier: float, cfg: Config) -> list[tuple]:
@@ -67,9 +70,9 @@ def close_chunks(messages: list[Priced], chunks, multiplier: float, cfg: Config)
     it reaches target_chunk_tokens over at least four messages and doesn't end on a tool_use, whose
     result comes next. A run closes when it is full, or when the next message isn't adjacent to it
     (owned messages lie between). A last run that isn't full is left for the next call."""
-    owned = set(chain.from_iterable(chunks))
+    owned, (head, tail, _) = set(chain.from_iterable(chunks)), windows(messages, multiplier, cfg)
     closed, run, total, full = [], [], 0, False
-    for i in range(head_end(messages, multiplier, cfg), recent_start(messages, multiplier, cfg)):
+    for i in range(head, tail):
         if (message := messages[i]).id in owned: continue
         if run and (full or run[-1] != i - 1):
             closed.append(run)
@@ -78,6 +81,12 @@ def close_chunks(messages: list[Priced], chunks, multiplier: float, cfg: Config)
         total += message.text_only if cfg.attachments_ignore_size else store_tokens(message, multiplier)
         full = total >= cfg.target_chunk_tokens and len(run) >= 4 and 'tool_use' not in message.kinds
     return [tuple(messages[i].id for i in run) for run in closed + [run] * full]
+
+
+def rebuild(state, cfg: Config):
+    """rebuildChunks, on a state.State: the chunks that can close do, and the L1 queue is cut afresh."""
+    chunks = state.chunks + tuple(close_chunks(state.priced, state.chunks, state.calibration.multiplier, cfg))
+    return state._replace(chunks=chunks, queue=l1_queue(chunks, state.summarized, state.demanded, cfg))   # no new chunk has an L1
 
 
 def l1_queue(chunks, summarized: set[int], demanded, cfg: Config) -> list[int]:

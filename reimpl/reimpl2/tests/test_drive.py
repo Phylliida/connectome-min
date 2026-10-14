@@ -29,6 +29,7 @@ from chunking import post_strip_tokens  # noqa: E402
 from estimate import js_json  # noqa: E402
 from config import Config  # noqa: E402
 from library import cases, compare  # noqa: E402
+from state import State  # noqa: E402
 
 FIXTURES = HERE / 'fixtures_drive.json'
 
@@ -37,7 +38,7 @@ def simulate(cfg, events):
     """The port, driven as the oracle drives the library. Fills in, for the oracle, what a pass leaves
     to the port's state: its usage report from the armed estimate, a budget from the priced total,
     and the window above the budget."""
-    state, host, states = drive.State(), mint.Host(None), []
+    state, host, states = State(), mint.Host(None), []
     for event in events:
         if 'host' in event:
             host = host._replace(tools=event['host']['tools'], system=event['host']['system'])
@@ -45,22 +46,22 @@ def simulate(cfg, events):
         for message in event['messages']:
             pending = drive.append(pending, message, cfg)
         if 'ratio' in event:
-            armed = pending.session.calibration.armed
+            armed = pending.calibration.armed
             event['usage'] = max(1, round(armed * event.pop('ratio'))) if armed else None
         if event['usage'] is not None:
             pending = drive.observe(pending, event['usage'])
         if 'fraction' in event:
-            total = sum(post_strip_tokens(list(pending.priced), pending.session.calibration.multiplier, cfg))
+            total = sum(post_strip_tokens(list(pending.priced), pending.calibration.multiplier, cfg))
             event['budget'] = event['reserve'] + max(1, round(total * event.pop('fraction')))
         if 'room' in event:
             event['window'] = event['budget'] + event['reserve'] + event.pop('room')
         requests = []
         state, compiled, error = drive.step(state, event['messages'], event['usage'], event['budget'], event['reserve'],
                                             event['window'], host._replace(complete=test_l1.scripted(event['replies'], requests)), cfg)
-        states.append({**test_l1.observed(state.memory, state.chunks, requests, error),
+        states.append({**test_l1.observed(state, requests, error),
                        'compiled': {'refusal': list(compiled)} if isinstance(compiled, emit.Refusal) else {'messages': compiled},
-                       'levels': {k: v for k, v in state.session.levels.items() if v != 0},
-                       'multiplier': state.session.calibration.multiplier, 'armed': state.session.calibration.armed})
+                       'levels': {k: v for k, v in state.levels.items() if v != 0},
+                       'multiplier': state.calibration.multiplier, 'armed': state.calibration.armed})
     return states
 
 

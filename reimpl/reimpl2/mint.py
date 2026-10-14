@@ -41,6 +41,7 @@ import chunking
 from config import Config
 from emit import IMAGE_PLACEHOLDER, OMITTED, REASONING, split
 from estimate import _JS_SPACE, image_bytes, js_json, js_len, js_round, js_trim
+from state import State
 
 CM = 'Context Manager'
 MARKER = ('System: You will soon form a new memory, get ready. The messages that follow are the slice of '
@@ -111,15 +112,6 @@ class Merge(NamedTuple):
         return any(stop == 'refusal' for _, stop in self.failures)
 
 
-class Memory(NamedTuple):
-    """The strategy's state between ticks."""
-    entries: tuple = ()                   # Entry, in creation order: the n of L<k>-n counts the ones before it
-    queue: tuple = ()                     # chunk indices: l1_queue as of the last rebuild, less what ticks took
-    quarantine: frozenset = frozenset()   # (chunk, request JSON) for each request no reply could answer
-    merges: tuple = ()                    # Merge, in the order they run
-    merge_quarantine: frozenset = frozenset()   # source runs that exhausted their attempts
-
-
 class Host(NamedTuple):
     """The host's side of a call."""
     complete: Callable                    # request -> response, as membrane normalizes them; raises on failure,
@@ -129,11 +121,9 @@ class Host(NamedTuple):
 
 
 class Context(NamedTuple):
-    """What a tick reads besides memory (StrategyContext and the message store)."""
-    messages: list[dict]                  # the log, in order
-    position: dict                        # message id -> its index in messages
+    """What a tick reads besides the state (StrategyContext)."""
+    position: dict                        # message id -> its index in the log
     head: int                             # messages in the head window (chunking.head_end)
-    chunks: list                          # chunking.close_chunks's, in close order
     host: Host
     cfg: Config
 
@@ -175,57 +165,51 @@ def sha256(value) -> str:
     return hashlib.sha256(js_json(value).encode()).hexdigest()
 
 
-def summarized(memory: Memory, chunks: list) -> set[int]:
-    """Indices of the chunks with an L1, for chunking.l1_queue."""
-    l1s = {s.sources for s in memory.entries if s.level == 1}
-    return {i for i, chunk in enumerate(chunks) if chunk in l1s}
-
-
-def tick(messages: list[dict], priced: list, chunks: list, memory: Memory, multiplier: float, host: Host,
-         cfg: Config) -> tuple[Memory, Exception | None]:
-    """AutobiographicalStrategy.tick. Rebuilds set memory.queue to chunking.l1_queue(chunks,
-    summarized(memory, chunks), ...); ticks between rebuilds take its following entries. An error the
-    library's tick throws comes back beside the memory: an L1's chunk has left the queue and nothing
-    else changed; a merge stays queued, with a server error counted."""
-    ctx = Context(messages, {m['id']: i for i, m in enumerate(messages)}, chunking.head_end(priced, multiplier, cfg), chunks, host, cfg)
-    memory = sweep(ctx, memory)
-    if not memory.queue:
-        return merge(ctx, memory) if memory.merges else (memory, None)
-    index, memory = memory.queue[0], memory._replace(queue=memory.queue[1:])
+def tick(state: State, host: Host, cfg: Config) -> tuple[State, Exception | None]:
+    """AutobiographicalStrategy.tick. Rebuilds cut state.queue afresh (chunking.rebuild); ticks
+    between rebuilds take its following entries. An error the library's tick throws comes back
+    beside the state: an L1's chunk has left the queue and nothing else changed; a merge stays
+    queued, with a server error counted."""
+    ctx = Context({m['id']: i for i, m in enumerate(state.messages)},
+                  chunking.head_end(state.priced, state.calibration.multiplier, cfg), host, cfg)
+    state = sweep(ctx, state)
+    if not state.queue:
+        return merge(ctx, state) if state.merges else (state, None)
+    index, state = state.queue[0], state._replace(queue=state.queue[1:])
     try:
-        return mint(ctx, index, memory), None
+        return mint(ctx, index, state), None
     except Exception as error:
-        return memory, error
+        return state, error
 
 
 # --- L1s ---
 
-def mint(ctx: Context, index: int, memory: Memory) -> Memory:
+def mint(ctx: Context, index: int, state: State) -> State:
     """compressChunkHierarchical for chunk `index`."""
-    cfg, ids = ctx.cfg, ctx.chunks[index]
-    chunk = [ctx.messages[ctx.position[i]] for i in ids]
+    cfg, ids = ctx.cfg, state.chunks[index]
+    chunk = [state.messages[ctx.position[i]] for i in ids]
     blocks = [b for m in chunk for b in m['content']]
     if all(b['type'] == 'text' for b in blocks) and sum(js_len(js_trim(b['text'])) for b in blocks) < cfg.min_chunk_chars:
-        return remember(ctx, memory, Entry(f'L1-{len(memory.entries)}', 1, QUIET.format(len(ids)), 40, ids, (ids[0], ids[-1])))
+        return remember(ctx, state, Entry(f'L1-{len(state.entries)}', 1, QUIET.format(len(ids)), 40, ids, (ids[0], ids[-1])))
 
-    request, kept = ask(ctx, memory, [s for s in memory.entries if s.parent is None], cfg.recall_budget_tokens, ctx.position[ids[0]],
+    request, kept = ask(ctx, state, [s for s in state.entries if s.parent is None], cfg.recall_budget_tokens, ctx.position[ids[0]],
                         [say(MARKER), *raw(chunk), say(INSTRUCTION.format(cfg.summary_target_tokens))])
     if not ctx.host.tools and (_TOOLS_LESS.search(cfg.compression_model)
                                or any(b['type'] in TOOL_BLOCKS for t in request['messages'] for b in t['content'])):
-        return memory
+        return state
     family = (ids, js_json(request))
-    if family in memory.quarantine or sum(q[0] == ids for q in memory.quarantine) >= SHAPE_CAP:
-        return memory
-    chosen = next((reply for reply, accepted in attempts(ctx, memory, request, kept) if accepted), None)
+    if family in state.quarantine or sum(q[0] == ids for q in state.quarantine) >= SHAPE_CAP:
+        return state
+    chosen = next((reply for reply, accepted in attempts(ctx, state, request, kept) if accepted), None)
     if chosen and not js_trim(chosen.text):
         retry = call(ctx.host, with_line(request, PLAIN_PROSE))
         chosen = retry if retry.stop == 'end_turn' and js_trim(retry.text) else None
     if chosen is None:
-        return memory._replace(quarantine=memory.quarantine | {family})
-    return remember(ctx, memory, written(memory, 1, ids, (ids[0], ids[-1]), chosen, cfg))
+        return state._replace(quarantine=state.quarantine | {family})
+    return remember(ctx, state, written(state, 1, ids, (ids[0], ids[-1]), chosen, cfg))
 
 
-def attempts(ctx: Context, memory: Memory, request: dict, kept: list[Entry]) -> Iterator[tuple[Reply, bool]]:
+def attempts(ctx: Context, state: State, request: dict, kept: list[Entry]) -> Iterator[tuple[Reply, bool]]:
     """The L1 ladder, lazily: each reply in call order, paired with whether it may become the memory.
     First the request, accepted on end_turn. After a tool_use, the request again with the no-tools
     line and, on a second tool_use, without the tools: accepted on end_turn. Then the recall variants
@@ -238,7 +222,7 @@ def attempts(ctx: Context, memory: Memory, request: dict, kept: list[Entry]) -> 
         if retry.stop == 'tool_use':
             retry = call(ctx.host, without_tools(lined))
         yield retry, retry.stop == 'end_turn'
-    for variant in admitted(request, variants(ctx, memory, request, kept), input_tokens(first.response), ctx.cfg):
+    for variant in admitted(request, variants(ctx, state, request, kept), input_tokens(first.response), ctx.cfg):
         try:
             reply = call(ctx.host, variant)
         except Exception:
@@ -246,41 +230,41 @@ def attempts(ctx: Context, memory: Memory, request: dict, kept: list[Entry]) -> 
         yield reply, reply.verdict[0] == 'valid'
 
 
-def remember(ctx: Context, memory: Memory, entry: Entry) -> Memory:
+def remember(ctx: Context, state: State, entry: Entry) -> State:
     """Store an L1, clear its chunk's quarantine, and queue the merges it completes."""
-    return enqueue_merges(ctx, memory._replace(entries=memory.entries + (entry,),
-                                               quarantine=frozenset(q for q in memory.quarantine if q[0] != entry.sources)))
+    return enqueue_merges(ctx, state._replace(entries=state.entries + (entry,),
+                                              quarantine=frozenset(q for q in state.quarantine if q[0] != entry.sources)))
 
 
 # --- merges ---
 
-def merge(ctx: Context, memory: Memory) -> tuple[Memory, Exception | None]:
+def merge(ctx: Context, state: State) -> tuple[State, Exception | None]:
     """executeMerge for the merge queue's head, with tick's accounting of an error: a provider error
     marked not retryable counts as a failed attempt, and so does each server error from the twelfth;
     any other escapes, the merge still queued."""
-    job = memory.merges[0]
-    request = merge_request(ctx, memory, job)
+    job = state.merges[0]
+    request = merge_request(ctx, state, job)
     try:
         reply = call(ctx.host, request)
     except Exception as error:
         retryable, kind = getattr(error, 'retryable', None), getattr(error, 'type', None)
         server = retryable is True and kind == 'server'
-        memory = memory._replace(merges=(job := job._replace(streak=job.streak + server),) + memory.merges[1:])
+        state = state._replace(merges=(job := job._replace(streak=job.streak + server),) + state.merges[1:])
         if retryable is False and isinstance(kind, str) or server and job.streak >= SERVER_STREAK:
-            return reject(memory, 'provider_error', None, ctx.cfg), None
-        return memory, error
+            return reject(state, 'provider_error', None, ctx.cfg), None
+        return state, error
     outcome, stop = reply.verdict
     if outcome == 'valid' and not js_trim(reply.text):
         outcome, stop = 'unusable_empty', 'end_turn'
     if outcome != 'valid':
-        return reject(memory, outcome, stop, ctx.cfg), None
-    nodes = {s.id: s for s in memory.entries}
-    entry = written(memory, job.level, job.sources, (nodes[job.sources[0]].span[0], nodes[job.sources[-1]].span[1]), reply, ctx.cfg)
-    entries = tuple(s._replace(parent=entry.id) if s.id in job.sources else s for s in memory.entries) + (entry,)
-    return enqueue_merges(ctx, memory._replace(entries=entries, merges=memory.merges[1:])), None
+        return reject(state, outcome, stop, ctx.cfg), None
+    nodes = {s.id: s for s in state.entries}
+    entry = written(state, job.level, job.sources, (nodes[job.sources[0]].span[0], nodes[job.sources[-1]].span[1]), reply, ctx.cfg)
+    entries = tuple(s._replace(parent=entry.id) if s.id in job.sources else s for s in state.entries) + (entry,)
+    return enqueue_merges(ctx, state._replace(entries=entries, merges=state.merges[1:])), None
 
 
-def merge_request(ctx: Context, memory: Memory, job: Merge) -> dict:
+def merge_request(ctx: Context, state: State, job: Merge) -> dict:
     """executeMerge's request, shaped by the merge's failures so far. It recalls the summaries before
     the run whose sources aren't the run's messages (above L1 they are summaries, so only position
     leaves one out), on a budget halved for each failure, four times at most, to no less than 8000. It
@@ -288,48 +272,48 @@ def merge_request(ctx: Context, memory: Memory, job: Merge) -> dict:
     pairs) or, once a reply was refused, the run itself; adds the no-tools line after a tool_use and
     the prose line after an empty reply; caps its images; and drops the tools once two attempts have
     failed and the latest stop reason was tool_use."""
-    cfg, nodes, tries = ctx.cfg, {s.id: s for s in memory.entries}, len(job.failures)
+    cfg, nodes, tries = ctx.cfg, {s.id: s for s in state.entries}, len(job.failures)
     sources = [nodes[i] for i in job.sources]
     under, start = {m for s in sources for m in leaves(s, nodes)}, ctx.position[sources[0].span[0]]
-    prior = [s for s in memory.entries if s.parent is None and under.isdisjoint(s.sources) and ctx.position[s.span[0]] < start]
+    prior = [s for s in state.entries if s.parent is None and under.isdisjoint(s.sources) and ctx.position[s.span[0]] < start]
     level, who = sources[0].level, cfg.summary_participant
-    target = (pairs(sources, who) if job.refused else raw(ctx.messages[ctx.position[m]] for s in sources for m in s.sources) if level == 1
+    target = (pairs(sources, who) if job.refused else raw(state.messages[ctx.position[m]] for s in sources for m in s.sources) if level == 1
               else pairs((nodes[c] for s in sources for c in s.sources), who))
     shown = level if job.refused else level - 1
     instruction = MERGE_INSTRUCTION.format(level=job.level, target=cfg.summary_target_tokens, seen=f'the L{shown} memories above'
                                            if shown else 'the slices of recent experience above (raw conversation)') \
         + NO_TOOLS * (job.stop == 'tool_use') + PLAIN_PROSE * (job.outcome == 'unusable_empty')
-    request, _ = ask(ctx, memory, prior, max(8000, js_round(cfg.recall_budget_tokens * 0.5 ** min(tries, 4))), start,
+    request, _ = ask(ctx, state, prior, max(8000, js_round(cfg.recall_budget_tokens * 0.5 ** min(tries, 4))), start,
                      target + [say(instruction)])
     request = {**request, 'messages': cap_images(request['messages'], cfg.compression_image_bytes)}
     return without_tools(request) if job.stop == 'tool_use' and tries >= 2 else request
 
 
-def reject(memory: Memory, outcome: str, stop: str | None, cfg: Config) -> Memory:
+def reject(state: State, outcome: str, stop: str | None, cfg: Config) -> State:
     """recordMergeRejection for the queue's head: record the failure; at merge_attempt_limit, quarantine
     the run."""
-    job = (old := memory.merges[0])._replace(failures=old.failures + ((outcome, stop),))
+    job = (old := state.merges[0])._replace(failures=old.failures + ((outcome, stop),))
     if len(job.failures) >= cfg.merge_attempt_limit:          # a limit under 1 acts as 1
-        return memory._replace(merges=memory.merges[1:], merge_quarantine=memory.merge_quarantine | {job.sources})
-    return memory._replace(merges=(job,) + memory.merges[1:])
+        return state._replace(merges=state.merges[1:], merge_quarantine=state.merge_quarantine | {job.sources})
+    return state._replace(merges=(job,) + state.merges[1:])
 
 
-def sweep(ctx: Context, memory: Memory) -> Memory:
+def sweep(ctx: Context, state: State) -> State:
     """sweepPaidOffMergeQuarantine, before every tick: a quarantined run that another merge took a
     member of can never run again, so it is dropped and the merges are requeued."""
-    unmerged = {s.id for s in memory.entries if s.parent is None}
-    stale = {run for run in memory.merge_quarantine if not unmerged.issuperset(run)}
-    return enqueue_merges(ctx, memory._replace(merge_quarantine=memory.merge_quarantine - stale)) if stale else memory
+    unmerged = {s.id for s in state.entries if s.parent is None}
+    stale = {run for run in state.merge_quarantine if not unmerged.issuperset(run)}
+    return enqueue_merges(ctx, state._replace(merge_quarantine=state.merge_quarantine - stale)) if stale else state
 
 
-def enqueue_merges(ctx: Context, memory: Memory) -> Memory:
+def enqueue_merges(ctx: Context, state: State) -> State:
     """checkMergeThresholdRecursive: for each level, a merge over the run that contiguousMergeCandidates
     picks among its unmerged, unqueued summaries, unless that run is quarantined."""
-    seq, queued = {m: k for k, m in enumerate(chain.from_iterable(ctx.chunks))}, {s for m in memory.merges for s in m.sources}
-    runs = (candidates([s for s in memory.entries if s.level == level and s.parent is None and s.id not in queued], seq, ctx.cfg)
-            for level in range(1, max((s.level for s in memory.entries), default=0) + 1))
-    return memory._replace(merges=memory.merges + tuple(
-        Merge(level, run) for level, run in enumerate(runs, 2) if run and run not in memory.merge_quarantine))
+    seq, queued = {m: k for k, m in enumerate(chain.from_iterable(state.chunks))}, {s for m in state.merges for s in m.sources}
+    runs = (candidates([s for s in state.entries if s.level == level and s.parent is None and s.id not in queued], seq, ctx.cfg)
+            for level in range(1, max((s.level for s in state.entries), default=0) + 1))
+    return state._replace(merges=state.merges + tuple(
+        Merge(level, run) for level, run in enumerate(runs, 2) if run and run not in state.merge_quarantine))
 
 
 def candidates(unmerged: list[Entry], seq: dict, cfg: Config) -> tuple | None:
@@ -358,17 +342,17 @@ def leaves(s: Entry, nodes: dict) -> Iterable:
 
 # --- requests ---
 
-def ask(ctx: Context, memory: Memory, prior: list[Entry], budget: float, start: int, task: list[dict]) -> tuple[dict, list[Entry]]:
+def ask(ctx: Context, state: State, prior: list[Entry], budget: float, start: int, task: list[dict]) -> tuple[dict, list[Entry]]:
     """The request for `task`, after what the agent saw before message `start`: the head window raw;
     recall pairs, oldest first, for the newest of `prior` that fit `budget`; the messages from the
     head that no L1 covers, raw. Mixed tool turns are split, a participant's consecutive turns
     joined, tool blocks whose partner is nowhere in the request dropped, then blank text, empty turns
     and stale cache_control; cache seams follow unless the budget left a summary out. Returns it with
     the summaries recalled."""
-    cfg, covered = ctx.cfg, {m for s in memory.entries if s.level == 1 for m in s.sources}
+    cfg, covered = ctx.cfg, {m for s in state.entries if s.level == 1 for m in s.sources}
     prior = sorted(prior, key=lambda s: ctx.position[s.span[0]])
     kept = recall(prior, budget)
-    seen = raw(ctx.messages[:ctx.head], covered) + pairs(kept, cfg.summary_participant) + raw(ctx.messages[ctx.head:start], covered)
+    seen = raw(state.messages[:ctx.head], covered) + pairs(kept, cfg.summary_participant) + raw(state.messages[ctx.head:start], covered)
     turns = drop_unpaired(collapse([part for t in seen + task for part in split(t, False)]))
     wire = [{'participant': t['participant'], 'content': c} for t in turns if (c := [
         {k: v for k, v in b.items() if k != 'cache_control'} for b in t['content'] if b['type'] != 'text' or js_trim(b['text'])])]
@@ -470,7 +454,7 @@ def without_tools(request: dict) -> dict:
 
 # --- fallbacks ---
 
-def variants(ctx: Context, memory: Memory, request: dict, kept: list[Entry]) -> Iterator[dict]:
+def variants(ctx: Context, state: State, request: dict, kept: list[Entry]) -> Iterator[dict]:
     """buildRecallCurveVariants, lazily: for each recalled summary above L1, newest first, the request
     with its pair replaced by its children's. The summary's messages must ascend in the log, its pair
     must appear exactly once, unjoined, and the result must still answer each tool block in the
@@ -481,7 +465,7 @@ def variants(ctx: Context, memory: Memory, request: dict, kept: list[Entry]) -> 
     range after the run's ends, and chunk order departs from log order only where a shrinking head
     exposes earlier messages to later chunks, which then precede the run's first; so a run passes
     exactly when it is already in log order."""
-    nodes, wire = {s.id: s for s in memory.entries}, request['messages']
+    nodes, wire = {s.id: s for s in state.entries}, request['messages']
     for parent in sorted((s for s in kept if s.level > 1), key=lambda s: -ctx.position[s.span[1]]):
         at = [i for i in range(len(wire) - 1) if header(wire[i]) == parent.id and wire[i + 1]['content'] == answer(parent)]
         if len(at) == 1 and all(ctx.position[a] < ctx.position[b] for a, b in pairwise(leaves(parent, nodes))):
@@ -540,12 +524,12 @@ def call(host: Host, request: dict) -> Reply:
     return Reply(stripped, host.complete(stripped))
 
 
-def written(memory: Memory, level: int, sources: tuple, span: tuple, reply: Reply, cfg: Config) -> Entry:
+def written(state: State, level: int, sources: tuple, span: tuple, reply: Reply, cfg: Config) -> Entry:
     """The memory a reply wrote. Its tokens are the reply's output tokens, else chars/3; it keeps the
     reply's reasoning and text blocks if it reasoned (captureResponseContent), and the hash of the
     request the provider took."""
     out, content, text = (reply.response.get('usage') or {}).get('outputTokens'), reply.response['content'], reply.text
-    return Entry(f'L{level}-{len(memory.entries)}', level, text, out if out and out > 0 else math.ceil(js_len(text) / 3), sources, span,
+    return Entry(f'L{level}-{len(state.entries)}', level, text, out if out and out > 0 else math.ceil(js_len(text) / 3), sources, span,
                  blocks=tuple(b for b in content if b['type'] in REASONING + ('text',)) if any(b['type'] in REASONING for b in content) else None,
                  provenance=('end_turn', sha256(reply.sent), cfg.compression_model))
 

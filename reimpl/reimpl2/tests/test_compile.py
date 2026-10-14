@@ -17,11 +17,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
+import drive  # noqa: E402
 import emit  # noqa: E402
 import mint  # noqa: E402
-from chunking import close_chunks, enqueue, l1_queue, post_strip_tokens  # noqa: E402
+from chunking import post_strip_tokens  # noqa: E402
 from config import Config  # noqa: E402
-from estimate import price  # noqa: E402
+from state import State  # noqa: E402
 from library import cases, compare  # noqa: E402
 
 LIBRARY_NAMES = {
@@ -40,46 +41,40 @@ def simulate(cfg, events):
     leave to the session's state: a merge's children (the oldest k parentless summaries at the lowest
     level that has k), a usage report given as a ratio of the armed estimate, a budget given as a
     fraction of the priced total."""
-    messages, priced, chunks, summaries, summarized, queue = [], [], [], [], set(), []
-    session, states = emit.Session(), []
+    state, states = State(), []
     for event in events:
         compiled = None
         if event['kind'] == 'append':
-            messages.append(event['message'])
-            priced.append(price(event['message']))
-            chunks += close_chunks(priced, chunks, session.calibration.multiplier, cfg)
-            queue = l1_queue(chunks, summarized, session.demanded, cfg)
+            state = drive.append(state, event['message'], cfg)
         elif event['kind'] == 'usage':
             if 'ratio' in event:
-                event['tokens'] = max(1, round(session.calibration.armed * event.pop('ratio')))
-            session = session._replace(calibration=session.calibration.observe(event['tokens']))
+                event['tokens'] = max(1, round(state.calibration.armed * event.pop('ratio')))
+            state = drive.observe(state, event['tokens'])
         elif event['kind'] == 'summarize':
             for memory in event['memories']:
-                if not queue:
+                if not state.queue:
                     break
-                summarized.add(index := queue.pop(0))
-                summaries.append(entry(f'L1-{index}', 1, tuple(chunks[index]), memory))
+                index = state.queue[0]
+                state = state._replace(queue=state.queue[1:], entries=state.entries + (entry(f'L1-{index}', 1, state.chunks[index], memory),))
         elif event['kind'] == 'merge':
+            summaries = state.entries
             if 'children' not in event:
                 event['children'] = next(([s.id for s in orphans[:event['k']]] for level in range(1, 9)
                                           if len(orphans := [s for s in summaries if s.level == level and s.parent is None]) >= event['k']), [])
                 event['id'] = f'M{len(summaries)}'
             if event['children']:
                 level = next(s.level for s in summaries if s.id == event['children'][0]) + 1
-                summaries = [s._replace(parent=event['id']) if s.id in event['children'] else s for s in summaries]
-                summaries.append(entry(event['id'], level, tuple(event['children']), event))
+                summaries = tuple(s._replace(parent=event['id']) if s.id in event['children'] else s for s in summaries)
+                state = state._replace(entries=summaries + (entry(event['id'], level, tuple(event['children']), event),))
         elif event['kind'] == 'compile':
-            chunks += close_chunks(priced, chunks, session.calibration.multiplier, cfg)
-            queue = l1_queue(chunks, summarized, session.demanded, cfg)
             if 'fraction' in event:
-                priced_total = sum(post_strip_tokens(priced, session.calibration.multiplier, cfg))
+                priced_total = sum(post_strip_tokens(state.priced, state.calibration.multiplier, cfg))
                 event['budget'] = max(1, round(priced_total * event.pop('fraction')))
-            session, result = emit.select(messages, priced, chunks, summaries, session, event['budget'], cfg)
-            queue = enqueue(queue, session.demanded, summarized)
+            state, result = emit.select(state, event['budget'], cfg)
             compiled = {'refusal': list(result)} if isinstance(result, emit.Refusal) else {'messages': result}
-        states.append({'compiled': compiled, 'levels': {k: v for k, v in session.levels.items() if v != 0},
-                       'queue': list(queue),
-                       'multiplier': session.calibration.multiplier, 'armed': session.calibration.armed})
+        states.append({'compiled': compiled, 'levels': {k: v for k, v in state.levels.items() if v != 0},
+                       'queue': list(state.queue),
+                       'multiplier': state.calibration.multiplier, 'armed': state.calibration.armed})
     return states
 
 

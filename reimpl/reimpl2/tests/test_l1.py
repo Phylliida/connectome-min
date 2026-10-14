@@ -23,10 +23,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
+import drive  # noqa: E402
 import mint  # noqa: E402
-from chunking import close_chunks, l1_queue  # noqa: E402
+from chunking import close_chunks  # noqa: E402
 from config import Config  # noqa: E402
-from estimate import js_json, js_len, price  # noqa: E402
+from estimate import Calibration, js_json, js_len, price  # noqa: E402
+from state import State  # noqa: E402
 from library import cases, compare  # noqa: E402
 
 LIBRARY_NAMES = {
@@ -65,22 +67,19 @@ class ProviderError(Exception):
 
 def simulate(cfg, events):
     """The port, driven as the oracle drives the library."""
-    messages, priced, chunks, memory, multiplier, host, states = [], [], [], mint.Memory(), 1.0, mint.Host(None), []
+    state, host, states = State(), mint.Host(None), []
     for event in events:
         requests, error = [], None
         match event:
             case {'kind': 'append', 'message': message}:
-                messages.append(message)
-                priced.append(price(message))
-                chunks += close_chunks(priced, chunks, multiplier, cfg)
-                memory = memory._replace(queue=tuple(l1_queue(chunks, mint.summarized(memory, chunks), set(), cfg)))
+                state = drive.append(state, message, cfg)
             case {'kind': 'calibrate', 'multiplier': multiplier}:
-                pass
+                state = state._replace(calibration=Calibration(multiplier))
             case {'kind': 'host'}:
                 host = host._replace(tools=event.get('tools'), system=event.get('system'))
             case {'kind': 'tick', 'replies': replies}:
-                memory, error = mint.tick(messages, priced, chunks, memory, multiplier, host._replace(complete=scripted(replies, requests)), cfg)
-        states.append(observed(memory, chunks, requests, error))
+                state, error = mint.tick(state, host._replace(complete=scripted(replies, requests)), cfg)
+        states.append(observed(state, requests, error))
     return states
 
 
@@ -98,7 +97,7 @@ def scripted(replies, requests):
     return complete
 
 
-def observed(memory, chunks, requests, error):
+def observed(state, requests, error):
     """The state the oracle reports after an event, from the port's."""
     return {
         'requests': requests, 'error': error is not None,
@@ -106,13 +105,13 @@ def observed(memory, chunks, requests, error):
                        'sourceRange': {'first': s.span[0], 'last': s.span[1]}, 'mergedInto': s.parent,
                        'responseContent': list(s.blocks) if s.blocks else None,
                        'provenance': dict(zip(('stopReason', 'requestHash', 'model'), s.provenance)) if s.provenance else None}
-                      for s in memory.entries],
-        'chunks': [list(c) for c in chunks], 'compressed': sorted(mint.summarized(memory, chunks)), 'queue': list(memory.queue),
-        'quarantine': sorted([mint.sha256(list(ids)), hashlib.sha256(request.encode()).hexdigest()] for ids, request in memory.quarantine),
-        'counter': len(memory.entries),
+                      for s in state.entries],
+        'chunks': [list(c) for c in state.chunks], 'compressed': sorted(state.summarized), 'queue': list(state.queue),
+        'quarantine': sorted([mint.sha256(list(ids)), hashlib.sha256(request.encode()).hexdigest()] for ids, request in state.quarantine),
+        'counter': len(state.entries),
         'merges': [{'level': m.level, 'sourceIds': list(m.sources), 'attempts': len(m.failures), 'lastStopReason': m.stop,
-                    'lastOutcome': m.outcome, 'hadRefusal': m.refused, 'serverErrorStreak': m.streak} for m in memory.merges],
-        'mergeQuarantine': sorted(js_json(list(q)) for q in memory.merge_quarantine),
+                    'lastOutcome': m.outcome, 'hadRefusal': m.refused, 'serverErrorStreak': m.streak} for m in state.merges],
+        'mergeQuarantine': sorted(js_json(list(q)) for q in state.merge_quarantine),
     }
 
 

@@ -12,8 +12,7 @@ calibration.
 The renderer checks its running total, not just the plan's: the middle in order, then the tail
 newest-first, against W plus the grace. A message whose stripped image priced it below zero can
 make a prefix exceed what the whole fits under, and then the compile is refused. Not reproduced: the
-full-coverage assertion, which cannot fire when every unit renders as planned. Close chunks
-(chunking.close_chunks) before each compile, as select's rebuild does.
+full-coverage assertion, which cannot fire when every unit renders as planned.
 """
 from itertools import groupby, takewhile
 from typing import NamedTuple
@@ -21,7 +20,8 @@ from typing import NamedTuple
 import chunking
 import fold
 from config import Config
-from estimate import Calibration, Priced, image_bytes, js_trim, store_tokens
+from estimate import Priced, image_bytes, js_trim, store_tokens
+from state import State
 
 PICKER = 'Adaptive picker exhausted'
 EMISSION = 'Emission overran the plan (planner/emitter estimator drift)'
@@ -41,63 +41,48 @@ class Refusal(NamedTuple):
     budget: int
 
 
-class Session(NamedTuple):
-    """What compiles carry between them besides the log."""
-    levels: dict = {}                                     # carried level per message id
-    demanded: dict = {}                                   # chunk indices the planner asked an L1 for, keys in that order
-    calibration: Calibration = Calibration()
-    cache_keys: list | None = None                        # the last compile's entries, for cache markers
-
-
-def select(messages: list[dict], priced: list[Priced], chunks: list, memories: list, session: Session, W: float,
-           cfg: Config) -> tuple[Session, list | Refusal]:
-    """messages: {'id', 'participant', 'content'} in log order; priced: estimate.price of each;
-    memories: mint.Entry, or anything with its id, level, content, sources, parent and blocks."""
-    answers = {s.id: answer(s) for s in memories}
-    summaries = [fold.Summary(s.id, s.level, fold.recall_tokens(answers[s.id], cfg), s.sources, s.parent) for s in memories]
-    view = fold.inputs(priced, summaries, session.levels, session.calibration.multiplier, cfg)
+def select(state: State, W: float, cfg: Config) -> tuple[State, list | Refusal]:
+    """AutobiographicalStrategy.select: rebuild, plan, queue an L1 for each chunk the plan demands,
+    render. Memories are state.entries, each rendered by answer()."""
+    state = chunking.rebuild(state, cfg)
+    messages, priced, multiplier = state.messages, state.priced, state.calibration.multiplier
+    answers = {s.id: answer(s) for s in state.entries}
+    summaries = [fold.Summary(s.id, s.level, fold.recall_tokens(answers[s.id], cfg), s.sources, s.parent) for s in state.entries]
+    view = fold.inputs(priced, summaries, state.levels, multiplier, cfg)
     limit = fold.ceiling(W, cfg)
     if view.head_tokens + view.tail_tokens > limit:
-        return session, Refusal(PICKER, view.head_tokens + view.tail_tokens, limit)
+        return state, Refusal(PICKER, view.head_tokens + view.tail_tokens, limit)
     plan = fold.plan(view, W, cfg)
-    session = session._replace(demanded=session.demanded | dict.fromkeys(
-        c for first, last in plan.produced for c in chunking.demand(chunks, first, last)))
+    wanted = [c for first, last in plan.produced for c in chunking.demand(state.chunks, first, last)]
+    state = state._replace(demanded=state.demanded | dict.fromkeys(wanted), queue=chunking.enqueue(state.queue, wanted, state.summarized))
     if plan.tokens > limit:
-        return session, Refusal(PICKER, plan.tokens, limit)
+        return state, Refusal(PICKER, plan.tokens, limit)
 
     # Render, keeping the running total under the limit: middle first, then the tail newest-first.
     copy = lambda m: {'participant': m['participant'], 'content': m['content'], 'source': m['id']}
-    tail_start, at, shown, entries = view.head + len(view.leaves), fold.ancestry(summaries), set(), []
-    total, room = view.head_tokens, limit - view.tail_tokens
-    for leaf, m in zip(view.leaves, messages[view.head:tail_start]):
-        if (node := at(leaf, plan.levels[leaf.id])) is None:
-            unit, cost = [copy(m)], leaf.tokens
-        elif node.id not in shown:
-            shown.add(node.id)
-            unit, cost = [{'participant': 'Context Manager', 'content': [{'type': 'text', 'text': cfg.summary_label}], 'source': None},
-                          {'participant': cfg.summary_participant, 'content': answers[node.id], 'source': None}], node.tokens
-        else:
-            continue
+    recall = lambda sid: [{'participant': 'Context Manager', 'content': [{'type': 'text', 'text': cfg.summary_label}], 'source': None},
+                          {'participant': cfg.summary_participant, 'content': answers[sid], 'source': None}]
+    tail_start, entries, total, room = view.head + len(view.leaves), [], view.head_tokens, limit - view.tail_tokens
+    for (kind, ref), cost in plan.units:
         if total + cost > room:
-            return session, Refusal(EMISSION, total + cost + view.tail_tokens, limit)
-        entries, total = entries + unit, total + cost
+            return state, Refusal(EMISSION, total + cost + view.tail_tokens, limit)
+        entries, total = entries + ([copy(messages[ref])] if kind == 'raw' else recall(ref)), total + cost
     tail = messages[tail_start:]
     evicted = chunking.crossing(reversed(view.prices[tail_start:]), limit - total) is not None
     if evicted or tail and has(tail[0], 'tool_result') and not has(tail[0], 'tool_use'):   # its call is not in the tail
-        return session, Refusal(TAIL, total + view.tail_tokens, limit)
+        return state, Refusal(TAIL, total + view.tail_tokens, limit)
     entries = [copy(m) for m in messages[:view.head]] + entries + [copy(m) for m in tail]
 
     # Repair: drop trailing calls with no result, pair tools, strip images; the newest turn must survive.
     entries = entries[:len(entries) - sum(1 for _ in takewhile(
         lambda e: has(e, 'tool_use') and not has(e, 'tool_result'), reversed(entries)))]
-    entries = strip_images(pair_tools(entries), priced, session.calibration.multiplier, cfg)
+    entries = strip_images(pair_tools(entries), priced, multiplier, cfg)
     if messages and not any(e['source'] == messages[-1]['id'] for e in entries):
-        return session, Refusal(NEWEST, plan.tokens, limit)
+        return state, Refusal(NEWEST, plan.tokens, limit)
 
-    marks, keys = cache_marks(entries, {m['id'] for m in messages[:view.head]}, {m['id'] for m in tail}, session.cache_keys)
-    session = session._replace(levels=session.levels | plan.levels, calibration=session.calibration.arm(plan.tokens),
-                               cache_keys=keys)
-    return session, [part for i, e in enumerate(entries) for part in split(e, i in marks)]
+    marks, keys = cache_marks(entries, {m['id'] for m in messages[:view.head]}, {m['id'] for m in tail}, state.cache_keys)
+    state = state._replace(levels=state.levels | plan.levels, calibration=state.calibration.arm(plan.tokens), cache_keys=keys)
+    return state, [part for i, e in enumerate(entries) for part in split(e, i in marks)]
 
 
 def answer(memory) -> list[dict]:
