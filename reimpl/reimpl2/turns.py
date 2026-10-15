@@ -1,10 +1,12 @@
 """Transforms of conversation turns ({'participant', 'content': [blocks]}) that the compile and the
 summarizer's requests share, each reproducing one of the library's: splitting mixed tool turns,
-joining a participant's consecutive turns, repairing or dropping unpaired tool blocks, stripping
-reasoning, and replacing images past a byte cap."""
+joining a participant's consecutive turns, repairing or dropping unpaired tool blocks, normalizing
+turns for a provider, stripping reasoning, and replacing images past a byte cap."""
 from itertools import groupby
 
 from blocks import REASONING, image_bytes
+from js import js_trim
+from segment import budget
 
 OMITTED = {'type': 'text', 'text': '[tool call omitted]'}
 STUB = '[tool result unavailable — omitted during context compression]'
@@ -42,6 +44,15 @@ def drop_unpaired(turns: list[dict]) -> list[dict]:
     keep = lambda b: b['id'] in results if b['type'] == 'tool_use' else b['toolUseId'] in uses if b['type'] == 'tool_result' else True
     return [{'participant': t['participant'], 'content': [b for b in t['content'] if keep(b)] or [OMITTED] * bool(t['content'])}
             for t in turns]
+
+
+def normalize(turns: list[dict]) -> list[dict]:
+    """Turns as a provider takes them: mixed tool turns split, a participant's consecutive turns
+    joined, tool blocks whose partner is nowhere in them dropped, then blank text, empty turns and
+    stale cache_control markers."""
+    joined = drop_unpaired(collapse([part for t in turns for part in split(t, False)]))
+    return [{'participant': t['participant'], 'content': c} for t in joined if (c := [
+        {k: v for k, v in b.items() if k != 'cache_control'} for b in t['content'] if b['type'] != 'text' or js_trim(b['text'])])]
 
 
 def pair_tools(entries: list[dict]) -> list[dict]:
@@ -86,15 +97,12 @@ def strip_reasoning(content: list) -> list:
 
 def cap_images(turns: list[dict], cap: int) -> list[dict]:
     """capCompressionImageBytes: newest turn first, images, nested ones too, become placeholders once
-    the bytes kept would pass `cap`. (The library caps before the request drops blank text, empty
+    the bytes kept would pass `cap`; a cap of 0 or less keeps them all. (The library caps before the request drops blank text, empty
     turns and cache_control, none of which an image is.)"""
-    kept = 0
+    admit = budget(0, cap)
 
     def fit(b: dict) -> dict:
-        nonlocal kept
         if b['type'] == 'image':
-            if fits := kept + image_bytes(b) <= cap:
-                kept += image_bytes(b)
-            return b if fits else IMAGE_PLACEHOLDER
+            return b if admit(image_bytes(b)) else IMAGE_PLACEHOLDER
         return {**b, 'content': list(map(fit, b['content']))} if isinstance(b.get('content'), list) else b   # a tool result's
-    return turns if cap <= 0 else [{**t, 'content': list(map(fit, t['content']))} for t in turns[::-1]][::-1]
+    return [{**t, 'content': list(map(fit, t['content']))} for t in turns[::-1]][::-1]

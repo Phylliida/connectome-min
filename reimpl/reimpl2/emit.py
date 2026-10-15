@@ -25,6 +25,7 @@ from config import Config
 from cut import Summary
 from estimate import Priced, store_tokens
 from js import js_len, js_trim
+from segment import budget, crossing, enqueue
 from state import State
 from turns import IMAGE_PLACEHOLDER, has, pair_tools, split
 
@@ -54,7 +55,7 @@ def select(state: State, W: float, cfg: Config) -> tuple[State, list | Refusal]:
         return state, Refusal(PICKER, view.head_tokens + view.tail_tokens, limit)
     plan = planner.plan(view, W, cfg)
     wanted = [c for first, last in plan.produced for c in chunking.demand(state.chunks, first, last)]
-    state = state._replace(demanded=state.demanded | dict.fromkeys(wanted), queue=chunking.enqueue(state.queue, wanted, state.summarized))
+    state = state._replace(demanded=state.demanded | dict.fromkeys(wanted), queue=enqueue(state.queue, wanted, state.summarized))
     if plan.tokens > limit:
         return state, Refusal(PICKER, plan.tokens, limit)
 
@@ -68,7 +69,7 @@ def select(state: State, W: float, cfg: Config) -> tuple[State, list | Refusal]:
             return state, Refusal(EMISSION, total + cost + view.tail_tokens, limit)
         entries, total = entries + ([copy(messages[ref])] if kind == 'raw' else recall(ref)), total + cost
     tail = messages[tail_start:]
-    evicted = chunking.crossing(reversed(view.prices[tail_start:]), limit - total) is not None
+    evicted = crossing(reversed(view.prices[tail_start:]), limit - total) is not None
     if evicted or tail and has(tail[0], 'tool_result') and not has(tail[0], 'tool_use'):   # its call is not in the tail
         return state, Refusal(TAIL, total + view.tail_tokens, limit)
     entries = [copy(m) for m in messages[:view.head]] + entries + [copy(m) for m in tail]
@@ -105,23 +106,13 @@ def strip_images(entries: list[dict], priced: list[Priced], multiplier: float, c
     message is deeper than the strip depth (walked on store prices) or the kept images reach the
     count or byte limit."""
     position = {m.id: i for i, m in enumerate(priced)}
-    deep = chunking.crossing(reversed([store_tokens(m, multiplier) for m in priced]), cfg.image_strip_depth_tokens)
+    deep = crossing(reversed([store_tokens(m, multiplier) for m in priced]), cfg.image_strip_depth_tokens)
     start = 0 if deep is None else len(priced) - deep
-    pos = lambda i: position.get(entries[i]['source'], -1)
-    kept = kept_bytes = 0
+    pos, admit = lambda i: position.get(entries[i]['source'], -1), budget(cfg.max_live_images, cfg.max_live_image_bytes)
     for i in sorted(range(len(entries)), key=lambda i: -pos(i)):
         too_deep = cfg.image_strip_depth_tokens > 0 and pos(i) < start
-        content = []
-        for block in entries[i]['content']:
-            size = image_bytes(block)
-            if block['type'] != 'image':
-                content.append(block)
-            elif too_deep or 0 < cfg.max_live_images <= kept or 0 < cfg.max_live_image_bytes < kept_bytes + size:
-                content.append(IMAGE_PLACEHOLDER)
-            else:
-                content.append(block)
-                kept, kept_bytes = kept + 1, kept_bytes + size
-        entries[i] = {**entries[i], 'content': content}
+        entries[i] = {**entries[i], 'content': [block if block['type'] != 'image' or not too_deep and admit(image_bytes(block))
+                                                else IMAGE_PLACEHOLDER for block in entries[i]['content']]}
     return entries
 
 

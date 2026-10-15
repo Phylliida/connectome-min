@@ -30,8 +30,8 @@ from calls import Failure, Host, Reply, call, input_tokens, written
 from config import Config
 from js import js_json, js_len, js_trim
 from merges import enqueue_merges, merge, sweep
-from prompts import (INSTRUCTION, MARKER, NO_TOOLS, PLAIN_PROSE, Context, admitted, ask, raw, say, variants,
-                      with_line, without_tools)
+from fallbacks import admitted, variants
+from prompts import INSTRUCTION, MARKER, NO_TOOLS, PLAIN_PROSE, Context, ask, raw, say, with_line, without_tools
 from state import Entry, State
 
 QUIET = ('(A quiet stretch: {} messages of routine system traffic — heartbeats, empty turns, notices. '

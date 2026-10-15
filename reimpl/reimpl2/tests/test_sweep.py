@@ -26,8 +26,9 @@ TESTS = {                                 # the tests that reach each module, th
     'js.py': ['faithful', 'l1', 'compile', 'fold', 'drive'], 'blocks.py': ['faithful', 'l1', 'compile', 'drive'],
     'estimate.py': ['faithful', 'l1', 'compile', 'drive'], 'chunking.py': ['faithful', 'compile', 'l1', 'drive'],
     'cut.py': ['fold', 'compile', 'faithful', 'drive'], 'planner.py': ['fold', 'compile', 'faithful', 'drive'],
+    'optimize.py': ['fold', 'compile', 'faithful', 'drive'], 'segment.py': ['faithful', 'compile', 'l1', 'drive'],
     'state.py': ['l1', 'compile', 'drive'], 'turns.py': ['compile', 'l1', 'drive'], 'emit.py': ['compile', 'fold', 'drive'],
-    'calls.py': ['l1', 'drive'], 'prompts.py': ['l1', 'drive'], 'merges.py': ['l1', 'drive'], 'mint.py': ['l1', 'drive'],
+    'calls.py': ['l1', 'drive'], 'prompts.py': ['l1', 'drive'], 'fallbacks.py': ['l1', 'drive'], 'merges.py': ['l1', 'drive'], 'mint.py': ['l1', 'drive'],
     'drive.py': ['drive'],
 }
 WRAPPERS = {'sorted', 'list', 'tuple', 'set', 'frozenset', 'dict', 'reversed', 'abs', 'int', 'float', 'bool', 'str'}

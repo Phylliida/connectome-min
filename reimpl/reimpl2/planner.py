@@ -21,19 +21,21 @@ the bootstrap branch needs an empty log. Carried frontiers and suffix candidates
 group (a message returning from the tail with a stale level, a boundary inside a group), and are
 projected.
 
-The cut operations this policy uses (what a cut renders and costs, projection) are cut.py's.
+This module is the policy: the targets, the age bands and misallocation that judge a cut, the order
+and rounds of the folds, and the names of the outcomes. The search is optimize.py's (coarsen, refine,
+adopt), over cut.py's operations.
 """
 import math
-from bisect import bisect_left
-from functools import cache, reduce
-from itertools import groupby, product
+from functools import reduce
+from itertools import groupby
 from operator import add
 from typing import NamedTuple
 
 import chunking
 from config import Config
-from cut import Inputs, Leaf, Summary, kv_cost, size
+from cut import Inputs, Leaf, Summary, size
 from estimate import Priced
+from optimize import adopt, coarsen, refine
 
 
 class Plan(NamedTuple):
@@ -47,70 +49,44 @@ class Plan(NamedTuple):
 
 
 def plan(view: Inputs, W: float, cfg: Config) -> Plan:
-    leaves, target, P = view.leaves, W * (1 - cfg.slack), W if cfg.reach_tokens is None else cfg.reach_tokens
-    cap = {leaf.id: band(view, leaf, cfg.merge_threshold) for leaf in leaves}
-    adopt = lambda F, pert, branch, escalated, produced: Plan(F, view.total(F), pert, branch, escalated, produced, view.units(F))
-
-    # 1. The ideal cut.
+    target, P = W * (1 - cfg.slack), W if cfg.reach_tokens is None else cfg.reach_tokens
+    cap = {leaf.id: band(view, leaf, cfg.merge_threshold) for leaf in view.leaves}
     ideal = ideal_cut(view, W, target, cap)
     escalated = size(view.layout(ideal)) > W
     produced = [(run[0].id, run[-1].id) for run in
-                (list(run) for uncovered, run in groupby(leaves, lambda m: not m.l1) if uncovered and escalated)]
+                (list(run) for uncovered, run in groupby(view.leaves, lambda m: not m.l1) if uncovered and escalated)]
 
-    # 2. Hold the carried frontier.
-    carried = view.project({leaf.id: leaf.level for leaf in leaves})
-    carried_units, ideal_loss = view.layout(carried), loss(view, ideal, cap)
-    gap = cfg.quality_gap_ratio * max(1, ideal_loss)
-    if target <= size(carried_units) <= W and loss(view, carried, cap) - ideal_loss <= gap:
-        return adopt(carried, 0, 'hold', False, [])
-
-    # 3. Adopt the ideal within the trust region.
-    if (pert := kv_cost(carried_units, view.layout(ideal))) <= P:
-        return adopt(ideal, pert, 'ideal', escalated, produced)
-
-    # 4. Adopt the ideal from a boundary on: the oldest of its changes the trust region affords,
-    #    found by the library's binary search (len(changes) adopts nothing).
-    changes = [leaf.seq for leaf in leaves if carried[leaf.id] != ideal[leaf.id]]
-
-    @cache
-    def suffix(i: int) -> tuple:
-        F = view.project({m.id: ideal[m.id] if i < len(changes) and m.seq >= changes[i] else carried[m.id] for m in leaves})
-        return F, (units := view.layout(F)), kv_cost(carried_units, units)
-
-    F, units, partial_pert = suffix(bisect_left(range(len(changes)), True, key=lambda i: suffix(i)[2] <= P))
-    if (partial := size(units)) <= W and loss(view, F, cap) - ideal_loss <= gap:
-        return adopt(F, partial_pert, 'suffix', False, [])
-
-    # 5. The trust region loses.
-    return adopt(ideal, pert, 'infeasible' if partial > W else 'quality-gap', escalated, produced)
+    ideal_loss = loss(view, ideal, cap)
+    near = lambda F: loss(view, F, cap) - ideal_loss <= cfg.quality_gap_ratio * max(1, ideal_loss)   # not much worse
+    step = adopt(view, view.project({leaf.id: leaf.level for leaf in view.leaves}), ideal, P,
+                 holds=lambda F, units: target <= size(units) <= W and near(F), fits=lambda F, units: size(units) <= W and near(F))
+    planned = lambda branch, escalated, produced: Plan(step.cut, view.total(step.cut), step.cost, branch, escalated, produced,
+                                                       view.units(step.cut))
+    match step.name:
+        case 'hold' | 'suffix':
+            return planned(step.name, False, [])
+        case 'ideal':
+            return planned('ideal', escalated, produced)
+        case 'neither':
+            return planned('infeasible' if size(step.tried) > W else 'quality-gap', escalated, produced)
 
 
 def ideal_cut(view: Inputs, W: float, target: float, cap: dict) -> dict:
     """Step 1, in rounds: the ledger (view.total) steers the phases, but a round ends on the render,
     which leaves out a negative window; while that exceeds W and shrinks, another round, three at most.
-      A  past the target: fold whole groups, level by level in (salience, age) order, within their bands.
+      A  past the target: fold in (salience, age) order, within the bands, while past the target.
       B  still past W: the same, past the bands.
-      C  under the target: unfold each group at a level once, youngest-first, if that nears the target
-         and stays within W. Unfolding a group moves the total by a fixed amount and only other groups'
-         unfolds came before, so the library's retries of a refused group after each accept always refuse."""
-    leaves, at, members, total = view.leaves, view.at, view.members, view.total
-    ideal, rendered = dict.fromkeys((leaf.id for leaf in leaves), 0), math.inf
-    priority = sorted(leaves, key=lambda m: (m.salience, m.seq))
+      C  under the target: unfold where that nears the target within W. Unfolding a group moves the
+         total by a fixed amount and only other groups' unfolds came before, so the library's retries
+         of a refused group after each accept always refuse; refine tries each group once."""
+    ledger, priority = view.total, sorted(view.leaves, key=lambda m: (m.salience, m.seq))
+    in_band = lambda group, level: min(cap[m] for m in view.members(group.id)) >= level
+    ideal, rendered = dict.fromkeys((leaf.id for leaf in view.leaves), 0), math.inf
     for _ in range(3):
-        tokens = total(ideal)
-        for within_bands, limit in ((True, target), (False, W)):    # phase A, and phase B only past W
-            if tokens > limit:
-                for level, leaf in product(range(1, view.top + 1), priority):
-                    node = at(leaf, level) if tokens > target and ideal[leaf.id] < level else None
-                    if node and (not within_bands or min(cap[m] for m in members(node.id)) >= level):
-                        ideal |= dict.fromkeys(members(node.id), level)
-                        tokens = total(ideal)
-        for level in range(view.top, 0, -1):                          # phase C
-            for node in dict.fromkeys(at(m, level) for m in reversed(leaves) if ideal[m.id] == level):
-                if tokens < target:
-                    trial = ideal | dict.fromkeys(members(node.id), level - 1)
-                    if (t := total(trial)) <= W and abs(t - target) < abs(tokens - target):
-                        ideal, tokens = trial, t
+        ideal = coarsen(view, ideal, ledger, priority, lambda t: t > target, in_band)
+        if ledger(ideal) > W:
+            ideal = coarsen(view, ideal, ledger, priority, lambda t: t > target, lambda group, level: True)
+        ideal = refine(view, ideal, ledger, lambda t: t < target, lambda t, now: t <= W and abs(t - target) < abs(now - target))
         if (now := size(view.layout(ideal))) <= W or now >= rendered:
             break
         rendered = now
