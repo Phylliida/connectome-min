@@ -23,11 +23,8 @@ pub fn plan(frontier: Vec<Node>, cost: impl Fn(Node) -> f64, exists: impl Fn(Nod
     let total = |f: &[Node]| fixed + f.iter().map(|&n| cost(n)).fold(0.0, |a, x| a + x);
     let (target, mut f) = (w * (1.0 - cfg.slack), frontier);
     let folded = total(&f) > w;
-    while folded && total(&f) > target {
-        match fold(&f, &exists, cfg.merge_threshold) {
-            Some(folds) => f = folds,
-            None => break,
-        }
+    while folded && total(&f) > target && let Some(folds) = fold(&f, &exists, cfg.merge_threshold) {
+        f = folds;
     }
     if folded || total(&f) < w * cfg.unfold_below {
         while let Some(trial) = unfold(&f, cfg.merge_threshold).filter(|t| total(t) <= target) {

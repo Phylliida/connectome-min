@@ -23,13 +23,8 @@ use crate::turns::Turn;
 #[allow(clippy::too_many_arguments)]
 pub fn step(session: &Session, messages: &[Value], usage: Option<f64>, budget: f64, reserve: f64, window: f64, host: &mut dyn Host, cfg: &Config)
     -> (Result<Vec<Turn>, Refusal>, Option<String>) {
-    for message in messages {
-        append(session, message, cfg);
-    }
-    let mut calibration = current(session);
-    if let Some(usage) = usage {
-        calibration = calibration.observe(usage);
-    }
+    messages.iter().for_each(|message| append(session, message, cfg));
+    let calibration = usage.into_iter().fold(current(session), Calibration::observe);
     let compiled = compile(session, budget, reserve, window, calibration, cfg);
     (compiled, drive(session, host, cfg))
 }

@@ -44,6 +44,7 @@ name = "connectome-web"
 version = "0.1.0"
 dependencies = [
  "connectome",
+ "libc",
  "open",
  "ureq",
 ]

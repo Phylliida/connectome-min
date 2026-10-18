@@ -113,15 +113,13 @@ fn render(session: &Session, (n, p): Node, cfg: &Config) -> Vec<Turn> {
 /// placeholders.
 fn messages(session: &Session, ids: Range<u64>, live: &Range<u64>, cfg: &Config) -> Vec<Turn> {
     let mut admit = budget(cfg.max_live_images, cfg.max_live_image_bytes);
-    let newest_first: Vec<Turn> = ids
-        .rev()
-        .map(|i| {
-            let p = priced(session, i);
-            let content = p.blocks.iter().map(|b| if b.kind != "image" || live.contains(&i) && admit(b.images[0]) { b.clone() } else { text(DROPPED) });
-            Turn::new(&p.participant, content.collect(), Some(i))
-        })
-        .collect();
-    newest_first.into_iter().rev().collect()
+    let mut turns: Vec<Turn> = ids.rev().map(|i| {
+        let p = priced(session, i);
+        let content = p.blocks.iter().map(|b| if b.kind != "image" || live.contains(&i) && admit(b.images[0]) { b.clone() } else { text(DROPPED) });
+        Turn::new(&p.participant, content.collect(), Some(i))
+    }).collect();
+    turns.reverse(); // read newest first, as the live image limits count
+    turns
 }
 
 /// A memory's recall answer under carrierPolicy 'live-strip' (liveWindowAnswerProse): the reply's

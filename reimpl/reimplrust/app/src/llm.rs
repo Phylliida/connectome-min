@@ -6,7 +6,7 @@
 
 use connectome::blocks::Block;
 use connectome::emit::Reader;
-use connectome::json::{self, Json, Value};
+use connectome::json::{self, sparse, Json, Value};
 use connectome::obj;
 use connectome::turns::Turn;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -66,19 +66,17 @@ impl Llm {
             let text = body.read_to_string().unwrap_or_default();
             return Err(format!("HTTP {status}: {}", text.chars().take(500).collect::<String>()));
         }
-        let mut reply = Reply::default();
-        for line in BufReader::new(body.into_reader()).lines() {
-            match line.map_err(|e| e.to_string())?.strip_prefix("data:").map(str::trim) {
-                Some("[DONE]") => break, // OpenRouter ends the stream as OpenAI's does, past message_stop
-                Some(data) => reply.event(&json::parse(data.as_bytes())?, &mut piece)?,
-                None => {}
-            }
-        }
-        Ok(reply.done())
+        // each event's data, until OpenRouter's [DONE] (it ends the stream as OpenAI's does, past message_stop)
+        let data = BufReader::new(body.into_reader()).lines().filter_map(|line| match line {
+            Ok(line) => Some(Ok(line.strip_prefix("data:")?.trim().to_string())),
+            Err(e) => Some(Err(e.to_string())),
+        });
+        let mut events = data.take_while(|d| d.as_deref() != Ok("[DONE]"));
+        events.try_fold(Reply::default(), |reply, d| reply.event(&json::parse(d?.as_bytes())?, &mut piece)).map(Reply::done)
     }
 }
 
-/// A streamed reply as its events build it.
+/// A streamed reply as its events build it, a fold over them.
 #[derive(Default)]
 struct Reply {
     blocks: Vec<Value>,
@@ -88,7 +86,7 @@ struct Reply {
 }
 
 impl Reply {
-    fn event(&mut self, e: &Value, show: &mut impl FnMut(&str, &str)) -> Result<(), String> {
+    fn event(mut self, e: &Value, show: &mut impl FnMut(&str, &str)) -> Result<Reply, String> {
         let tokens = |usage: &Value, k: &str| usage[k].as_f64().unwrap_or(0.0);
         match e.kind() {
             "message_start" => {
@@ -102,7 +100,7 @@ impl Reply {
                 let key = match e["delta"].kind().strip_suffix("_delta") {
                     Some(key @ ("text" | "thinking" | "signature")) => key,
                     Some("input_json") => "partial_json", // a tool call's input, parsed once whole
-                    _ => return Ok(()),
+                    _ => return Ok(self),
                 };
                 let more = e["delta"][key].as_str().unwrap_or("");
                 match &mut block[key] {
@@ -128,7 +126,7 @@ impl Reply {
             "error" => return Err(format!("{}: {}", e["error"]["type"].as_str().unwrap_or("error"), e["error"]["message"].as_str().unwrap_or(""))),
             _ => {} // ping, message_stop
         }
-        Ok(())
+        Ok(self)
     }
 
     fn done(self) -> Value {
@@ -160,7 +158,7 @@ fn to_api(mut b: Value, cache: bool) -> Value {
                 Value::Array(blocks) => Value::Array(blocks.into_iter().filter(|c| SENT.contains(&c.kind())).map(|c| to_api(c, false)).collect()),
                 content => content,
             };
-            obj! {"type" => "tool_result", "tool_use_id" => b["toolUseId"].take(), "content" => content}
+            sparse(obj! {"type" => "tool_result", "tool_use_id" => b["toolUseId"].take(), "content" => content, "is_error" => b["isError"].take()})
         }
         "image" => {
             let source = &mut b["source"];

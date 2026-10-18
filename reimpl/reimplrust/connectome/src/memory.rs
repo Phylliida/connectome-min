@@ -164,9 +164,7 @@ fn ask(session: &Session, before: u64, task: Vec<Turn>, host: &dyn Host, cfg: &C
     let fits = |&&(_, tokens): &&(Node, f64)| used + tokens + 50.0 <= cfg.recall_budget_tokens && { used += tokens + 50.0; true };
     let mut kept: Vec<Node> = prior.iter().rev().filter(fits).map(|&(node, _)| node).collect();
     kept.reverse();
-    let mut turns = pairs(session, &kept, cfg);
-    turns.extend(task);
-    let mut wire = cap_images(normalize(turns), cfg.compression_image_bytes);
+    let mut wire = cap_images(normalize(pairs(session, &kept, cfg).into_iter().chain(task).collect()), cfg.compression_image_bytes);
     let marks = if kept.len() == prior.len() { seams(&wire, &kept) } else { vec![] };
     for (i, t) in wire.iter_mut().enumerate() {
         t.mark = marks.contains(&i);
