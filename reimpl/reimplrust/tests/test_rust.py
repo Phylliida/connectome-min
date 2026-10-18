@@ -52,6 +52,8 @@ def python(r, folder: str, snapshot: str | None = None) -> tuple[list, dict]:
         except Exception as error:
             replies.append({'raise': repr(error)})
             raise
+        if odd.random() < 0.05:                                    # a reply cut short
+            response = {**response, 'stopReason': 'max_tokens'}
         replies.append({'response': response})
         return response
 
@@ -67,6 +69,8 @@ def python(r, folder: str, snapshot: str | None = None) -> tuple[list, dict]:
             W = r.choice([4000, 12000, 40000])
         last = s.last('compiles') or {}
         usage = round(last['armed'] * r.uniform(0.8, 1.2)) if last.get('armed') and r.random() < 0.5 else None
+        if usage and odd.random() < 0.1:                           # a request the compile didn't build
+            usage = round(usage * odd.choice([0.3, 3]))
         messages = turn(r, t) + odd_turn(odd, t)
         passes.append({'t': t, 'before': before, 'replies': len(replies), 'fork': fork, 'messages': messages, 'usage': usage,
                        'budget': W + 1000, 'reserve': 1000, 'window': W + 5000})
@@ -77,9 +81,10 @@ def python(r, folder: str, snapshot: str | None = None) -> tuple[list, dict]:
 
 
 def odd_turn(r, t) -> list[dict]:
-    """Now and then, tool traffic generate.turn doesn't make: a call answered twice in one turn, a non-user
-    turn mixing text and a tool result (the newest message, so it carries the cache mark when it splits),
-    and a call that repeats its id."""
+    """Now and then, what generate.turn doesn't make: a call answered twice in one turn, a non-user turn
+    mixing text and a tool result (the newest message, so it carries the cache mark when it splits), a
+    call that repeats its id, a user message of images that fill a 600-byte live limit exactly, a quiet
+    stretch, a long text whose density the first 2000 units decide, and reasoning with its text removed."""
     text = {'type': 'text', 'text': 'odd é'}
     call = lambda tid, n=1: {'participant': 'assistant', 'content': [text] + [{'type': 'tool_use', 'id': tid, 'name': 'read', 'input': {}}] * n}
     result = lambda tid: {'type': 'tool_result', 'toolUseId': tid, 'content': 'ok'}
@@ -90,6 +95,16 @@ def odd_turn(r, t) -> list[dict]:
         out += [call(f'u{t}', 2), {'participant': 'user', 'content': [result(f'u{t}')]}]
     if r.random() < 0.04:
         out += [call(f'm{t}'), {'participant': r.choice(['assistant', 'Claude']), 'content': [text, result(f'm{t}'), text, result(f'x{t}')]}]
+    if r.random() < 0.06:
+        image = {'type': 'image', 'source': {'type': 'base64', 'mediaType': 'image/png', 'data': 'iVBOR' * 60}}
+        out += [{'participant': 'user', 'content': [text] + [image] * r.randint(2, 4)}]
+    if r.random() < 0.05:                                          # heartbeats: a quiet stretch, mostly padding
+        out += [{'participant': ['user', 'assistant'][k % 2], 'content': [{'type': 'text', 'text': 'ok' + ' ' * 1500}]} for k in range(r.randint(4, 12))]
+    if r.random() < 0.04:                                          # code first, prose after the 2000 units density looks at
+        out += [{'participant': 'assistant', 'content': [{'type': 'text', 'text': '{"a": [1, 2]}' * r.randint(20, 200) + ' then the memory' * r.randint(10, 600)}]}]
+    if r.random() < 0.04:                                          # reasoning whose text was removed
+        out += [{'participant': 'assistant', 'content': [{'type': 'thinking', 'thinking': '', 'signature': 'sig'},
+                                                        {'type': 'redacted_thinking', 'data': 'xyz' * r.randint(0, 20)}, text]}]
     return out
 
 

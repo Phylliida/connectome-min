@@ -46,16 +46,8 @@ struct App {
 
 struct Summarizer<'a>(&'a Llm);
 
+/// Declares no system prompt or tools, so its requests carry neither.
 impl Host for Summarizer<'_> {
-    fn tools(&self) -> Option<&Value> {
-        None
-    }
-
-    fn system(&self) -> Option<&str> {
-        None
-    }
-
-    /// The request carries no system prompt or tools: this host declares neither.
     fn complete(&mut self, request: &Request, reader: &mut Reader) -> Result<Value, String> {
         let model = if request.model.is_empty() { &self.0.model } else { &request.model };
         self.0.messages(obj! {"model" => model.as_str(), "max_tokens" => request.max_tokens}, &request.messages, reader, |_, _| {})
@@ -119,9 +111,7 @@ fn main() {
     for stream in listener.incoming().flatten() {
         let app = app.clone();
         std::thread::spawn(move || {
-            if let Err(e) = handle(&app, stream) {
-                eprintln!("{e}");
-            }
+            handle(&app, stream).unwrap_or_else(|e| eprintln!("{e}"));
         });
     }
 }
@@ -133,24 +123,16 @@ fn main() {
 /// goes.
 fn handle(app: &App, mut stream: TcpStream) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+    let mut lines = (&mut reader).lines().map_while(Result::ok);
+    let line = lines.next().unwrap_or_default();
     let mut words = line.split_whitespace();
     let (method, target) = (words.next().unwrap_or("").to_string(), words.next().unwrap_or("/").to_string());
-    let (mut length, mut host, mut marked) = (0, String::new(), false);
-    loop {
-        let mut header = String::new();
-        reader.read_line(&mut header)?;
-        let Some((k, v)) = header.trim_end().split_once(':') else { break };
-        match k.to_ascii_lowercase().as_str() {
-            "content-length" => length = v.trim().parse().unwrap_or(0).min(1 << 20),
-            "host" => host = v.trim().to_string(),
-            "x-connectome" => marked = true,
-            _ => {}
-        }
-    }
+    let field = |h: String| h.split_once(':').map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()));
+    let headers: Vec<(String, String)> = lines.take_while(|h| !h.is_empty()).filter_map(field).collect();
+    let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+    let length = header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0usize).min(1 << 20);
     let port = app.addr.rsplit(':').next().unwrap_or("");
-    if ![app.addr.clone(), format!("localhost:{port}")].contains(&host) || method == "POST" && !marked {
+    if ![app.addr.as_str(), &format!("localhost:{port}")].contains(&header("host").unwrap_or("")) || method == "POST" && header("x-connectome").is_none() {
         return send(&mut stream, "403 Forbidden", "text/plain", b"this server answers only its own page");
     }
     let body = {

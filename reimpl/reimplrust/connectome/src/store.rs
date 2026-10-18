@@ -21,7 +21,7 @@ use crate::estimate::Priced;
 use crate::json::{self, Json, Value};
 use crate::obj;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ pub struct Session {
     parent: Option<Box<Session>>,
     pub fork: Value, // fork.json: {parent, at, shared: {file: records shared}}, or null
     counts: RefCell<HashMap<String, (u64, u64)>>, // file -> (its size, its count) when last counted
-    repaired: RefCell<Vec<String>>,
+    repaired: RefCell<HashSet<String>>,
     /// chunking::priced's memo: what plans read from a message, never the message.
     pub(crate) priced: RefCell<HashMap<u64, Rc<Priced>>>,
 }
@@ -107,15 +107,10 @@ impl Session {
 
     /// Records first..=last, in order, read as they're iterated.
     pub fn span(&self, name: &str, first: u64, last: u64) -> Box<dyn Iterator<Item = Value> + '_> {
-        let n = self.shared(name);
-        let inherited: Box<dyn Iterator<Item = Value>> = match &self.parent {
-            Some(parent) if first < n && first <= last => parent.span(name, first, last.min(n - 1)),
-            _ => Box::new(std::iter::empty()),
-        };
-        let start = first.max(n);
-        let own: Box<dyn Iterator<Item = Value>> =
-            if start <= last { Box::new(self.scan(name, start).take_while(move |r| r.id() <= last)) } else { Box::new(std::iter::empty()) };
-        Box::new(inherited.chain(own))
+        let (n, start) = (self.shared(name), first.max(self.shared(name)));
+        let inherited = self.parent.as_ref().filter(|_| first < n && first <= last).map(|parent| parent.span(name, first, last.min(n - 1)));
+        let own = (start <= last).then(|| self.scan(name, start).take_while(move |r| r.id() <= last));
+        Box::new(inherited.into_iter().flatten().chain(own.into_iter().flatten()))
     }
 
     /// This session's own records from id `i` on, a line at a time.
@@ -131,12 +126,11 @@ impl Session {
         let Value::Object(fields) = record else { panic!("a record is an object") };
         let record = Value::Object(std::iter::once(("id".to_string(), Value::from(id))).chain(fields.into_iter().filter(|(k, _)| k != "id")).collect());
         let path = self.file(name);
-        if !self.repaired.borrow().iter().any(|f| f == name) {
+        if self.repaired.borrow_mut().insert(name.to_string()) {
             repair(&path);
-            self.repaired.borrow_mut().push(name.to_string());
         }
         let mut f = OpenOptions::new().create(true).append(true).open(&path).expect("open for append");
-        let mut line = json::to_string(&record);
+        let mut line = json::to_string(&record); // one write: a record is never half there
         line.push('\n');
         f.write_all(line.as_bytes()).expect("append");
         self.counts.borrow_mut().insert(name.to_string(), (f.metadata().expect("metadata").len(), id + 1));
@@ -196,30 +190,29 @@ fn id_of(bytes: &[u8]) -> Option<u64> {
 /// The first `most` bytes of the last non-blank line of a file, found from its end.
 fn last_line(path: &Path, most: u64) -> Option<Vec<u8>> {
     let mut file = File::open(path).ok()?;
-    let mut end = file.metadata().ok()?.len();
-    let mut byte = [0];
-    while end > 0 && file.seek(SeekFrom::Start(end - 1)).and_then(|_| file.read_exact(&mut byte)).is_ok() && byte[0].is_ascii_whitespace() {
-        end -= 1;
-    }
-    if end == 0 {
-        return None;
-    }
+    let size = file.metadata().ok()?.len();
+    let end = rfind(&mut file, size, |b| !b.is_ascii_whitespace())? + 1;
     let start = line_start(&mut file, end);
     Some(read_at(&mut file, start, end.min(start.saturating_add(most))))
 }
 
 /// Where the line ending at `end` starts: past the newline before it, or at 0.
 fn line_start(file: &mut File, end: u64) -> u64 {
+    rfind(file, end, |b| b == b'\n').map_or(0, |nl| nl + 1)
+}
+
+/// Where the last byte before `end` that `wanted` holds of is, read backward a block at a time.
+fn rfind(file: &mut File, end: u64, wanted: impl Fn(u8) -> bool) -> Option<u64> {
     let (mut pos, mut block) = (end, vec![0; 1 << 16]);
     while pos > 0 {
         let step = pos.min(block.len() as u64) as usize;
         file.seek(SeekFrom::Start(pos - step as u64)).and_then(|_| file.read_exact(&mut block[..step])).expect("read");
-        if let Some(nl) = block[..step].iter().rposition(|&b| b == b'\n') {
-            return pos - step as u64 + nl as u64 + 1;
+        if let Some(k) = block[..step].iter().rposition(|&b| wanted(b)) {
+            return Some(pos - step as u64 + k as u64);
         }
         pos -= step as u64;
     }
-    0
+    None
 }
 
 fn read_at(file: &mut File, start: u64, end: u64) -> Vec<u8> {

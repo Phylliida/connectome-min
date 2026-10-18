@@ -58,13 +58,8 @@ impl Calibration {
     /// real_tokens: input + cache-read + cache-write. A ratio outside 0.6..1.8 is a request the
     /// compile didn't build: it disarms without learning.
     pub fn observe(self, real_tokens: f64) -> Calibration {
-        if !(real_tokens > 0.0 && self.armed > 0.0) {
-            return self;
-        }
         let (ratio, m) = (real_tokens / self.armed, self.multiplier);
-        if !(0.6..=1.8).contains(&ratio) {
-            return Calibration { multiplier: m, armed: 0.0 };
-        }
-        Calibration { multiplier: (m + 0.2 * (ratio * m - m)).clamp(0.6, 1.8), armed: 0.0 }
+        let multiplier = if (0.6..=1.8).contains(&ratio) { (m + 0.2 * (ratio * m - m)).clamp(0.6, 1.8) } else { m };
+        if real_tokens > 0.0 && self.armed > 0.0 { Calibration { multiplier, armed: 0.0 } } else { self }
     }
 }

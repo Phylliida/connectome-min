@@ -11,7 +11,8 @@ use crate::config::Config;
 use crate::emit::{select, Refusal};
 use crate::estimate::Calibration;
 use crate::json::Value;
-use crate::memory::{tick, Host};
+pub use crate::memory::drive;
+use crate::memory::Host;
 use crate::obj;
 use crate::store::Session;
 use crate::turns::Turn;
@@ -51,17 +52,5 @@ pub fn compile(session: &Session, budget: f64, reserve: f64, window: f64, calibr
     match crate::emit::select(session, budget - reserve, calibration, cfg) {
         Err(r) if r.actual > r.budget && r.actual + reserve <= window => select(session, (r.actual + reserve) - reserve, calibration, cfg),
         result => result,
-    }
-}
-
-/// driveTick: memories form until one makes a call or none forms.
-pub fn drive(session: &Session, host: &mut dyn Host, cfg: &Config) -> Option<String> {
-    let memories = || (1..).map(|n| session.count(&format!("layer{n}"))).take_while(|&c| c > 0).sum::<u64>();
-    loop {
-        let before = memories();
-        let (called, error) = tick(session, host, cfg);
-        if called || memories() == before {
-            return error;
-        }
     }
 }

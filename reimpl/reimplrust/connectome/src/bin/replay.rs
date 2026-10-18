@@ -32,10 +32,6 @@ impl Host for Scripted<'_> {
         self.tools.as_ref()
     }
 
-    fn system(&self) -> Option<&str> {
-        None
-    }
-
     fn complete(&mut self, request: &Request, reader: &mut Reader) -> Result<Value, String> {
         self.events.push(Value::Array(vec![format!("request {}", self.now).into(), request.value(|b| reader.load(b))]));
         let reply = self.replies.next().expect("a scripted reply");

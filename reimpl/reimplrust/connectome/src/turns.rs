@@ -7,7 +7,7 @@
 use crate::blocks::{reasoning, shape, At, Block};
 use crate::json::{sparse, Value};
 use crate::obj;
-use crate::segment::Budget;
+use crate::segment::budget;
 
 pub const LABEL: &str = "Context Manager";
 pub const STUB: &str = "[tool result unavailable — omitted during context compression]";
@@ -141,19 +141,13 @@ pub fn strip_reasoning(content: &[Block]) -> Vec<Block> {
 /// and says which of its images the reader drops. (The library caps before the request drops blank
 /// text, empty turns and cache_control, none of which an image is.)
 pub fn cap_images(mut turns: Vec<Turn>, cap: usize) -> Vec<Turn> {
-    let mut admit = Budget::new(0, cap);
-    for t in turns.iter_mut().rev() {
-        for b in t.content.iter_mut() {
-            if b.kind == "image" {
-                if !admit.admit(b.images[0]) {
-                    *b = text(DROPPED);
-                }
-                continue;
-            }
-            let dropped: Vec<usize> = b.images.iter().enumerate().filter(|&(_, &size)| !admit.admit(size)).map(|(k, _)| k).collect();
-            if let (At::Disk(.., at_dropped), false) = (&mut b.at, dropped.is_empty()) {
-                at_dropped.extend(dropped);
-            }
+    let mut admit = budget(0, cap);
+    for b in turns.iter_mut().rev().flat_map(|t| t.content.iter_mut()) {
+        let dropped: Vec<usize> = (0..b.images.len()).filter(|&k| !admit(b.images[k])).collect();
+        if b.kind == "image" && !dropped.is_empty() {
+            *b = text(DROPPED);
+        } else if let (false, At::Disk(.., at)) = (b.kind == "image", &mut b.at) {
+            at.extend(dropped);
         }
     }
     turns

@@ -8,7 +8,7 @@
 use crate::config::Config;
 use crate::estimate::{price, store_tokens, Priced};
 use crate::obj;
-use crate::segment::{runs, Budget};
+use crate::segment::{budget, runs};
 use crate::store::Session;
 use std::rc::Rc;
 
@@ -18,17 +18,12 @@ pub const PLACEHOLDER: f64 = 9.0;
 /// The tail's first message: walking back from the newest, the messages until one takes the total
 /// past recent_window_tokens, which is outside; a tool_result first in the tail brings its call in.
 pub fn tail_start(session: &Session, multiplier: f64, cfg: &Config) -> u64 {
-    let (floor, mut admit, mut total) = (open_start(session), Budget::new(cfg.max_live_images, cfg.max_live_image_bytes), 0.0);
-    let mut after: Option<Rc<Priced>> = None;
-    for i in (floor..session.count("messages")).rev() {
-        let p = priced(session, i);
-        total += live_price(&p, multiplier, &mut admit);
-        if total > cfg.recent_window_tokens {
-            return i + 1 - after.is_some_and(|a| a.has("tool_result")) as u64;
-        }
-        after = Some(p);
-    }
-    floor
+    let (floor, n, mut admit, mut total) = (open_start(session), session.count("messages"), budget(cfg.max_live_images, cfg.max_live_image_bytes), 0.0);
+    let outside = (floor..n).rev().find(|&i| {
+        total += live_price(&priced(session, i), multiplier, &mut admit);
+        total > cfg.recent_window_tokens
+    });
+    outside.map_or(floor, |i| i + 1 - (i + 1 < n && priced(session, i + 1).has("tool_result")) as u64)
 }
 
 /// The first message no chunk holds.
@@ -49,22 +44,17 @@ pub fn close_chunks(session: &Session, multiplier: f64, cfg: &Config) {
 /// estimate::price of logged message i, kept while recently used (messages never change); the
 /// message itself isn't kept.
 pub fn priced(session: &Session, i: u64) -> Rc<Priced> {
-    if let Some(p) = session.priced.borrow().get(&i) {
-        return p.clone();
-    }
-    let p = Rc::new(price(&session.read("messages", i)));
     let mut memo = session.priced.borrow_mut();
-    if memo.len() >= 4096 {
+    if memo.len() >= 4096 && !memo.contains_key(&i) {
         memo.clear();
     }
-    memo.insert(i, p.clone());
-    p
+    memo.entry(i).or_insert_with(|| Rc::new(price(&session.read("messages", i)))).clone()
 }
 
 /// A tail message's price: images past the live limits count as placeholders (uncalibrated, as in
 /// the library).
-pub fn live_price(p: &Priced, multiplier: f64, admit: &mut Budget) -> f64 {
-    let dropped: f64 = p.images().filter(|&(_, size)| !admit.admit(size)).map(|(raw, _)| (raw - PLACEHOLDER).max(0.0)).fold(0.0, |a, x| a + x);
+pub fn live_price(p: &Priced, multiplier: f64, admit: &mut impl FnMut(usize) -> bool) -> f64 {
+    let dropped: f64 = p.images().filter(|&(_, size)| !admit(size)).map(|(raw, _)| (raw - PLACEHOLDER).max(0.0)).fold(0.0, |a, x| a + x);
     store_tokens(p, multiplier) - dropped
 }
 

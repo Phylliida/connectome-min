@@ -22,7 +22,7 @@ use crate::js::{digest, js_len, js_trim, py_round};
 use crate::json::{Json, Value};
 use crate::obj;
 use crate::planner::{chunks, plan, Node};
-use crate::segment::Budget;
+use crate::segment::budget;
 use crate::store::Session;
 use crate::turns::{pair_tools, say, split, text, Turn, DROPPED};
 use std::cell::RefCell;
@@ -53,7 +53,7 @@ pub fn select(session: &Session, w: f64, calibration: Calibration, cfg: &Config)
     let covered = shown.last().map_or(0, |&node| chunks(node, cfg.merge_threshold).end);
     let frontier: Vec<Node> = shown.into_iter().chain((covered..held(0)).map(|j| (0, j))).collect();
     let (tail, loose) = (tail_start(session, m, cfg), open_start(session)..session.count("messages"));
-    let (mut admit, live) = (Budget::new(cfg.max_live_images, cfg.max_live_image_bytes), tail..loose.end);
+    let (mut admit, live) = (budget(cfg.max_live_images, cfg.max_live_image_bytes), tail..loose.end);
     let price = |i| {
         let p = priced(session, i);
         if live.contains(&i) { live_price(&p, m, &mut admit) } else { py_round(stripped_raw(&p) * m) }
@@ -79,11 +79,17 @@ pub fn select(session: &Session, w: f64, calibration: Calibration, cfg: &Config)
         return Err(Refusal { stage: "Structural repair did not retain the newest turn", actual: total, budget: limit });
     }
     let keys: Vec<String> = entries.iter().map(|e| digest(&Value::Array(vec![e.participant.as_str().into(), located(&e.content)]))).collect();
-    let in_tail: Vec<bool> = entries.iter().map(|e| e.source.is_some_and(|s| s >= tail)).collect();
-    let marks = cache_marks(&keys, &in_tail, last["keys"].as_array());
+    // placeCacheMarkers: the end of the prefix unchanged since the previous compile (before any, the last
+    // entry ahead of the tail), and the last entry. An entry's key is where its blocks are, which says
+    // what they hold, since records never change.
+    let stable = match last["keys"].as_array() {
+        None => entries.iter().position(|e| e.source.is_some_and(|s| s >= tail)).unwrap_or(keys.len()),
+        Some(previous) => keys.iter().zip(previous).take_while(|(a, b)| b.as_str() == Some(a)).count(),
+    };
+    let marks = [keys.len().checked_sub(1), stable.checked_sub(1)];
     let nodes: Vec<Value> = frontier.iter().map(|&(n, p)| vec![n, p].into()).collect();
     session.append("compiles", obj! {"frontier" => nodes, "multiplier" => m, "armed" => total, "keys" => keys, "escalated" => total > w});
-    Ok(entries.iter().enumerate().flat_map(|(i, e)| split(e, marks.contains(&i))).collect())
+    Ok(entries.iter().enumerate().flat_map(|(i, e)| split(e, marks.contains(&Some(i)))).collect())
 }
 
 /// Blocks as where they are: what keys and request hashes are taken over.
@@ -106,17 +112,16 @@ fn render(session: &Session, (n, p): Node, cfg: &Config) -> Vec<Turn> {
 /// Messages as entries: images past the live limits, newest first, or outside the tail, become
 /// placeholders.
 fn messages(session: &Session, ids: Range<u64>, live: &Range<u64>, cfg: &Config) -> Vec<Turn> {
-    let mut admit = Budget::new(cfg.max_live_images, cfg.max_live_image_bytes);
-    let mut out: Vec<Turn> = ids
+    let mut admit = budget(cfg.max_live_images, cfg.max_live_image_bytes);
+    let newest_first: Vec<Turn> = ids
         .rev()
         .map(|i| {
             let p = priced(session, i);
-            let content = p.blocks.iter().map(|b| if b.kind != "image" || live.contains(&i) && admit.admit(b.images[0]) { b.clone() } else { text(DROPPED) });
+            let content = p.blocks.iter().map(|b| if b.kind != "image" || live.contains(&i) && admit(b.images[0]) { b.clone() } else { text(DROPPED) });
             Turn::new(&p.participant, content.collect(), Some(i))
         })
         .collect();
-    out.reverse();
-    out
+    newest_first.into_iter().rev().collect()
 }
 
 /// A memory's recall answer under carrierPolicy 'live-strip' (liveWindowAnswerProse): the reply's
@@ -139,24 +144,6 @@ pub fn recalled(memory: &Value, level: u64) -> Vec<Block> {
 pub fn recall_tokens(answer: &[Value], cfg: &Config) -> f64 {
     let quarter = |s: &str| (js_len(s) as f64 / 4.0).ceil();
     quarter(&cfg.summary_label) + answer.iter().map(|b| quarter(b["text"].as_str().unwrap_or(""))).fold(0.0, |a, x| a + x)
-}
-
-/// placeCacheMarkers: the end of the prefix unchanged since the previous compile (before any, the
-/// last entry ahead of the tail), and the last entry. An entry's key is where its blocks are, which
-/// says what they hold, since records never change.
-fn cache_marks(keys: &[String], in_tail: &[bool], previous: Option<&Vec<Value>>) -> Vec<usize> {
-    if keys.is_empty() {
-        return vec![];
-    }
-    let stable = match previous {
-        None => in_tail.iter().position(|&t| t).unwrap_or(keys.len()),
-        Some(previous) => keys.iter().zip(previous).take_while(|(a, b)| b.as_str() == Some(a)).count(),
-    };
-    let mut marks = vec![keys.len() - 1];
-    if stable >= 1 {
-        marks.push(stable - 1);
-    }
-    marks
 }
 
 /// Per file: the id read last, its record, and the scan it came from.
@@ -197,10 +184,9 @@ impl<'s> Reader<'s> {
         };
         let record = self.read(file, i);
         let mut block = if file == "messages" { record["content"].arr()[j].clone() } else { answer(record).swap_remove(j) };
-        let mut seen = 0..;
-        if let (false, Some(Value::Array(nested))) = (dropped.is_empty(), block.get_mut("content")) {
-            for c in nested.iter_mut().filter(|c| c.kind() == "image") {
-                if dropped.contains(&seen.next().unwrap()) {
+        if let Some(Value::Array(nested)) = block.get_mut("content") {
+            for (k, c) in nested.iter_mut().filter(|c| c.kind() == "image").enumerate() {
+                if dropped.contains(&k) {
                     *c = obj! {"type" => "text", "text" => DROPPED};
                 }
             }

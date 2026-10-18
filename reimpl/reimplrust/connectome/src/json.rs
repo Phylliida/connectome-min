@@ -16,8 +16,6 @@ pub trait Json {
     fn u64(&self) -> u64;
     /// A record's id.
     fn id(&self) -> u64;
-    /// Python's truthiness.
-    fn truthy(&self) -> bool;
 }
 
 impl Json for Value {
@@ -35,17 +33,6 @@ impl Json for Value {
 
     fn id(&self) -> u64 {
         self["id"].u64()
-    }
-
-    fn truthy(&self) -> bool {
-        match self {
-            Value::Null => false,
-            Value::Bool(b) => *b,
-            Value::Number(n) => n.as_f64() != Some(0.0),
-            Value::String(s) => !s.is_empty(),
-            Value::Array(a) => !a.is_empty(),
-            Value::Object(o) => !o.is_empty(),
-        }
     }
 }
 

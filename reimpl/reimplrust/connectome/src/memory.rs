@@ -23,7 +23,7 @@ use crate::emit::{answer, recall_tokens, recalled, Reader};
 use crate::js::{digest, is_js_space, js_len, js_round, js_trim};
 use crate::json::{sparse, Json, Value};
 use crate::obj;
-use crate::planner::chunks;
+use crate::planner::{chunks, Node};
 use crate::store::Session;
 use crate::turns::{cap_images, normalize, say, strip_reasoning, Turn, LABEL};
 
@@ -48,9 +48,9 @@ Nothing happened worth remembering.)";
 /// The host's side of a call.
 pub trait Host {
     /// The agent's live tool definitions, once declared.
-    fn tools(&self) -> Option<&Value>;
+    fn tools(&self) -> Option<&Value> { None }
     /// The host's system prompt, once declared.
-    fn system(&self) -> Option<&str>;
+    fn system(&self) -> Option<&str> { None }
     /// The summarizer's response {stopReason, content, usage}, or why the call failed. The request's
     /// blocks are read through `reader` as the host writes them out.
     fn complete(&mut self, request: &Request, reader: &mut Reader) -> Result<Value, String>;
@@ -77,76 +77,57 @@ impl Request {
     }
 }
 
-/// Form the memory that's due, if it may be tried: (whether a call was made, the error if it failed).
-pub fn tick(session: &Session, host: &mut dyn Host, cfg: &Config) -> (bool, Option<String>) {
-    let Some((level, p)) = due(session, cfg).filter(|&target| !blocked(session, target, cfg)) else { return (false, None) };
-    if level == 1
-        && let Some(stub) = quiet(session, p, cfg)
-    {
-        session.append("layer1", stub);
-        return (false, None);
+/// driveTick: the memories that are due form, in order (a stub without a call), until one makes a
+/// call or none may be tried; the error a failed call gave, if one did.
+pub fn drive(session: &Session, host: &mut dyn Host, cfg: &Config) -> Option<String> {
+    loop {
+        let (level, p) = due(session, cfg).filter(|&target| !blocked(session, target, cfg))?;
+        if level == 1
+            && let Some(stub) = quiet(session, p, cfg)
+        {
+            session.append("layer1", stub);
+            continue;
+        }
+        // an L1 waits while it carries tool blocks and the host has declared no tools
+        let request = if level == 1 { l1_request(session, p, host, cfg)? } else { merge_request(session, level, p, host, cfg) };
+        let (outcome, error) = match host.complete(&request, &mut Reader::new(session, true)) {
+            Err(error) => ("retry", Some(error)),
+            Ok(response) if response["stopReason"] == "refusal" => ("refusal", None),
+            Ok(response) => match usable(&response) {
+                None => ("retry", None),
+                Some(text) => {
+                    session.append(&format!("layer{level}"), written(session, level, p, &request, &response, text, cfg));
+                    return None;
+                }
+            },
+        };
+        session.append("attempts", obj! {"target" => vec![level, p], "messages" => session.count("messages"), "outcome" => outcome});
+        return error;
     }
-    let request = if level == 1 { l1_request(session, p, host, cfg) } else { Some(merge_request(session, level, p, host, cfg)) };
-    let Some(request) = request else { return (false, None) }; // deferred until the host declares its tools
-    let (outcome, error) = match host.complete(&request, &mut Reader::new(session, true)) {
-        Err(error) => ("retry", Some(error)),
-        Ok(response) if response["stopReason"] == "refusal" => ("refusal", None),
-        Ok(response) => match usable(&response) {
-            text if text.is_empty() => ("retry", None),
-            text => {
-                session.append(&format!("layer{level}"), written(session, level, p, &request, &response, text, cfg));
-                return (true, None);
-            }
-        },
-    };
-    session.append("attempts", obj! {"target" => vec![level, p], "messages" => session.count("messages"), "outcome" => outcome});
-    (true, error)
 }
 
 /// The memory to form next: the next L1, else the lowest level's next merge.
 fn due(session: &Session, cfg: &Config) -> Option<(u64, u64)> {
-    let (k, closed, l1s) = (cfg.merge_threshold, session.count("layer0"), session.count("layer1"));
-    let escalated = session.last("compiles").is_some_and(|c| c["escalated"].truthy());
-    if l1s < closed.saturating_sub(if escalated { 0 } else { cfg.l1_holdback_chunks }) {
-        return Some((1, l1s));
-    }
-    for n in 1.. {
-        let have = session.count(&format!("layer{n}"));
-        if have < k {
-            return None;
-        }
-        let p = session.count(&format!("layer{}", n + 1));
-        if p * k + k <= have {
-            return Some((n + 1, p));
-        }
-    }
-    unreachable!()
+    let (k, count) = (cfg.merge_threshold, |n: u64| session.count(&format!("layer{n}")));
+    let holdback = if session.last("compiles").is_some_and(|c| c["escalated"] == true) { 0 } else { cfg.l1_holdback_chunks };
+    let merge = || (1..).take_while(|&n| count(n) >= k).find(|&n| count(n + 1) * k + k <= count(n)).map(|n| (n + 1, count(n + 1)));
+    (count(1) < count(0).saturating_sub(holdback)).then(|| (1, count(1))).or_else(merge)
 }
 
 /// Memory formation stops at a refusal: nothing is tried after one, so it stays the attempts log's
 /// last record until surgery appends another. A target also waits for the log to grow once it failed
 /// attempt_limit times at the log's length.
 fn blocked(session: &Session, (level, p): (u64, u64), cfg: &Config) -> bool {
-    if session.last("attempts").is_some_and(|a| a["outcome"].as_str() == Some("refusal")) {
-        return true;
-    }
     let (now, target) = (session.count("messages"), Value::from(vec![level, p]));
     let recent = (0..session.count("attempts")).rev().map(|i| session.read("attempts", i)).take_while(|a| a["messages"].u64() == now);
-    recent.filter(|a| a["target"] == target).count() >= cfg.attempt_limit
+    session.last("attempts").is_some_and(|a| a["outcome"] == "refusal") || recent.filter(|a| a["target"] == target).count() >= cfg.attempt_limit
 }
 
 /// The stub for a chunk of text blocks only under min_chunk_chars of trimmed text.
 fn quiet(session: &Session, p: u64, cfg: &Config) -> Option<Value> {
     let (first, last) = span(session, 1, p, cfg);
-    let mut chars = 0;
-    for message in session.span("messages", first, last) {
-        for b in message["content"].arr() {
-            if b.kind() != "text" {
-                return None;
-            }
-            chars += js_len(js_trim(b["text"].as_str().unwrap_or("")));
-        }
-    }
+    let text = |b: &Value| (b.kind() == "text").then(|| js_len(js_trim(b["text"].as_str().unwrap_or(""))));
+    let chars: usize = session.span("messages", first, last).map(|m| m["content"].arr().iter().map(text).sum::<Option<usize>>()).sum::<Option<usize>>()?;
     (chars < cfg.min_chunk_chars).then(|| memory(first, last, &QUIET.replace("{n}", &(last - first + 1).to_string()), Value::Null, 40.0, Value::Null, cfg))
 }
 
@@ -154,26 +135,22 @@ fn quiet(session: &Session, p: u64, cfg: &Config) -> Option<Value> {
 /// no tools and the request carries tool blocks, which a provider takes only with their tools.
 fn l1_request(session: &Session, p: u64, host: &dyn Host, cfg: &Config) -> Option<Request> {
     let (first, last) = span(session, 1, p, cfg);
-    let mut task = vec![say(MARKER)];
-    task.extend(raw(session, first, last));
-    task.push(say(&INSTRUCTION.replace("{target}", &number(cfg.summary_target_tokens))));
-    let request = ask(session, first, task, host, cfg);
+    let task = [vec![say(MARKER)], raw(session, first, last), vec![say(&INSTRUCTION.replace("{target}", &number(cfg.summary_target_tokens)))]];
+    let request = ask(session, first, task.concat(), host, cfg);
     let tools_used = request.messages.iter().flat_map(|t| &t.content).any(|b| b.kind == "tool_use" || b.kind == "tool_result");
-    (host.tools().is_some_and(Value::truthy) || !tools_used).then_some(request)
+    (host.tools().is_some_and(|tools| !tools.arr().is_empty()) || !tools_used).then_some(request)
 }
 
 /// executeMerge's request for layer `level`'s entry p: the run one level deeper (an L1 run's
 /// messages raw, a higher run's children as recall pairs), then the merge instruction.
 fn merge_request(session: &Session, level: u64, p: u64, host: &dyn Host, cfg: &Config) -> Request {
     let (k, below, (first, last)) = (cfg.merge_threshold, level - 1, span(session, level, p, cfg));
-    let mut shown = if below == 1 {
-        raw(session, first, last)
+    let (mut shown, seen) = if below == 1 {
+        (raw(session, first, last), "the slices of recent experience above (raw conversation)".to_string())
     } else {
-        let layer = format!("layer{}", below - 1);
-        let children: Vec<Recall> = session.span(&layer, p * k * k, (p + 1) * k * k - 1).map(|m| Recall::of(below - 1, &m)).collect();
-        pairs(session, &children, cfg)
+        let children: Vec<Node> = (p * k * k..(p + 1) * k * k).map(|id| (below - 1, id)).collect();
+        (pairs(session, &children, cfg), format!("the L{} memories above", below - 1))
     };
-    let seen = if below > 1 { format!("the L{} memories above", below - 1) } else { "the slices of recent experience above (raw conversation)".into() };
     let instruction = MERGE_INSTRUCTION.replace("{seen}", &seen).replace("{level}", &level.to_string()).replace("{target}", &number(cfg.summary_target_tokens));
     shown.push(say(&instruction));
     ask(session, first, shown, host, cfg)
@@ -183,14 +160,10 @@ fn merge_request(session: &Session, level: u64, p: u64, host: &dyn Host, cfg: &C
 /// message `before` that fit the recall budget at their tokens plus 50 (capRecallPairs); normalized
 /// for the provider, images capped; cache seams follow unless the budget left a memory out.
 fn ask(session: &Session, before: u64, task: Vec<Turn>, host: &dyn Host, cfg: &Config) -> Request {
-    let prior = unmerged(session, before, cfg);
-    let (mut kept, mut used) = (vec![], 0.0);
-    for m in prior.iter().rev() {
-        if used + m.tokens + 50.0 <= cfg.recall_budget_tokens {
-            kept.insert(0, m.clone());
-            used += m.tokens + 50.0;
-        }
-    }
+    let (prior, mut used) = (unmerged(session, before, cfg), 0.0);
+    let fits = |&&(_, tokens): &&(Node, f64)| used + tokens + 50.0 <= cfg.recall_budget_tokens && { used += tokens + 50.0; true };
+    let mut kept: Vec<Node> = prior.iter().rev().filter(fits).map(|&(node, _)| node).collect();
+    kept.reverse();
     let mut turns = pairs(session, &kept, cfg);
     turns.extend(task);
     let mut wire = cap_images(normalize(turns), cfg.compression_image_bytes);
@@ -209,46 +182,29 @@ fn ask(session: &Session, before: u64, task: Vec<Turn>, host: &dyn Host, cfg: &C
     }
 }
 
-/// What a request needs of a memory it replays, without its text.
-#[derive(Clone)]
-struct Recall {
-    level: u64,
-    id: u64,
-    first: f64,
-    tokens: f64,
-}
-
-impl Recall {
-    fn of(level: u64, m: &Value) -> Recall {
-        Recall { level, id: m.id(), first: m["first"].as_f64().unwrap(), tokens: m["tokens"].as_f64().unwrap() }
-    }
-}
-
-/// Each memory no merge has taken that ends before message `before`, oldest first.
-fn unmerged(session: &Session, before: u64, cfg: &Config) -> Vec<Recall> {
-    let mut out = vec![];
-    for n in (1..).take_while(|n| session.count(&format!("layer{n}")) > 0) {
-        let (layer, have) = (format!("layer{n}"), session.count(&format!("layer{n}")));
-        let start = session.count(&format!("layer{}", n + 1)) * cfg.merge_threshold;
-        out.extend(session.span(&layer, start, have - 1).filter(|m| m["last"].as_f64().unwrap() < before as f64).map(|m| Recall::of(n, &m)));
-    }
-    out.sort_by(|a, b| a.first.total_cmp(&b.first));
-    out
+/// Each memory no merge has taken that ends before message `before`, and its tokens, oldest first: a
+/// level's are all older than the next level down's, since merges take each level's oldest.
+fn unmerged(session: &Session, before: u64, cfg: &Config) -> Vec<(Node, f64)> {
+    let count = |n: u64| session.count(&format!("layer{n}"));
+    let levels: Vec<u64> = (1..).take_while(|&n| count(n) > 0).collect();
+    let level = |n: u64| session.span(&format!("layer{n}"), count(n + 1) * cfg.merge_threshold, count(n) - 1);
+    let ended = |m: &Value| m["last"].as_f64().unwrap() < before as f64;
+    levels.into_iter().rev().flat_map(|n| level(n).filter(ended).map(move |m| ((n, m.id()), m["tokens"].as_f64().unwrap()))).collect()
 }
 
 /// Recall pairs: a turn naming each memory, then its answer as the agent.
-fn pairs(session: &Session, memories: &[Recall], cfg: &Config) -> Vec<Turn> {
-    let pair = |m: &Recall| {
-        let answer = recalled(&session.read(&format!("layer{}", m.level), m.id), m.level);
-        [say(&format!("[CM] Recall memory L{}-{}.", m.level, m.id)), Turn::new(&cfg.summary_participant, answer, None)]
+fn pairs(session: &Session, memories: &[Node], cfg: &Config) -> Vec<Turn> {
+    let pair = |&(level, id): &Node| {
+        let answer = recalled(&session.read(&format!("layer{level}"), id), level);
+        [say(&format!("[CM] Recall memory L{level}-{id}.")), Turn::new(&cfg.summary_participant, answer, None)]
     };
     memories.iter().flat_map(pair).collect()
 }
 
 /// applyMintCacheSeams: the turns a breakpoint follows: the one before the first recall pair, the
 /// newest pair above L1's answer, and the newest pair's answer. None without pairs.
-fn seams(wire: &[Turn], kept: &[Recall]) -> Vec<usize> {
-    let level_of = |name: &str| kept.iter().find(|m| format!("L{}-{}", m.level, m.id) == name).map(|m| m.level);
+fn seams(wire: &[Turn], kept: &[Node]) -> Vec<usize> {
+    let level_of = |name: &str| kept.iter().find(|(level, id)| format!("L{level}-{id}") == name).map(|&(level, _)| level);
     let found: Vec<(usize, u64)> = wire.iter().enumerate().filter_map(|(i, t)| header(t).and_then(level_of).map(|level| (i, level))).collect();
     let (Some(&(first, _)), Some(&(last, _))) = (found.first(), found.last()) else { return vec![] };
     let above_l1 = found.iter().filter(|&&(_, level)| level >= 2).map(|&(i, _)| i + 1).max();
@@ -269,28 +225,18 @@ fn raw(session: &Session, first: u64, last: u64) -> Vec<Turn> {
 
 /// A finished reply's memory text: its text blocks, less a leading <thinking>…</thinking>
 /// (stripThinkingPreamble); empty for a reply cut short, malformed, empty, or all thinking.
-pub fn usable(response: &Value) -> String {
-    let Value::Array(content) = &response["content"] else { return String::new() };
-    if response["stopReason"].as_str() != Some("end_turn") || !content.iter().all(|b| b.is_object()) {
-        return String::new();
-    }
-    let texts: Vec<&str> = content.iter().filter(|b| b["type"].as_str() == Some("text")).filter_map(|b| b["text"].as_str()).collect();
-    let joined = texts.join("\n");
-    let text = strip_thinking(&joined);
-    if js_trim(text).is_empty() { String::new() } else { text.to_string() }
+pub fn usable(response: &Value) -> Option<String> {
+    let content = response["content"].as_array().filter(|c| response["stopReason"] == "end_turn" && c.iter().all(Value::is_object))?;
+    let joined = content.iter().filter(|b| b.kind() == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n");
+    Some(strip_thinking(&joined)).filter(|text| !js_trim(text).is_empty()).map(str::to_string)
 }
 
 /// The text after a leading <thinking>…</thinking> and the spaces around it; none if it opens one
 /// it never closes (ASCII case ignored).
 fn strip_thinking(text: &str) -> &str {
     let rest = text.trim_start_matches(is_js_space);
-    if !rest.get(..10).is_some_and(|open| open.eq_ignore_ascii_case("<thinking>")) {
-        return text;
-    }
-    match rest[10..].to_ascii_lowercase().find("</thinking>") {
-        Some(k) => rest[10 + k + 11..].trim_start_matches(is_js_space),
-        None => "",
-    }
+    let Some(inside) = rest.get(..10).filter(|open| open.eq_ignore_ascii_case("<thinking>")).map(|_| &rest[10..]) else { return text };
+    inside.to_ascii_lowercase().find("</thinking>").map_or("", |k| inside[k + 11..].trim_start_matches(is_js_space))
 }
 
 /// The memory a reply wrote: its text, its reasoning and text blocks if it reasoned
@@ -299,14 +245,10 @@ fn strip_thinking(text: &str) -> &str {
 fn written(session: &Session, level: u64, p: u64, request: &Request, response: &Value, text: String, cfg: &Config) -> Value {
     let ((first, last), content) = (span(session, level, p, cfg), response["content"].arr());
     let out = response["usage"]["outputTokens"].as_f64();
-    let blocks = if content.iter().any(|b| reasoning(b.kind())) {
-        Value::Array(content.iter().filter(|b| reasoning(b.kind()) || b.kind() == "text").cloned().collect())
-    } else {
-        Value::Null
-    };
+    let blocks = content.iter().any(|b| reasoning(b.kind())).then(|| content.iter().filter(|b| reasoning(b.kind()) || b.kind() == "text").cloned().collect::<Vec<_>>());
     let tokens = out.filter(|&o| o > 0.0).unwrap_or_else(|| (js_len(&text) as f64 / 3.0).ceil());
     let provenance = obj! {"stopReason" => "end_turn", "requestHash" => digest(&request.value(|b| b.at.value())), "model" => cfg.compression_model.as_str()};
-    memory(first, last, &text, blocks, tokens, provenance, cfg)
+    memory(first, last, &text, blocks.into(), tokens, provenance, cfg)
 }
 
 /// The first and last message of the stretch layer `level`'s entry p covers: from its first chunk's

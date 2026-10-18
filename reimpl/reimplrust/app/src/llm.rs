@@ -99,11 +99,9 @@ impl Reply {
             "content_block_start" => self.blocks.push(e["content_block"].clone()),
             "content_block_delta" => {
                 let block = self.blocks.last_mut().ok_or("a delta before its block")?;
-                let key = match e["delta"].kind() {
-                    "text_delta" => "text",
-                    "thinking_delta" => "thinking",
-                    "signature_delta" => "signature",
-                    "input_json_delta" => "partial_json", // a tool call's input, parsed once whole
+                let key = match e["delta"].kind().strip_suffix("_delta") {
+                    Some(key @ ("text" | "thinking" | "signature")) => key,
+                    Some("input_json") => "partial_json", // a tool call's input, parsed once whole
                     _ => return Ok(()),
                 };
                 let more = e["delta"][key].as_str().unwrap_or("");

@@ -18,24 +18,13 @@ pub fn runs(start: u64, stop: u64, size: impl Fn(u64) -> f64, full: impl Fn(&[u6
 
 /// An admission budget: admit(n) says whether one more item of n bytes fits within `count` items
 /// and `size` bytes in all, 0 meaning no limit, and counts it if it does.
-pub struct Budget {
-    count: usize,
-    size: usize,
-    kept: usize,
-    kept_bytes: usize,
-}
-
-impl Budget {
-    pub fn new(count: usize, size: usize) -> Budget {
-        Budget { count, size, kept: 0, kept_bytes: 0 }
-    }
-
-    pub fn admit(&mut self, n: usize) -> bool {
-        if 0 < self.count && self.count <= self.kept || 0 < self.size && self.size < self.kept_bytes + n {
-            return false;
+pub fn budget(count: usize, size: usize) -> impl FnMut(usize) -> bool {
+    let (mut kept, mut kept_bytes) = (0, 0);
+    move |n| {
+        let fits = !(0 < count && count <= kept || 0 < size && size < kept_bytes + n);
+        if fits {
+            (kept, kept_bytes) = (kept + 1, kept_bytes + n);
         }
-        self.kept += 1;
-        self.kept_bytes += n;
-        true
+        fits
     }
 }

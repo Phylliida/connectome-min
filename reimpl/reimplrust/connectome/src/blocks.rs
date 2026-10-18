@@ -28,7 +28,7 @@ pub fn raw_tokens(b: &Value) -> f64 {
     let thinking = &b["thinking"];
     match b.kind() {
         "thinking" | "redacted_thinking" if stamped.is_some() => stamped.unwrap(),
-        "thinking" if b["signature"].as_str().is_some_and(|s| !s.is_empty()) && !thinking.truthy() => HIDDEN_THINKING,
+        "thinking" if b["signature"].as_str().is_some_and(|s| !s.is_empty()) && thinking.as_str().is_none_or(str::is_empty) => HIDDEN_THINKING,
         "thinking" => density_tokens(thinking.as_str().unwrap_or("")),
         "text" if b.get("text").is_some() => density_tokens(b["text"].as_str().unwrap_or("")),
         "redacted_thinking" => match b["data"].as_str() {
@@ -50,17 +50,9 @@ pub fn raw_tokens(b: &Value) -> f64 {
 /// 2.3 chars/token when over 12% of the first 2000 code units are above U+007E or JSON/code
 /// punctuation, otherwise 2.9.
 pub fn density_tokens(text: &str) -> f64 {
-    if text.is_empty() {
-        return 0.0;
-    }
-    let (mut units, mut prose) = (0usize, 0usize);
-    for c in text.chars() {
-        if units < 2000 && c < '\u{7f}' && !"{}[]\":_/=`".contains(c) {
-            prose += 1;
-        }
-        units += c.len_utf16();
-    }
-    let n = units.min(2000);
+    let prose = |units: usize, c: char| (units < 2000 && c < '\u{7f}' && !"{}[]\":_/=`".contains(c)) as usize;
+    let (units, prose) = text.chars().fold((0, 0), |(units, n), c| (units + c.len_utf16(), n + prose(units, c)));
+    let n = units.min(2000); // none: 0/0 isn't over 0.12, and no units cost nothing
     (units as f64 / if (n - prose) as f64 / n as f64 > 0.12 { DENSE } else { PROSE }).ceil()
 }
 
@@ -81,10 +73,7 @@ impl At {
     /// As the Python port writes it: [file, id, index, *dropped] or the block.
     pub fn value(&self) -> Value {
         match self {
-            At::Disk(file, id, j, dropped) => {
-                let head = [Value::from(file.as_str()), Value::from(*id), Value::from(*j)];
-                Value::Array(head.into_iter().chain(dropped.iter().map(|&k| Value::from(k))).collect())
-            }
+            At::Disk(file, id, j, dropped) => [file.as_str().into(), Value::from(*id), Value::from(*j)].into_iter().chain(dropped.iter().map(|&k| k.into())).collect(),
             At::Itself(block) => block.clone(),
         }
     }
