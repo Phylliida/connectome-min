@@ -6,6 +6,7 @@ tail. Images count only in the tail, newest first within the live limits; elsewh
 stands for each.
 """
 import math
+from functools import lru_cache
 
 from config import Config
 from estimate import Priced, price, store_tokens
@@ -22,7 +23,7 @@ def tail_start(session: Session, multiplier: float, cfg: Config) -> int:
     for message in session.backwards('messages'):
         if message['id'] < floor:
             break
-        total += live_price(p := priced(session, message), multiplier, admit)
+        total += live_price(p := priced(session, message['id']), multiplier, admit)
         if total > cfg.recent_window_tokens:
             return message['id'] + 1 - (after is not None and 'tool_result' in after.kinds)
         after = p
@@ -37,16 +38,17 @@ def open_start(session: Session) -> int:
 def close_chunks(session: Session, multiplier: float, cfg: Config) -> None:
     """Append the chunks that close now: the open run, from the last chunk to the tail, in full runs."""
     messages = list(session.span('messages', open_start(session), tail_start(session, multiplier, cfg) - 1))
-    p = [priced(session, m) for m in messages]
+    p = [priced(session, m['id']) for m in messages]
     full = lambda run, total: total >= cfg.target_chunk_tokens and len(run) >= 4 and 'tool_use' not in p[run[-1]].kinds
     for run in runs(0, len(messages), lambda i: True, lambda i: p[i].text_only, full):
         session.append('layer0', {'first': messages[run[0]]['id'], 'last': messages[run[-1]]['id'],
                                   'raw': sum(stripped_raw(p[i]) for i in run)})
 
 
-def priced(session: Session, message: dict) -> Priced:
-    """estimate.price of a logged message, once while the session caches it."""
-    return session.memo(('price', message['id']), lambda: price(message))
+@lru_cache(maxsize=4096)
+def priced(session: Session, i: int) -> Priced:
+    """estimate.price of logged message i, kept while recently used (messages never change)."""
+    return price(session.get('messages', i))
 
 
 def live_price(p: Priced, multiplier: float, admit) -> float:

@@ -1,0 +1,9 @@
+[package]
+name = "connectome-web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+connectome = { version = "0.1.0", path = "../connectome" }
+open = "5.4.4"
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }

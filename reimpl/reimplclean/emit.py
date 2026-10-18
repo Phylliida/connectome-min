@@ -7,8 +7,6 @@ pairing is repaired, and up to three cache breakpoints are placed. A compile ove
 refused; only a compile that completes commits its frontier and arms calibration, and a refused one
 that couldn't fold enough marks the session escalated, so the next L1 doesn't wait for newer chunks.
 """
-import hashlib
-import json
 import math
 from functools import cache
 from itertools import takewhile
@@ -17,7 +15,7 @@ from typing import NamedTuple
 from chunking import close_chunks, live_price, open_start, priced, stripped_raw, tail_start
 from config import Config
 from estimate import Calibration
-from js import js_len, js_trim
+from js import js_len, js_trim, sha256
 from blocks import REASONING, image_bytes
 from planner import chunks, plan
 from segment import budget
@@ -46,7 +44,7 @@ def select(session: Session, W: float, calibration: Calibration, cfg: Config) ->
     admit = budget(cfg.max_live_images, cfg.max_live_image_bytes)
     live = {msg['id'] for msg in loose if msg['id'] >= tail}
     fixed = sum(live_price(p, m, admit) if msg['id'] in live else round(stripped_raw(p) * m)
-                for msg in reversed(loose) for p in [priced(session, msg)])
+                for msg in reversed(loose) for p in [priced(session, msg['id'])])
     frontier = plan(frontier, cost, cache(lambda node: node[1] < count(node[0])), fixed, W, cfg)
     total, limit = fixed + sum(map(cost, frontier)), math.floor(W * (1 + cfg.over_budget_grace))
     if total > limit:
@@ -58,7 +56,7 @@ def select(session: Session, W: float, calibration: Calibration, cfg: Config) ->
     entries = pair_tools(entries)
     if loose and not any(e['source'] == loose[-1]['id'] for e in entries):
         return Refusal('Structural repair did not retain the newest turn', total, limit)
-    keys = [hashlib.sha256(json.dumps([e['participant'], e['content']]).encode()).hexdigest() for e in entries]
+    keys = [sha256([e['participant'], e['content']]) for e in entries]
     marks = cache_marks(keys, [e['source'] in live for e in entries], last.get('keys'))
     session.append('compiles', {'frontier': frontier, 'multiplier': m, 'armed': total, 'keys': keys, 'escalated': total > W})
     return [part for i, e in enumerate(entries) for part in split(e, i in marks)]

@@ -1,0 +1,47 @@
+# Builds connectome-web (reimpl/reimplrust) for Linux, Windows and macOS on each platform's own runner.
+# Each binary is standalone: TLS (rustls, ring, Mozilla's roots) is compiled in, and the Linux ones are
+# static (musl). The static x86_64 Linux build runs the whole test suite; the others run the unit tests
+# where the runner can run them. Download the binaries from the run's artifacts.
+name: connectome-web
+
+on:
+  push:
+    paths: ['reimpl/reimplrust/**', 'reimpl/reimplclean2/**', '.github/workflows/connectome-web.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, bin: connectome-web, name: connectome-web-linux-x86_64, suite: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, bin: connectome-web, name: connectome-web-linux-arm64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, bin: connectome-web.exe, name: connectome-web-windows-x86_64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, bin: connectome-web, name: connectome-web-macos-arm64 }
+          - { os: macos-latest, target: x86_64-apple-darwin, bin: connectome-web, name: connectome-web-macos-x86_64, cross: true }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: reimpl/reimplrust
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools   # ring's C, for musl
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p connectome-web
+      - if: ${{ !matrix.cross }}
+        run: cargo test --release --locked --target ${{ matrix.target }} -p connectome
+      - if: matrix.suite
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - if: matrix.suite
+        run: |
+          pip install cryptography
+          CONNECTOME_WEB=$PWD/target/${{ matrix.target }}/release/connectome-web python3 tests/test_app.py
+          python3 tests/test_rust.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: reimpl/reimplrust/target/${{ matrix.target }}/release/${{ matrix.bin }}

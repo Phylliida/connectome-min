@@ -1,0 +1,10 @@
+[package]
+name = "connectome"
+version = "0.1.0"
+edition = "2024"
+description = "Autobiographical context compaction (a port of reimplclean2): sessions on disk, a lazy counter over a k-ary memory pyramid, and contexts streamed from disk."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+smart-default = "0.7.1"
+serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }

@@ -36,21 +36,11 @@ def collapse(turns: list[dict]) -> list[dict]:
             for p, run in groupby(turns, lambda t: t['participant'])]
 
 
-def drop_unpaired(turns: list[dict]) -> list[dict]:
-    """stripUnpairedToolBlocks: tool blocks whose partner is nowhere in the request go; a turn they
-    leave empty says a call was omitted."""
-    uses = {b['id'] for t in turns for b in t['content'] if b['type'] == 'tool_use'}
-    results = {b['toolUseId'] for t in turns for b in t['content'] if b['type'] == 'tool_result'}
-    keep = lambda b: b['id'] in results if b['type'] == 'tool_use' else b['toolUseId'] in uses if b['type'] == 'tool_result' else True
-    return [{'participant': t['participant'], 'content': [b for b in t['content'] if keep(b)] or [OMITTED] * bool(t['content'])}
-            for t in turns]
-
-
 def normalize(turns: list[dict]) -> list[dict]:
     """Turns as a provider takes them: mixed tool turns split, a participant's consecutive turns
-    joined, tool blocks whose partner is nowhere in them dropped, then blank text, empty turns and
-    stale cache_control markers."""
-    joined = drop_unpaired(collapse([part for t in turns for part in split(t, False)]))
+    joined, tool pairing repaired (pair_tools), then blank text, empty turns and stale cache_control
+    markers dropped."""
+    joined = pair_tools(collapse([part for t in turns for part in split(t, False)]))
     return [{'participant': t['participant'], 'content': c} for t in joined if (c := [
         {k: v for k, v in b.items() if k != 'cache_control'} for b in t['content'] if b['type'] != 'text' or js_trim(b['text'])])]
 

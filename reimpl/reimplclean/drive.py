@@ -8,12 +8,11 @@ on disk. At each step boundary:
 """
 from itertools import count, takewhile
 
-from calls import Host
 from chunking import close_chunks
 from config import Config
 from emit import Refusal, select
 from estimate import Calibration
-from memory import tick
+from memory import Host, tick
 from store import Session
 
 

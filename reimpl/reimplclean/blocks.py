@@ -1,7 +1,6 @@
 """Every rule of @animalabs/context-manager 0.10.1 that turns on a block's type, one table per
-question: a block's store and text-only prices, its image bytes, and whether a reply's block is
-well-formed. Blocks are the library's dicts ({'type': 'text', 'text': ...}); lengths are JavaScript's
-(js.py)."""
+question: a block's store and text-only prices, and its image bytes. Blocks are the library's dicts
+({'type': 'text', 'text': ...}); lengths are JavaScript's (js.py)."""
 import math
 import re
 from functools import reduce
@@ -56,19 +55,3 @@ def image_bytes(block) -> int:
     match block:
         case {'source': {'data': str() as data}}: return js_len(data)
     return 0
-
-
-def well_formed(block) -> bool:
-    """fallbackContentBlockError finds nothing wrong."""
-    source = lambda s, url: isinstance(s, dict) and (url and s.get('type') == 'url' and isinstance(s.get('url'), str) or s.get(
-        'type') == 'base64' and isinstance(s.get('data'), str) and isinstance(s.get('mediaType'), str))
-    match block:
-        case {'type': 'text', 'text': str()} | {'type': 'redacted_thinking', 'data': str()}: return True
-        case {'type': 'thinking', 'thinking': str()}: return isinstance(block.get('signature', ''), str)
-        case {'type': 'tool_use', 'id': str(), 'name': str(), 'input': dict()}: return True
-        case {'type': 'tool_result', 'toolUseId': str(), 'content': str()}: return True
-        case {'type': 'tool_result', 'toolUseId': str(), 'content': list() as nested}: return all(map(well_formed, nested))
-        case {'type': 'image'}: return source(block.get('source'), True)
-        case {'type': 'document' | 'audio' | 'video'}: return source(block.get('source'), False)
-        case {'type': 'generated_image', 'data': str(), 'mimeType': str()}: return True
-    return False

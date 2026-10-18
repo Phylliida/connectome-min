@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connectome</title>
+<style>
+:root {
+  --bg: #f7f6f3; --panel: #ffffff; --ink: #1d1c1a; --muted: #6b6862; --line: #e3e0da;
+  --accent: #2f6fdf; --tail: #2f9e6a; --raw: #8a8780; --warn: #c2410c;
+  --l1: #c9dcfb; --l2: #a5c4f6; --l3: #7ea8ee; --l4: #5a8de4; --l5: #3d72d6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161615; --panel: #1f1f1d; --ink: #ecebe7; --muted: #9a978f; --line: #33322f;
+    --accent: #6b9cf5; --tail: #4cc38a; --raw: #8f8c85; --warn: #f97316;
+    --l1: #23375c; --l2: #2b4778; --l3: #345a97; --l4: #3f6db5; --l5: #4b82d4;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, sans-serif; }
+main { display: grid; grid-template-columns: 220px 1fr 360px; height: 100vh; }
+aside, section { overflow: auto; padding: 16px; }
+aside { border-right: 1px solid var(--line); }
+#memory { border-left: 1px solid var(--line); border-right: 0; }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
+button, input, textarea { font: inherit; color: inherit; }
+button { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+input, textarea { width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+#sessions a { display: block; padding: 4px 6px; border-radius: 6px; color: inherit; text-decoration: none; }
+#sessions a.on { background: var(--panel); outline: 1px solid var(--line); }
+#sessions small { color: var(--muted); }
+.settings { display: flex; flex-direction: column; gap: 6px; padding: 0; border: 0; }
+.settings label { font-size: 12px; color: var(--muted); }
+.settings small { color: var(--muted); font-size: 12px; }
+#chat { display: flex; flex-direction: column; padding: 0; }
+#log { flex: 1; overflow: auto; padding: 16px; }
+.msg { position: relative; background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--raw); border-radius: 6px; padding: 8px 10px; margin: 0 0 8px; white-space: pre-wrap; word-wrap: break-word; }
+.msg.tail { border-left-color: var(--tail); }
+.msg.recalled { opacity: .55; }
+.msg .who { font-size: 12px; color: var(--muted); }
+.thinking { color: var(--muted); font-style: italic; margin: 2px 0 6px; }
+.thinking summary { cursor: pointer; font-style: normal; font-size: 12px; }
+.msg button { position: absolute; top: 6px; right: 6px; font-size: 12px; padding: 1px 6px; display: none; }
+.msg:hover button { display: block; }
+form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
+form textarea { resize: vertical; min-height: 42px; }
+#status { color: var(--muted); font-size: 12px; padding: 0 16px 8px; min-height: 18px; }
+#status.warn { color: var(--warn); }
+.pyramid { display: flex; flex-direction: column; gap: 3px; margin: 8px 0 12px; }
+.row { position: relative; height: 18px; }
+.cell { position: absolute; top: 0; bottom: 0; border-radius: 3px; border: 1px solid transparent; cursor: pointer; min-width: 2px; }
+.cell.shown { border-color: var(--ink); }
+.row.chunks .cell { background: var(--raw); opacity: .5; }
+.row.chunks .cell.shown { opacity: 1; }
+.legend { font-size: 12px; color: var(--muted); }
+.stat { display: flex; justify-content: space-between; font-size: 13px; padding: 2px 0; }
+.bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 4px 0 12px; }
+.bar div { height: 100%; background: var(--accent); }
+pre#detail { white-space: pre-wrap; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; font: 12px/1.4 ui-monospace, monospace; max-height: 40vh; overflow: auto; }
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; height: auto; }
+  aside, section { padding: 16px; }
+  #chat { height: 80vh; }
+}
+</style>
+</head>
+<body>
+<main>
+  <aside>
+    <h2>Sessions</h2>
+    <div id="sessions"></div>
+    <form id="create" style="padding: 12px 0; border: 0;"><input id="newname" placeholder="new session name"></form>
+    <h2>Model</h2>
+    <form id="settings" class="settings">
+      <label>Provider <input id="base" placeholder="https://api.anthropic.com"></label>
+      <label>Model <input id="model"></label>
+      <label>API key <input id="key" type="password" autocomplete="off"></label>
+      <button>Save</button>
+      <small id="saved"></small>
+    </form>
+  </aside>
+  <section id="chat">
+    <div id="log"></div>
+    <div id="status"></div>
+    <form id="say"><textarea id="text" placeholder="Message (Enter sends, Shift+Enter for a new line)"></textarea><button>Send</button></form>
+  </section>
+  <aside id="memory">
+    <h2>Context</h2>
+    <div id="stats"></div>
+    <h2>Memory pyramid</h2>
+    <div class="legend">Top rows merge k of the row below; bottom row is chunks of raw messages. Outlined: what the context shows. Click for its text.</div>
+    <div id="pyramid" class="pyramid"></div>
+    <pre id="detail">Select a memory or chunk.</pre>
+  </aside>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let current = null, state = null, poll = null;
+
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: 'POST', headers: { 'x-connectome': '1' }, body: JSON.stringify(body) } : {});
+  const v = await r.json();
+  if (v && v.error) throw new Error(v.error);
+  return v;
+}
+
+function escape(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+async function listSessions() {
+  const all = await api('/api/sessions');
+  const children = (p) => all.filter((s) => (s.parent ? s.parent.name : null) === p);
+  const draw = (p, depth) => children(p).map((s) => `<a href="#${s.name}" class="${s.name === current ? 'on' : ''}" style="padding-left:${6 + depth * 14}px">${escape(s.name)} <small>${s.messages}${s.parent ? ' · from ' + s.parent.at : ''}</small></a>` + draw(s.name, depth + 1)).join('');
+  $('sessions').innerHTML = draw(null, 0) || '<small>No sessions yet.</small>';
+}
+
+// What the context shows of message i: 'tail' (raw, not in a chunk yet), 'raw' (a raw chunk), or 'recalled' (through a memory).
+function shownAs(i) {
+  if (!state || !state.chunks.length || i > state.chunks[state.chunks.length - 1][1]) return 'tail';
+  const chunk = state.chunks.findIndex(([a, b]) => a <= i && i <= b);
+  for (const [level, p] of state.frontier || []) {
+    const span = level === 0 ? 1 : state.k ** (level - 1);
+    if (chunk >= p * span && chunk < (p + 1) * span) return level === 0 ? 'raw' : 'recalled';
+  }
+  return 'raw';
+}
+
+async function open(name) {
+  current = name;
+  state = await api(`/api/s/${name}`);
+  const messages = await api(`/api/s/${name}/messages`);
+  const thinking = (m) => m.thinking ? `<details class="thinking"><summary>Thinking</summary>${escape(m.thinking)}</details>` : '';
+  $('log').innerHTML = messages.map((m) => `<div class="msg ${shownAs(m.id)}"><div class="who">#${m.id} · ${escape(m.participant)}</div>${thinking(m)}${escape(m.text)}<button data-fork="${m.id}">fork here</button></div>`).join('');
+  $('log').scrollTop = $('log').scrollHeight;
+  drawMemory();
+  listSessions();
+  setStatus();
+}
+
+function setStatus(text, warn) {
+  const s = $('status');
+  s.className = warn || (state && state.refused) ? 'warn' : '';
+  s.textContent = text || (state && state.refused ? 'The summarizer refused; memory formation is stopped until surgery.' : state && state.forming ? 'Forming memories…' : '');
+}
+
+function drawMemory() {
+  const s = state, used = s.armed || 0;
+  $('stats').innerHTML = `
+    <div class="stat"><span>Last context</span><span>${Math.round(used).toLocaleString()} / ${s.window.toLocaleString()} tokens</span></div>
+    <div class="bar"><div style="width:${Math.min(100, 100 * used / s.window)}%"></div></div>
+    <div class="stat"><span>Messages</span><span>${s.messages}</span></div>
+    <div class="stat"><span>Chunks · memories</span><span>${s.layers[0] || 0} · ${s.layers.slice(1).join(' / ') || 0}</span></div>
+    <div class="stat"><span>Price multiplier</span><span>${(s.multiplier || 1).toFixed(3)}</span></div>
+    <div class="stat"><span>Model</span><span>${escape(s.model)}</span></div>`;
+  const chunks = s.layers[0] || 0, shown = new Set((s.frontier || []).map(([l, p]) => `${l}/${p}`));
+  const rows = [];
+  for (let level = s.layers.length - 1; level >= 0; level--) {
+    const span = level === 0 ? 1 : s.k ** (level - 1), cells = [];
+    for (let p = 0; p < s.layers[level]; p++) {
+      const left = 100 * p * span / Math.max(chunks, 1), width = 100 * span / Math.max(chunks, 1);
+      const color = level === 0 ? '' : `background: var(--l${Math.min(level, 5)});`;
+      cells.push(`<div class="cell ${shown.has(`${level}/${p}`) ? 'shown' : ''}" data-node="${level}/${p}" title="${level ? 'L' + level : 'chunk'} ${p}" style="left:${left}%;width:calc(${width}% - 2px);${color}"></div>`);
+    }
+    rows.push(`<div class="row ${level === 0 ? 'chunks' : ''}">${cells.join('')}</div>`);
+  }
+  $('pyramid').innerHTML = rows.join('') || '<small class="legend">No chunks yet: everything is still in the raw tail.</small>';
+}
+
+$('pyramid').onclick = async (e) => {
+  const node = e.target.dataset.node;
+  if (!node) return;
+  const [level, p] = node.split('/').map(Number);
+  const [record] = await api(`/api/s/${current}/layer/${level}?from=${p}&to=${p + 1}`);
+  $('detail').textContent = level === 0
+    ? `Chunk ${p}: messages ${record.first}–${record.last}, ~${Math.round(record.raw)} tokens raw`
+    : `L${level} memory ${p} (messages ${record.first}–${record.last}, ${record.tokens} tokens)\n\n${record.text}`;
+};
+
+$('log').onclick = async (e) => {
+  const at = e.target.dataset.fork;
+  if (at === undefined) return;
+  const name = prompt(`Name for a fork of ${current} at message #${at}`, `${current}-${at}`);
+  if (!name) return;
+  try { await api(`/api/s/${current}/fork`, { at: Number(at), name }); location.hash = name; } catch (err) { setStatus(err.message, true); }
+};
+
+$('say').onsubmit = async (e) => {
+  e.preventDefault();
+  const text = $('text').value.trim();
+  if (!text || !current) return;
+  $('text').value = '';
+  $('log').insertAdjacentHTML('beforeend', `<div class="msg tail"><div class="who">user</div>${escape(text)}</div><div class="msg tail"><div class="who">assistant</div><details class="thinking" id="thinking" open hidden><summary>Thinking</summary><span></span></details><span id="streaming"></span></div>`);
+  $('log').scrollTop = $('log').scrollHeight;
+  setStatus('Waiting for the model…');
+  let error = null;
+  try {
+    // the reply comes as JSON lines: {"thinking"} or {"text"} for each piece, then {"ok"} or {"error"}
+    const r = await fetch(`/api/s/${current}/say`, { method: 'POST', headers: { 'x-connectome': '1' }, body: JSON.stringify({ text }) });
+    const reader = r.body.getReader(), decoder = new TextDecoder();
+    let buffered = '';
+    const take = (line) => {
+      if (!line.trim()) return;
+      const event = JSON.parse(line);
+      if (event.thinking) {
+        $('thinking').hidden = false;
+        $('thinking').querySelector('span').textContent += event.thinking;
+      }
+      if (event.text) $('streaming').textContent += event.text;
+      if (event.thinking || event.text) {
+        setStatus('');
+        $('log').scrollTop = $('log').scrollHeight;
+      }
+      if (event.error) error = event.error;
+    };
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      for (let i; (i = buffered.indexOf('\n')) >= 0; buffered = buffered.slice(i + 1)) take(buffered.slice(0, i));
+    }
+    take(buffered);
+  } catch (err) { error = err.message; }
+  await open(current);
+  if (error) setStatus(error, true); else watch();
+};
+
+async function loadSettings() {
+  const s = await api('/api/settings');
+  $('base').value = s.base;
+  $('model').value = s.model;
+  $('key').value = '';
+  $('key').placeholder = s.key ? 'saved; type to replace' : 'needed to chat';
+  $('saved').textContent = s.key ? '' : 'Add the provider\'s API key to chat. DeepSeek: https://api.deepseek.com/anthropic, OpenRouter: https://openrouter.ai/api/v1';
+}
+
+$('settings').onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    await api('/api/settings', { base: $('base').value, model: $('model').value, key: $('key').value });
+    await loadSettings();
+    $('saved').textContent = 'Saved.';
+    if (current) open(current);
+  } catch (err) { $('saved').textContent = err.message; }
+};
+
+$('text').onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('say').requestSubmit(); } };
+
+$('create').onsubmit = async (e) => {
+  e.preventDefault();
+  try { await api('/api/sessions', { name: $('newname').value.trim() }); location.hash = $('newname').value.trim(); $('newname').value = ''; } catch (err) { alert(err.message); }
+};
+
+// While memories form, the page checks back for them.
+function watch() {
+  clearInterval(poll);
+  poll = setInterval(async () => {
+    state = await api(`/api/s/${current}`);
+    drawMemory();
+    setStatus();
+    if (!state.forming) { clearInterval(poll); open(current); }
+  }, 1500);
+}
+
+window.onhashchange = () => location.hash.length > 1 && open(decodeURIComponent(location.hash.slice(1)));
+loadSettings();
+listSessions().then(() => window.onhashchange());
+</script>
+</body>
+</html>

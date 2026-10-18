@@ -7,10 +7,14 @@ replies empty and now and then refuses. After every pass:
     tool_use is answered in the turn after it;
   - after a refusal no memory is written, and no memory fails more than attempt_limit times at one
     log length.
-Then one long session checks the point of the design: the records a pass reads don't grow with the log.
+Now and then a run forks at an earlier message and goes on in the fork (forks of forks too): the fork
+must share its parent's messages through that one, pass the same checks, and leave its parent's files
+untouched. Then one long session checks the point of the design: the records a pass reads don't grow
+with the log.
 
     python3 tests/test_session.py [sessions] [seed]
 """
+import os
 import random
 from collections import Counter
 import shutil
@@ -21,10 +25,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-from calls import Host  # noqa: E402
 from config import Config  # noqa: E402
 from drive import step  # noqa: E402
 from emit import Refusal  # noqa: E402
+from memory import Host  # noqa: E402
 from planner import chunks  # noqa: E402
 from store import Session  # noqa: E402
 
@@ -96,9 +100,16 @@ def run(r, folder, passes, checked=True):
     cfg = Config(target_chunk_tokens=r.choice([300, 1500]), recent_window_tokens=r.choice([500, 3000]), merge_threshold=k,
                  summary_target_tokens=200, recall_budget_tokens=r.choice([2000, 20000]), l1_holdback_chunks=r.choice([0, 1, 2]),
                  attempt_limit=r.choice([1, 3]), min_chunk_chars=r.choice([0, 200]))
-    s, host = Session(folder), Host(summarizer(r, r.choice([0, 0, 1])), tools=r.choice([None, [{'name': 'read'}]]))
-    W = r.choice([4000, 12000, 40000])
+    s, host = Session(os.path.join(folder, 'main')), Host(summarizer(r, r.choice([0, 0, 1])), tools=r.choice([None, [{'name': 'read'}]]))
+    W, frozen = r.choice([4000, 12000, 40000]), {}             # frozen: each forked session's file sizes when forked
     for t in range(passes):
+        if checked and r.random() < 0.02 and (n := s.count('messages')) > 2:
+            at = r.randrange(n)
+            frozen[s.path] = sizes(s.path)
+            fork = Session.fork(s, at, os.path.join(folder, f'fork{t}'))
+            if list(fork.span('messages', 0, at)) != list(s.span('messages', 0, at)) or fork.count('messages') != at + 1:
+                raise Failed(f'fork at {at} does not share its parent\'s messages')
+            s = fork
         if r.random() < 0.03:
             W = r.choice([4000, 12000, 40000])
         last = s.last('compiles') or {}
@@ -108,8 +119,15 @@ def run(r, folder, passes, checked=True):
         compiled, _ = step(s, turn(r, t), usage, W + 1000, 1000, W + 5000, host, cfg)
         if checked:
             check(s, compiled, cfg)
+            if changed := [path for path, before in frozen.items() if sizes(path) != before]:
+                raise Failed(f'a fork wrote to its parent {changed[0]}')
             if refused and [s.count(f'layer{n}') for n in range(1, 9)] != memories:
                 raise Failed('a memory was written after a refusal')
+    return len(frozen)
+
+
+def sizes(path):
+    return {f: os.path.getsize(os.path.join(path, f)) for f in sorted(os.listdir(path))}
 
 
 def bounded(seed) -> str:
@@ -139,10 +157,11 @@ def bounded(seed) -> str:
 
 
 def main(count=30, seed=0):
+    forks = 0
     for i in range(int(count)):
         folder = tempfile.mkdtemp()
         try:
-            run(random.Random(f'{seed}/{i}'), folder, 150)
+            forks += run(random.Random(f'{seed}/{i}'), folder, 150)
         except Failed as error:
             print(f'session {i}: {error}')
             return 1
@@ -153,7 +172,7 @@ def main(count=30, seed=0):
     except Failed as error:
         print(error)
         return 1
-    print(f'{count} sessions hold; {detail}')
+    print(f'{count} sessions hold, with {forks} forks; {detail}')
     return 0
 
 

@@ -18,12 +18,12 @@ import math
 import re
 from functools import reduce
 from itertools import count, takewhile
+from typing import Callable, NamedTuple
 
 from blocks import REASONING
-from calls import Failure, Host, Reply, call
 from config import Config
 from emit import LABEL, answer, recall_tokens
-from js import js_len, js_round, js_trim, sha256
+from js import JS_SPACE, js_len, js_round, js_trim, sha256
 from store import Session
 from turns import cap_images, normalize, strip_reasoning
 
@@ -45,7 +45,15 @@ MERGE_INSTRUCTION = ('You have just reviewed {seen}, in chronological order. The
 QUIET = ('(A quiet stretch: {} messages of routine system traffic — heartbeats, empty turns, notices. '
          'Nothing happened worth remembering.)')
 _HEADER = re.compile(r'\[CM\] Recall memory ([^\n\r  ]+)\.')
-_TOOLS_LESS = re.compile(r'(?:^|/)claude-(?:fable|mythos)-')
+_WRAPPED = re.compile(rf'[{JS_SPACE}]*<thinking>.*?</thinking>[{JS_SPACE}]*', re.I | re.A | re.S)
+_OPENS = re.compile(rf'[{JS_SPACE}]*<thinking>', re.I | re.A)
+
+
+class Host(NamedTuple):
+    """The host's side of a call."""
+    complete: Callable                    # request -> response {stopReason, content, usage}; raises on failure
+    tools: list | None = None             # the agent's live tool definitions, once declared
+    system: str | None = None             # the host's system prompt, once declared
 
 
 def tick(session: Session, host: Host, cfg: Config) -> tuple[bool, Exception | None]:
@@ -58,15 +66,19 @@ def tick(session: Session, host: Host, cfg: Config) -> tuple[bool, Exception | N
         return False, None
     if (request := l1_request(session, p, host, cfg) if level == 1 else merge_request(session, level, p, host, cfg)) is None:
         return False, None                                    # deferred until the host declares its tools
-    result = call(host, request)
-    match result:
-        case Reply(stop='refusal'):
-            session.append('attempts', {'target': target, 'messages': session.count('messages'), 'outcome': 'refusal'})
-        case Reply(verdict=('valid', _)) if js_trim(result.text):
-            session.append(f'layer{level}', written(session, level, p, result, cfg))
-        case _:
-            session.append('attempts', {'target': target, 'messages': session.count('messages'), 'outcome': 'retry'})
-    return True, result.error if isinstance(result, Failure) else None
+    failed = lambda outcome: session.append('attempts', {'target': target, 'messages': session.count('messages'), 'outcome': outcome})
+    try:
+        response = host.complete(request)
+    except Exception as error:
+        failed('retry')
+        return True, error
+    if response.get('stopReason') == 'refusal':
+        failed('refusal')
+    elif text := usable(response):
+        session.append(f'layer{level}', written(session, level, p, request, response, text, cfg))
+    else:
+        failed('retry')
+    return True, None
 
 
 def due(session: Session, cfg: Config) -> tuple[int, int] | None:
@@ -93,21 +105,20 @@ def blocked(session: Session, target: tuple, cfg: Config) -> bool:
 
 def quiet(session: Session, p: int, cfg: Config) -> dict | None:
     """The stub for a chunk of text blocks only under min_chunk_chars of trimmed text."""
-    chunk = session.get('layer0', p)
-    blocks = [b for m in session.span('messages', chunk['first'], chunk['last']) for b in m['content']]
+    first, last = span(session, 1, p, cfg)
+    blocks = [b for m in session.span('messages', first, last) for b in m['content']]
     if all(b['type'] == 'text' for b in blocks) and sum(js_len(js_trim(b['text'])) for b in blocks) < cfg.min_chunk_chars:
-        return memory(chunk['first'], chunk['last'], QUIET.format(chunk['last'] - chunk['first'] + 1), None, 40, None, cfg)
+        return memory(first, last, QUIET.format(last - first + 1), None, 40, None, cfg)
     return None
 
 
 def l1_request(session: Session, p: int, host: Host, cfg: Config) -> dict | None:
     """compressChunkHierarchical's request for chunk p, or None to defer it while the host has declared
-    no tools and the request carries tool blocks or the summarizer is a Fable/Mythos model."""
-    chunk = session.get('layer0', p)
-    task = [say(MARKER), *raw(session.span('messages', chunk['first'], chunk['last'])), say(INSTRUCTION.format(cfg.summary_target_tokens))]
-    request = ask(session, chunk['first'], task, host, cfg)
-    if not host.tools and (_TOOLS_LESS.search(cfg.compression_model)
-                           or any(b['type'] in ('tool_use', 'tool_result') for t in request['messages'] for b in t['content'])):
+    no tools and the request carries tool blocks, which a provider takes only with their tools."""
+    first, last = span(session, 1, p, cfg)
+    task = [say(MARKER), *raw(session.span('messages', first, last)), say(INSTRUCTION.format(cfg.summary_target_tokens))]
+    request = ask(session, first, task, host, cfg)
+    if not host.tools and any(b['type'] in ('tool_use', 'tool_result') for t in request['messages'] for b in t['content']):
         return None
     return request
 
@@ -115,8 +126,7 @@ def l1_request(session: Session, p: int, host: Host, cfg: Config) -> dict | None
 def merge_request(session: Session, level: int, p: int, host: Host, cfg: Config) -> dict:
     """executeMerge's request for layer `level`'s entry p: the run one level deeper (an L1 run's
     messages raw, a higher run's children as recall pairs), then the merge instruction."""
-    k, below = cfg.merge_threshold, level - 1
-    first, last = session.get(f'layer{below}', p * k)['first'], session.get(f'layer{below}', p * k + k - 1)['last']
+    (k, below), (first, last) = (cfg.merge_threshold, level - 1), span(session, level, p, cfg)
     shown = raw(session.span('messages', first, last)) if below == 1 else \
         pairs([(below - 1, m) for m in session.span(f'layer{below - 1}', p * k * k, (p + 1) * k * k - 1)], cfg)
     seen = f'the L{below - 1} memories above' if below > 1 else 'the slices of recent experience above (raw conversation)'
@@ -131,7 +141,7 @@ def ask(session: Session, before: int, task: list[dict], host: Host, cfg: Config
     kept = reduce(lambda acc, m: ([m, *acc[0]], acc[1] + m[1]['tokens'] + 50) if acc[1] + m[1]['tokens'] + 50 <= cfg.recall_budget_tokens
                   else acc, reversed(prior), ([], 0))[0]
     wire = cap_images(normalize(pairs(kept, cfg) + task), cfg.compression_image_bytes)
-    marks = seams(wire, {name(level, m['id']): level for level, m in kept}) if len(kept) == len(prior) else set()
+    marks = seams(wire, {f'L{level}-{m["id"]}': level for level, m in kept}) if len(kept) == len(prior) else set()
     cap = c if (c := cfg.compression_max_tokens or 0) > 0 else math.inf
     return {**({'system': host.system} if host.system else {}),
             'messages': [{**t, 'cacheBreakpoint': True} if i in marks else t for i, t in enumerate(wire)],
@@ -152,7 +162,7 @@ def unmerged(session: Session, before: int, cfg: Config) -> list[tuple[int, dict
 
 def pairs(memories: list[tuple[int, dict]], cfg: Config) -> list[dict]:
     """Recall pairs: a turn naming each memory, then its answer as the agent."""
-    return [t for level, m in memories for t in (say(f'[CM] Recall memory {name(level, m["id"])}.'),
+    return [t for level, m in memories for t in (say(f'[CM] Recall memory L{level}-{m["id"]}.'),
                                                   {'participant': cfg.summary_participant, 'content': answer(m)})]
 
 
@@ -170,10 +180,6 @@ def header(turn: dict) -> str | None:
             return m[1] if (m := _HEADER.fullmatch(text)) else None
 
 
-def name(level: int, i: int) -> str:
-    return f'L{level}-{i}'
-
-
 def say(text: str) -> dict:
     return {'participant': LABEL, 'content': [{'type': 'text', 'text': text}]}
 
@@ -183,17 +189,34 @@ def raw(messages) -> list[dict]:
     return [{'participant': m['participant'], 'content': strip_reasoning(m['content'])} for m in messages]
 
 
-def written(session: Session, level: int, p: int, reply: Reply, cfg: Config) -> dict:
-    """The memory a reply wrote: its text (less a leading <thinking> block), its reasoning and text blocks
-    if it reasoned (captureResponseContent), its output tokens (else chars/3), and the hash of the
-    request the provider took."""
-    k, content, text = cfg.merge_threshold, reply.response['content'], reply.text
-    first, last = ((c := session.get('layer0', p))['first'], c['last']) if level == 1 else \
-        (session.get(f'layer{level - 1}', p * k)['first'], session.get(f'layer{level - 1}', p * k + k - 1)['last'])
-    out = usage.get('outputTokens') if isinstance(usage := reply.response.get('usage'), dict) else None
+def usable(response: dict) -> str:
+    """A finished reply's memory text: its text blocks, less a leading <thinking>…</thinking>
+    (stripThinkingPreamble); '' for a reply cut short, malformed, empty, or all thinking."""
+    content = response.get('content')
+    if response.get('stopReason') != 'end_turn' or not isinstance(content, list) or not all(isinstance(b, dict) for b in content):
+        return ''
+    text = '\n'.join(b['text'] for b in content if b.get('type') == 'text' and isinstance(b.get('text'), str))
+    text = text[m.end():] if (m := _WRAPPED.match(text)) else '' if _OPENS.match(text) else text
+    return text if js_trim(text) else ''
+
+
+def written(session: Session, level: int, p: int, request: dict, response: dict, text: str, cfg: Config) -> dict:
+    """The memory a reply wrote: its text, its reasoning and text blocks if it reasoned
+    (captureResponseContent), its output tokens (else chars/3), and the hash of its request."""
+    (first, last), content = span(session, level, p, cfg), response['content']
+    out = usage.get('outputTokens') if isinstance(usage := response.get('usage'), dict) else None
     blocks = [b for b in content if b['type'] in REASONING + ('text',)] if any(b['type'] in REASONING for b in content) else None
     return memory(first, last, text, blocks, out if out and out > 0 else math.ceil(js_len(text) / 3),
-                  {'stopReason': 'end_turn', 'requestHash': sha256(reply.sent), 'model': cfg.compression_model}, cfg)
+                  {'stopReason': 'end_turn', 'requestHash': sha256(request), 'model': cfg.compression_model}, cfg)
+
+
+def span(session: Session, level: int, p: int, cfg: Config) -> tuple[int, int]:
+    """The first and last message of the stretch layer `level`'s entry p covers: chunk p's for an L1,
+    else from its first child's to its last's."""
+    if level == 1:
+        return (chunk := session.get('layer0', p))['first'], chunk['last']
+    k = cfg.merge_threshold
+    return session.get(f'layer{level - 1}', p * k)['first'], session.get(f'layer{level - 1}', p * k + k - 1)['last']
 
 
 def memory(first: int, last: int, text: str, blocks: list | None, tokens: int, provenance: dict | None, cfg: Config) -> dict:

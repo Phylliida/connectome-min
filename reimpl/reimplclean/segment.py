@@ -1,14 +1,7 @@
-"""Generic tools for an append-only sequence: where a running total first passes a budget, the runs
-that close among the items between two bounds, and an admission budget for items taken newest first.
+"""Generic tools for an append-only sequence: the runs that close among the items between two bounds,
+and an admission budget for items taken newest first.
 """
-from itertools import accumulate
 from typing import Callable
-
-
-def crossing(prices, limit) -> int | None:
-    """How many prices come before the running total first exceeds limit; None if it never does.
-    A scan, not a bisection: a price can be negative."""
-    return next((k for k, total in enumerate(accumulate(prices)) if total > limit), None)
 
 
 def runs(start: int, stop: int, free: Callable[[int], bool], size: Callable[[int], float],
