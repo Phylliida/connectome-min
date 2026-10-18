@@ -1,10 +1,10 @@
 //! The settings, at @animalabs/context-manager 0.10.1's defaults where the library has the same
 //! setting (its name in each comment). As JSON, an object of the settings it changes, by the Python
-//! port's field names (the same as here).
+//! port's field names (the same as here), and so a session's settings write it.
 
 use smart_default::SmartDefault;
 
-#[derive(Clone, Debug, SmartDefault, serde::Deserialize)]
+#[derive(Clone, Debug, SmartDefault, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Config {
     // chunks and windows

@@ -24,13 +24,17 @@ aside, section { overflow: auto; padding: 16px; }
 aside { border-right: 1px solid var(--line); }
 #memory { border-left: 1px solid var(--line); border-right: 0; }
 h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
-button, input, textarea { font: inherit; color: inherit; }
+button, input, textarea, select { font: inherit; color: inherit; }
 button { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
 button:hover { border-color: var(--accent); }
-input, textarea { width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+input, textarea, select { width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+input[type=checkbox] { width: auto; }
 #sessions a { display: block; padding: 4px 6px; border-radius: 6px; color: inherit; text-decoration: none; }
 #sessions a.on { background: var(--panel); outline: 1px solid var(--line); }
 #sessions small { color: var(--muted); }
+.group { margin: 0 0 6px; }
+.group summary, .provider { cursor: pointer; padding: 4px 0; }
+.group summary small, .provider small { display: block; font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
 .settings { display: flex; flex-direction: column; gap: 6px; padding: 0; border: 0; }
 .settings label { font-size: 12px; color: var(--muted); }
 .settings small { color: var(--muted); font-size: 12px; }
@@ -78,22 +82,39 @@ pre#detail { white-space: pre-wrap; background: var(--panel); border: 1px solid 
   <aside>
     <h2>Sessions</h2>
     <div id="sessions"></div>
-    <form id="create" style="padding: 12px 0; border: 0;"><input id="newname" placeholder="new session name"></form>
-    <h2>Model</h2>
-    <form id="settings" class="settings">
-      <label>Provider <input id="base" placeholder="https://api.anthropic.com"></label>
-      <label>Model <input id="model"></label>
-      <label>API key <input id="key" type="password" autocomplete="off"></label>
-      <button>Save</button>
+    <form id="create" class="settings" style="padding: 12px 0;">
+      <input id="newname" placeholder="new session name">
+      <input id="newspace" placeholder="its workspace, where bash runs">
+      <button>Create</button>
+    </form>
+    <h2>Providers</h2>
+    <div id="providers"></div>
+    <form id="provider" class="settings">
+      <label>Name <input id="pname" placeholder="openrouter"></label>
+      <label>Base URL <input id="base" placeholder="https://openrouter.ai/api/v1"></label>
+      <label>API key <input id="key" type="password" autocomplete="off" placeholder="unchanged if empty"></label>
+      <button>Save provider</button>
       <small id="saved"></small>
     </form>
   </aside>
   <section id="chat">
     <div id="log"></div>
     <div id="status"></div>
-    <form id="say"><textarea id="text" placeholder="Message (Enter sends, Shift+Enter for a new line)"></textarea><button>Send</button></form>
+    <form id="say"><textarea id="text" placeholder="Message (Enter sends, Shift+Enter for a new line)"></textarea><button>Send</button><button type="button" id="continue" title="Let the model go on, without a message">Continue</button></form>
   </section>
   <aside id="memory">
+    <h2>Session</h2>
+    <form id="session" class="settings">
+      <label>Provider <select name="provider" id="sprovider"></select></label>
+      <label>Model <input name="model"></label>
+      <label>Workspace <input name="workspace" placeholder="none: no bash"></label>
+      <label><input name="sandbox" type="checkbox"> bash in the sandbox</label>
+      <label>Window <input name="window" type="number"></label>
+      <label>Reply reserve <input name="reserve" type="number"></label>
+      <label>System prompt <textarea name="system" rows="2"></textarea></label>
+      <button>Save</button>
+      <small id="ssaved">The rest is in the session's session_settings.json.</small>
+    </form>
     <h2>Context</h2>
     <div id="stats"></div>
     <h2>Memory pyramid</h2>
@@ -104,7 +125,7 @@ pre#detail { white-space: pre-wrap; background: var(--panel); border: 1px solid 
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
-let current = null, state = null, poll = null;
+let current = null, state = null, poll = null, providers = [], showing = null;   // showing: the turn this page follows
 
 async function api(path, body) {
   const r = await fetch(path, body ? { method: 'POST', headers: { 'x-connectome': '1' }, body: JSON.stringify(body) } : {});
@@ -115,12 +136,29 @@ async function api(path, body) {
 
 function escape(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
+// the workspaces whose groups are folded, kept in this browser
+let folded = new Set();
+try { folded = new Set(JSON.parse(localStorage.getItem('folded')) || []); } catch { /* no storage here: groups start open */ }
+
+// the sessions, grouped by workspace (those without one last); in a group, a fork under its parent
 async function listSessions() {
-  const all = await api('/api/sessions');
-  const children = (p) => all.filter((s) => (s.parent ? s.parent.name : null) === p);
-  const draw = (p, depth) => children(p).map((s) => `<a href="#${s.name}" class="${s.name === current ? 'on' : ''}" style="padding-left:${6 + depth * 14}px">${escape(s.name)} <small>${s.messages}${s.parent ? ' · from ' + s.parent.at : ''}</small></a>` + draw(s.name, depth + 1)).join('');
-  $('sessions').innerHTML = draw(null, 0) || '<small>No sessions yet.</small>';
+  const all = await api('/api/sessions'), workspace = (s) => (s.workspace || '').replace(/[\\/]+$/, '');
+  const group = (w) => {
+    const members = all.filter((s) => workspace(s) === w), inside = (s) => members.some((m) => m.name === s.parent?.name);
+    const draw = (p, depth) => members.filter((s) => (inside(s) ? s.parent.name : null) === p).map((s) => `<a href="#${s.name}" class="${s.name === current ? 'on' : ''}" style="padding-left:${6 + depth * 14}px">${escape(s.name)} <small>${s.messages}${s.parent ? ' · from ' + s.parent.at : ''}</small></a>` + draw(s.name, depth + 1)).join('');
+    const title = w ? `<b>${escape(w.split(/[\\/]/).pop())}</b> · ${members.length}<small>${escape(w)}</small>` : `<b>No workspace</b> · ${members.length}`;
+    return `<details class="group" data-workspace="${escape(w)}"${folded.has(w) ? '' : ' open'}><summary>${title}</summary>${draw(null, 0)}</details>`;
+  };
+  $('sessions').innerHTML = [...new Set(all.map(workspace))].sort((a, b) => !a - !b || a.localeCompare(b)).map(group).join('') || '<small>No sessions yet.</small>';
 }
+
+// a group's header folds it or opens it ('toggle' doesn't bubble, so this listens as it goes down)
+$('sessions').addEventListener('toggle', (e) => {
+  const w = e.target.dataset.workspace;
+  if (w === undefined) return;
+  if (e.target.open) folded.delete(w); else folded.add(w);
+  try { localStorage.setItem('folded', JSON.stringify([...folded])); } catch { /* no storage here: kept until the page reloads */ }
+}, true);
 
 // What the context shows of message i: 'tail' (raw, not in a chunk yet), 'raw' (a raw chunk), or 'recalled' (through a memory).
 function shownAs(i) {
@@ -134,32 +172,53 @@ function shownAs(i) {
 }
 
 async function open(name) {
+  showing?.abort();
   current = name;
   state = await api(`/api/s/${name}`);
-  const messages = await api(`/api/s/${name}/messages`);
+  // while a turn runs, the log up to it, then the turn as it goes on
+  const messages = await api(`/api/s/${name}/messages${state.running == null ? '' : `?to=${state.running}`}`);
   const thinking = (m) => m.thinking ? `<details class="thinking"><summary>Thinking</summary>${escape(m.thinking)}</details>` : '';
   $('log').innerHTML = messages.map((m) => `<div class="msg ${shownAs(m.id)}"><div class="who">#${m.id} · ${escape(m.participant)}</div>${thinking(m)}${escape(m.text)}<button data-fork="${m.id}">fork here</button></div>`).join('');
   $('log').scrollTop = $('log').scrollHeight;
   drawMemory();
+  fill();
   listSessions();
   setStatus();
+  if (state.running != null) follow(fetch(`/api/s/${name}/live`, { signal: (showing = new AbortController()).signal }));
 }
+
+// the session form shows the session's settings, a field per input of its name
+const fields = () => [...$('session').elements].filter((el) => el.name);
+function fill() {
+  for (const el of fields()) el[el.type === 'checkbox' ? 'checked' : 'value'] = (state.settings || {})[el.name] ?? '';
+}
+
+$('session').onsubmit = async (e) => {
+  e.preventDefault();
+  const value = (el) => el.type === 'checkbox' ? el.checked : el.type === 'number' ? Number(el.value) : el.value || null;
+  try {
+    state = await api(`/api/s/${current}/settings`, Object.fromEntries(fields().map((el) => [el.name, value(el)])));
+    fill();
+    drawMemory();
+    $('ssaved').textContent = 'Saved.';
+  } catch (err) { $('ssaved').textContent = err.message; }
+};
 
 function setStatus(text, warn) {
   const s = $('status');
-  s.className = warn || (state && state.refused) ? 'warn' : '';
-  s.textContent = text || (state && state.refused ? 'The summarizer refused; memory formation is stopped until surgery.' : state && state.forming ? 'Forming memories…' : '');
+  s.className = warn || (state && (state.refused || state.problem)) ? 'warn' : '';
+  s.textContent = text || (state && (state.problem || (state.refused ? 'The summarizer refused; memory formation is stopped until surgery.' : state.forming ? 'Forming memories…' : '')));
 }
 
 function drawMemory() {
-  const s = state, used = s.armed || 0;
+  const s = state, used = s.armed || 0, { window = 0, model = '' } = s.settings || {};
   $('stats').innerHTML = `
-    <div class="stat"><span>Last context</span><span>${Math.round(used).toLocaleString()} / ${s.window.toLocaleString()} tokens</span></div>
-    <div class="bar"><div style="width:${Math.min(100, 100 * used / s.window)}%"></div></div>
+    <div class="stat"><span>Last context</span><span>${Math.round(used).toLocaleString()} / ${window.toLocaleString()} tokens</span></div>
+    <div class="bar"><div style="width:${Math.min(100, 100 * used / window)}%"></div></div>
     <div class="stat"><span>Messages</span><span>${s.messages}</span></div>
     <div class="stat"><span>Chunks · memories</span><span>${s.layers[0] || 0} · ${s.layers.slice(1).join(' / ') || 0}</span></div>
     <div class="stat"><span>Price multiplier</span><span>${(s.multiplier || 1).toFixed(3)}</span></div>
-    <div class="stat"><span>Model</span><span>${escape(s.model)}</span></div>
+    <div class="stat"><span>Model</span><span>${escape(model)}</span></div>
     <div class="stat"><span>Tools</span><span>${s.tools.map((t) => `<button class="chip ${t.allowed ? 'on' : ''}" data-tool="${escape(t.name)}" title="${t.allowed ? 'Always allowed. Click to ask first.' : 'Asks first. Click to always allow.'}">${escape(t.name)}</button>`).join('') || 'none'}</span></div>
     <div class="stat"><span>Tools and system prompt</span><span>${Math.round(s.overhead).toLocaleString()} tokens</span></div>`;
   const chunks = s.layers[0] || 0, shown = new Set((s.frontier || []).map(([l, p]) => `${l}/${p}`));
@@ -176,12 +235,12 @@ function drawMemory() {
   $('pyramid').innerHTML = rows.join('') || '<small class="legend">No chunks yet: everything is still in the raw tail.</small>';
 }
 
-// a tool's chip toggles whether the tool is always allowed
+// a tool's chip toggles whether the session always allows it
 $('stats').onclick = async (e) => {
   const tool = e.target.dataset.tool;
   if (!tool) return;
   const allow = state.tools.filter((t) => t.allowed !== (t.name === tool)).map((t) => t.name);
-  try { await api('/api/settings', { allow }); state = await api(`/api/s/${current}`); drawMemory(); } catch (err) { setStatus(err.message, true); }
+  try { state = await api(`/api/s/${current}/settings`, { allow }); drawMemory(); } catch (err) { setStatus(err.message, true); }
 };
 
 $('pyramid').onclick = async (e) => {
@@ -207,20 +266,35 @@ $('log').onclick = async (e) => {
   } catch (err) { setStatus(err.message, true); }
 };
 
-$('say').onsubmit = async (e) => {
+$('say').onsubmit = (e) => {
   e.preventDefault();
   const text = $('text').value.trim();
-  if (!text || !current) return;
+  if (!text) return;
   $('text').value = '';
-  $('log').insertAdjacentHTML('beforeend', `<div class="msg tail"><div class="who">user</div>${escape(text)}</div><div class="msg tail" id="reply"><div class="who">assistant</div></div>`);
+  turn(text);
+};
+
+$('continue').onclick = () => turn(null);
+
+// a turn: `text` joins the log and the model answers it, or without text the model goes on from the log as it is
+function turn(text) {
+  if (!current) return;
+  if (text) $('log').insertAdjacentHTML('beforeend', `<div class="msg tail"><div class="who">user</div>${escape(text)}</div>`);
+  showing?.abort();
+  showing = new AbortController();
+  follow(fetch(`/api/s/${current}/${text ? 'say' : 'continue'}`, { method: 'POST', headers: { 'x-connectome': '1' }, body: JSON.stringify({ text }), signal: showing.signal }));
+}
+
+// a turn as it streams, then the log as it leaves it: JSON lines, {"thinking"} or {"text"} for each
+// piece of a reply, {"tool"} for each call, {"approve"} when it asks to run and {"answered"} once it's
+// answered, {"result"} for its result, then {"ok"} or {"error"}; the page stops showing it when it opens a session
+async function follow(response) {
+  $('log').insertAdjacentHTML('beforeend', '<div class="msg tail" id="reply"><div class="who">assistant</div></div>');
   $('log').scrollTop = $('log').scrollHeight;
   setStatus('Waiting for the model…');
   let error = null;
   try {
-    // the turn comes as JSON lines: {"thinking"} or {"text"} for each piece of a reply, {"tool"} for each
-    // call and {"result"} for its result, then {"ok"} or {"error"}
-    const r = await fetch(`/api/s/${current}/say`, { method: 'POST', headers: { 'x-connectome': '1' }, body: JSON.stringify({ text }) });
-    const reader = r.body.getReader(), decoder = new TextDecoder();
+    const reader = (await response).body.getReader(), decoder = new TextDecoder();
     let buffered = '';
     // the reply's parts in order: a run of reasoning or of text continues its part; each call is a card
     const part = (kind, html) => {
@@ -238,6 +312,7 @@ $('say').onsubmit = async (e) => {
       if (event.text) part('text', '<div></div>').textContent += event.text;
       if (event.tool) part('tool', `<details class="tool" open><summary>${escape(event.tool.name)}</summary><pre>${escape(JSON.stringify(event.tool.input))}</pre></details>`).id = `call-${event.tool.id}`;
       if (event.approve) $(`call-${event.approve}`).insertAdjacentHTML('beforeend', '<div class="ask"><button data-answer="allow">Allow</button><button data-answer="always">Always allow</button><button data-answer="deny">Deny</button></div>');
+      if (event.answered) $(`call-${event.answered}`).querySelector('.ask')?.remove();
       if (event.result) {
         const card = $(`call-${event.result.id}`);
         card.insertAdjacentHTML('beforeend', `<pre class="${event.result.error ? 'failed' : ''}">${escape(event.result.text)}</pre>`);
@@ -256,27 +331,35 @@ $('say').onsubmit = async (e) => {
       for (let i; (i = buffered.indexOf('\n')) >= 0; buffered = buffered.slice(i + 1)) take(buffered.slice(0, i));
     }
     take(buffered);
-  } catch (err) { error = err.message; }
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    error = err.message;
+  }
   await open(current);
   if (error) setStatus(error, true); else watch();
-};
-
-async function loadSettings() {
-  const s = await api('/api/settings');
-  $('base').value = s.base;
-  $('model').value = s.model;
-  $('key').value = '';
-  $('key').placeholder = s.key ? 'saved; type to replace' : 'needed to chat';
-  $('saved').textContent = s.key ? '' : 'Add the provider\'s API key to chat. DeepSeek: https://api.deepseek.com/anthropic, OpenRouter: https://openrouter.ai/api/v1';
 }
 
-$('settings').onsubmit = async (e) => {
+// the providers sessions choose from, each a base URL and a key the page never sees; a click on one edits it
+async function loadProviders() {
+  ({ providers } = await api('/api/settings'));
+  $('providers').innerHTML = providers.map((p) => `<div class="provider" data-provider="${escape(p.name)}"><b>${escape(p.name)}</b>${p.key ? '' : ' · no key'}<small>${escape(p.base)}</small></div>`).join('');
+  $('sprovider').innerHTML = providers.map((p) => `<option>${escape(p.name)}</option>`).join('');
+  if (state) fill();
+  $('saved').textContent = providers.some((p) => p.key) ? '' : 'Add a provider\'s API key to chat. DeepSeek: https://api.deepseek.com/anthropic, OpenRouter: https://openrouter.ai/api/v1';
+}
+
+$('providers').onclick = (e) => {
+  const p = providers.find((p) => p.name === e.target.closest('[data-provider]')?.dataset.provider);
+  if (p) [$('pname').value, $('base').value, $('key').value] = [p.name, p.base, ''];
+};
+
+$('provider').onsubmit = async (e) => {
   e.preventDefault();
   try {
-    await api('/api/settings', { base: $('base').value, model: $('model').value, key: $('key').value });
-    await loadSettings();
+    await api('/api/settings', { name: $('pname').value, base: $('base').value, key: $('key').value });
+    await loadProviders();
+    $('key').value = '';
     $('saved').textContent = 'Saved.';
-    if (current) open(current);
   } catch (err) { $('saved').textContent = err.message; }
 };
 
@@ -284,7 +367,11 @@ $('text').onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.prevent
 
 $('create').onsubmit = async (e) => {
   e.preventDefault();
-  try { await api('/api/sessions', { name: $('newname').value.trim() }); location.hash = $('newname').value.trim(); $('newname').value = ''; } catch (err) { alert(err.message); }
+  try {
+    await api('/api/sessions', { name: $('newname').value.trim(), workspace: $('newspace').value });
+    location.hash = $('newname').value.trim();
+    $('newname').value = $('newspace').value = '';
+  } catch (err) { alert(err.message); }
 };
 
 // While memories form, the page checks back for them.
@@ -299,7 +386,7 @@ function watch() {
 }
 
 window.onhashchange = () => location.hash.length > 1 && open(decodeURIComponent(location.hash.slice(1)));
-loadSettings();
+loadProviders();
 listSessions().then(() => window.onhashchange());
 </script>
 </body>

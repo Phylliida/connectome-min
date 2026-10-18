@@ -20,32 +20,60 @@ autobiographical compaction) and a web app around it.
 x86_64 and arm64), Windows (x86_64) and macOS (arm64 and x86_64). Locally, `cargo build --release`.
 
 ```sh
-./target/release/connectome-web        # opens http://127.0.0.1:8080; set the provider, model and key in the page
+./target/release/connectome-web        # opens http://127.0.0.1:8080; add a provider's key in the page
 ```
 
-Tools: the model can call `bash` (built in: a command in a new shell in `--workdir`, or `cmd` on
-Windows; `--no-bash` leaves it out) and the tools of the MCP servers in `ROOT/mcp.json` (or `--mcp FILE`),
-in the usual format:
+Settings are JSON files you can edit by hand, read again at each use:
+
+- `ROOT/settings.json` (only you can read it, since it holds the keys): `providers`, each a name
+  with a `base` URL and a `key`; `defaults`, what a new session starts with; and `sandbox`, what a
+  sandboxed command sees. `--base`, `--model`, `--window`, `--reserve`, `--system` and `API_KEY`
+  write the first one, for a provider named `default`, when there's none.
+- `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
+  `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its
+  `window`, `reserve` and `system` prompt, and the library's settings (`config`). A new session's
+  file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its parent's.
+  The page edits the main fields; `config.merge_threshold` can't change once memories have merged.
+
+Tools: the model can call `bash` (built in: a command in a new shell in the session's workspace, or
+`cmd` on Windows; `--no-bash` leaves it out) and the tools
+of the MCP servers in `ROOT/mcp.json` (or `--mcp FILE`), in the usual format:
 
 ```json
 {"mcpServers": {"NAME": {"command": "...", "args": ["..."], "env": {"KEY": "..."}}}}
 ```
 
+A session without a workspace still declares bash, but each call fails at once, without asking, with
+a note to set one: so a session whose history calls bash still declares it, as the Messages API
+requires, and the model's calls come back as calls (without the declaration, some providers return
+the model's own tool-call markup as text).
+
+In a session's sandbox (Linux's bubblewrap, `bwrap`), a command sees its workspace, read-write, and
+of everything else only the paths `settings.json`'s `sandbox` lists that exist: `ro` read-only, `rw`
+read-write (a leading `~/` is the home directory); it has the network if `network`, and a PID
+namespace of its own, so a timeout still kills everything it started.
+
 Each call asks first: the page shows it with Allow, Always allow and Deny, and a denied call (or one
 left unanswered for ten minutes) gets an error result the model sees. Always allowed tools are kept in
-`settings.json`; the page's tool list toggles them. A call has `--tool-timeout` seconds (600 by default):
-bash kills a command still running then, with what it started, and an MCP call that runs out is cancelled
-without holding up the server's next call; a server that stops starts again at its next call. A turn takes
-steps, a model request each, until a reply calls no tools (at most 64), and the page shows each call as it
-runs. Tool sources compose as a monoid: a later source's tool shadows an earlier one of the same name.
-Every request carries the system prompt and the tool definitions, so their tokens come out of the window
-the context compiles to, and out of the usage that calibrates prices. Memory requests declare the same
-tools with tool choice "none", as the library does, so a memory can cover tool calls.
+the session's settings; the page's tool list toggles them. A call has `--tool-timeout` seconds (600 by
+default): bash kills a command still running then, with what it started, and an MCP call that runs out
+is cancelled without holding up the server's next call; a server that stops starts again at its next
+call. A turn takes steps, a model request each, until a reply calls no tools (at most 64), and the page
+shows each call as it runs. A page opened while a turn runs (after a reload, or on another device)
+follows it: the turn so far, then the rest as it happens, its calls waiting to be allowed included;
+the turn runs on whether any page follows it or not. The page's Continue button runs a turn without a message: after an
+interruption (a failed request, the 64 steps, a restart) the model goes on from the log as it is, and
+after a reply cut short it goes on from that reply (the request ends with it, as a prefill). Tool sources compose as a monoid: a later source's tool shadows an earlier
+one of the same name. Every request carries the system prompt and the tool definitions, so their
+tokens come out of the window the context compiles to, and out of the usage that calibrates prices;
+while calibration catches up with a request bigger than its estimate, the next context compiles that
+much smaller. Memory requests declare the same tools with tool choice "none", as the library does, so
+a memory can cover tool calls.
 
-Flags: `--root DIR` (sessions, and `settings.json`, which holds the key), `--addr`, `--window TOKENS`
-(the context budget), `--reserve TOKENS` (the reply's), `--system TEXT`, `--ca PEM` (root certificates
-to trust instead of Mozilla's), `--mcp FILE`, `--workdir DIR`, `--tool-timeout SECONDS`, `--no-bash`, `--no-open`; `--base`, `--model` and `API_KEY` give the settings until the
-page saves its own. The server answers only its own page: requests must name it as their Host, and
+Flags: `--root DIR` (sessions and settings), `--addr`, `--ca PEM` (root certificates to trust instead
+of Mozilla's), `--mcp FILE`, `--tool-timeout SECONDS`, `--no-bash`, `--no-open`, and the first
+settings' `--base`, `--model`, `--window TOKENS` (the context budget), `--reserve TOKENS` (the reply's)
+and `--system TEXT`. The server answers only its own page: requests must name it as their Host, and
 POSTs must carry its `x-connectome` header.
 
 Tests:
@@ -53,5 +81,8 @@ Tests:
 ```sh
 cargo test                  # unit tests of the JavaScript and Python arithmetic the ports share
 python3 tests/test_rust.py  # every compile, request and file record the same as reimplclean2's, handoffs both ways, the planner
-python3 tests/test_app.py   # the app against a mock API over HTTPS: chat, memories, forks, settings, certificates, bash, approvals, timeouts and tools through fake MCP servers, flat memory
+python3 tests/test_app.py   # the app against mock APIs over HTTPS, its parts at once: chat, memories, forks, settings, certificates, bash, its sandbox, approvals, timeouts and tools through fake MCP servers, flat memory
+python3 tests/mutants.py tests/test_app.py app/src/main.rs=mutants.json   # mutation testing, each mutant in a copy of its own, many at once
 ```
+
+The three take under 20 seconds together; a batch of mutants takes about as long as one.

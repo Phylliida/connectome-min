@@ -53,7 +53,7 @@ impl Server {
             for t in page["tools"].arr() {
                 let (server, name) = (self.clone(), t["name"].as_str().unwrap_or("").to_string());
                 let definition = obj! {"name" => name.as_str(), "description" => t["description"].clone(), "input_schema" => t["inputSchema"].clone()};
-                tools.push(Arc::new(Tool { definition, run: Box::new(move |input| server.call(&name, input)) }));
+                tools.push(Arc::new(Tool { definition, asks: true, run: Box::new(move |input| server.call(&name, input)) }));
             }
             cursor = Some(page["nextCursor"].clone()).filter(|c| !c.is_null());
         }

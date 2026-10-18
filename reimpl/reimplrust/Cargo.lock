@@ -46,6 +46,8 @@ dependencies = [
  "connectome",
  "libc",
  "open",
+ "serde",
+ "serde_json",
  "ureq",
 ]
 

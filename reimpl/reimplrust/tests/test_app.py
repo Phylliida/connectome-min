@@ -8,16 +8,26 @@ any request the API would (a body not sent in chunks, roles that don't alternate
 with the user, empty content or blank text, more than four cache breakpoints) and answers chat turns
 and memory requests. Checked: every chat turn gets its reply; memories form and the context comes
 to show them; the context stays within the window; the fork shares its parent's messages through the
-fork point; a key saved from the page reaches the API but never the page, in a file only its user
-can read; another site's page can't change the settings; a server whose certificate names another
+fork point, and its settings are its parent's; a provider saved from the page, and a model a session
+picks, reach the API, the key never the page or a session's file, in a file only its user can read;
+a session's settings refuse a provider there isn't, a workspace that isn't a directory and a new
+merge_threshold once memories have merged; a session that calls bash after losing its workspace
+gets a failed call, the request still declaring bash; a turn continues without a message, a reply
+cut short going on from its text and a turn whose request failed answering the message it had;
+another site's page can't change the settings; a server whose certificate names another
 host gets nothing; the model's tool calls, through MCP servers, get their results and form
 memories; and the app's peak memory doesn't grow with the contexts it streams.
+
+The three parts (the chat, the tool calls, the large contexts) run at once, in processes of their
+own, each with its own mock; the first to fail stops the rest.
 
     python3 tests/test_app.py [turns]
 """
 import datetime
 import json
+import multiprocessing
 import os
+import signal
 import ssl
 import shutil
 import socket
@@ -34,7 +44,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
-seen = {'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None}
+seen = {'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None}
 
 
 class Mock(BaseHTTPRequestHandler):
@@ -53,20 +63,32 @@ class Mock(BaseHTTPRequestHandler):
         self.rfile.readline()
         seen['bytes'] += len(body)
         seen['key'] = self.headers.get('x-api-key')
+        seen['model'] = json.loads(body).get('model')
         seen['largest'] = max(seen['largest'], len(body))
         request = json.loads(body)
         if problem := invalid(request):
             return self.problem(problem)
+        seen['prefills'] += request['messages'][-1]['role'] == 'assistant'
         if request.get('stream') is not True:
             return self.problem('the request did not ask for a stream')
-        if seen['limit'] and not request.get('tool_choice') and len(body) // 4 + request['max_tokens'] > seen['limit']:   # tokens as usage reports them
-            return self.problem(f'prompt is too long: {len(body) // 4} tokens and {request["max_tokens"]} to answer in a window of {seen["limit"]}')
+        prompt = tokens(body, request)
+        if seen['limit'] and not request.get('tool_choice') and prompt + request['max_tokens'] > seen['limit']:
+            return self.problem(f'prompt is too long: {prompt} tokens and {request["max_tokens"]} to answer in a window of {seen["limit"]}')
         messages = request['messages']
         last = ' '.join(b.get('text', '') for b in messages[-1]['content'])
         results = [b for b in messages[-1]['content'] if b['type'] == 'tool_result']
         asked = next(' '.join(b.get('text', '') for b in m['content']) for m in reversed(messages) if m['role'] == 'user' and any(b['type'] == 'text' for b in m['content']))
         stop = 'end_turn'
-        if 'memory' in last and ('Write the memory' in last or 'consolidate' in last):
+        if messages[-1]['role'] == 'assistant':                    # a reply cut short, which this one goes on from
+            seen['chat'] += 1
+            blocks = [{'type': 'text', 'text': ' and so the story ends.'}]
+        elif 'fail once' in last and last not in seen['failed']:
+            seen['failed'].append(last)
+            return self.answer(529, {'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'Overloaded'}})
+        elif 'a long story' in last:
+            seen['chat'] += 1
+            blocks, stop = [{'type': 'text', 'text': 'Once upon a time'}], 'max_tokens'
+        elif 'memory' in last and ('Write the memory' in last or 'consolidate' in last):
             if request.get('tools') and request.get('tool_choice') != {'type': 'none'}:
                 return self.problem(f'a memory request may call tools: tool_choice {request.get("tool_choice")}')
             seen['memory'] += 1
@@ -86,7 +108,7 @@ class Mock(BaseHTTPRequestHandler):
                 seen['results'].append(results)
             blocks = [{'type': 'thinking', 'thinking': 'Let me think about it.', 'signature': 'c2ln'}] * (seen['chat'] % 4 == 0) \
                 + [{'type': 'text', 'text': f'Reply {seen["chat"]}: ' + ' '.join(['words'] * 80)}]
-        self.stream(blocks, len(body) // 4, 0.25 if 'slowly' in last else 0, stop)
+        self.stream(blocks, prompt, 0.25 if 'slowly' in last else 0, stop)
 
     def stream(self, blocks, input_tokens, pause, stop):
         """The reply as server-sent events, its text in five pieces `pause` seconds apart and a tool
@@ -142,11 +164,18 @@ class Mock(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def tokens(body, request) -> int:
+    """A request's prompt tokens, as its usage reports them: a quarter of its bytes, but 1600 for each
+    image, as a screenshot costs (the tool's pictures are a few bytes)."""
+    images = [c for m in request['messages'] for b in m['content'] for c in [b, *(b['content'] if isinstance(b.get('content'), list) else [])] if c['type'] == 'image']
+    return (len(body) - sum(len(c['source']['data']) for c in images)) // 4 + 1600 * len(images)
+
+
 def invalid(request) -> str | None:
     """Why the Messages API would reject the request, if it would."""
     messages = request.get('messages') or []
     roles = [m['role'] for m in messages]
-    if not messages or roles[0] != 'user' or roles[-1] != 'user' or any(a == b for a, b in zip(roles, roles[1:])):
+    if not messages or roles[0] != 'user' or any(a == b for a, b in zip(roles, roles[1:])):   # one that ends with the assistant goes on from it
         return f'roles {roles}'
     blocks = [b for m in messages for b in m['content']]
     if any(not m['content'] for m in messages) or any(b['type'] == 'text' and not b['text'].strip() for b in blocks):
@@ -218,9 +247,10 @@ def call(port, path, body=None):
 
 
 def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
-    """A chat turn as the page has it: the reply's text and reasoning, and when each piece of text
-    arrived. A call that asks to run gets the answer `answers` has for its tool, else allow."""
-    request = urllib.request.Request(f'http://127.0.0.1:{port}/api/s/{name}/say', data=json.dumps({'text': text}).encode(), headers={'x-connectome': '1'})
+    """A chat turn as the page has it, or without text one that continues the log: the reply's text and
+    reasoning, and when each piece of text arrived. A call that asks to run gets the answer `answers`
+    has for its tool, else allow."""
+    request = urllib.request.Request(f'http://127.0.0.1:{port}/api/s/{name}/{"continue" if text is None else "say"}', data=json.dumps({'text': text}).encode(), headers={'x-connectome': '1'})
     pieces, thoughts, times, last, tools = [], [], [], {}, {}
     with urllib.request.urlopen(request, timeout=60) as r:
         for line in r:
@@ -237,7 +267,7 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
                 call(port, '/api/approve', {'id': last['approve'], 'answer': (answers or {}).get(tools[last['approve']], 'allow')})
             thoughts.append(last.get('thinking', ''))
     if not last.get('ok'):
-        raise SystemExit(f'{name}: "{text[:40]}" got {last}')
+        raise SystemExit(f'{name}: "{(text or "(continue)")[:40]}" got {last}')
     return ''.join(pieces), ''.join(thoughts), times
 
 
@@ -266,11 +296,12 @@ def chat(port, name, turns, start, window=WINDOW):
     return state
 
 
-def streamed_large(mock_port, ca) -> str:
+def streamed_large(tls, ca) -> str:
     """A session of large messages in a huge window, each context streaming all of them: from the
     second turn to the last the contexts grow sixfold, and the app's peak memory may grow by less
     than three messages."""
-    port, root, size = free_port(), tempfile.mkdtemp(), 900_000
+    port, root, size, mock_port = free_port(), tempfile.mkdtemp(), 900_000, free_port()
+    mock = serve(mock_port, tls)
     app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--base', f'https://localhost:{mock_port}', '--ca', ca,
                             '--model', 'mock', '--window', '20000000', '--reserve', '1000', '--no-open'], stderr=subprocess.PIPE, text=True)
     try:
@@ -290,29 +321,33 @@ def streamed_large(mock_port, ca) -> str:
         if peaks[-1] - peaks[1] > 3 * size // 1024:
             raise SystemExit(f'peak memory grew from {peaks[1]} KB to {peaks[-1]} KB as contexts grew from {contexts[1]} KB to {contexts[-1]} KB')
         return f'contexts of {contexts[1]} KB to {contexts[-1]} KB streamed at peaks of {peaks[1]} KB to {peaks[-1]} KB'
-
     finally:
         app.terminate()
-        shutil.rmtree(root)
+        mock.shutdown()
 
 
-def tooled(mock_port, ca, multiplier) -> str:
-    """A session whose model calls bash and the tools of two MCP servers (fake_mcp.py, the second, whose
-    tools are wordy, shadowing the first's add), and of none: each call runs once the user allows it, or
-    always allows its tool, and fails if they deny it, the tools always allowed kept across a restart; a
-    command past its timeout is killed with the processes it started, and it or an MCP call past its
-    timeout fails without holding up the next call; a server that stops starts again. Every call gets its result,
+def tooled(tls, ca, baseline) -> str:
+    """A session whose model calls bash in its workspace and the tools of two MCP servers (fake_mcp.py,
+    the second, whose tools are wordy, shadowing the first's add), and of none; a session without a
+    workspace has no bash. Each call runs once the user allows it, or always allows its tool for the
+    session, and fails if they deny it, the tools always allowed kept across a restart; a command past
+    its timeout is killed with the processes it started, and it or an MCP call past its timeout fails
+    without holding up the next call; a server that stops starts again. In the sandbox, bash sees its
+    workspace, read-write, and the paths settings.json names, as an edit by hand leaves them, and a
+    timeout still kills all it started. A page that comes in while a turn waits for an answer gets
+    the turn so far, then the rest as it happens, the same as the page that started it, and answers. Every call gets its result,
     in the log and on the page; the requests fit the window with the tool definitions counted, which
-    leave the price multiplier near `multiplier`, a session's without them; once a turn never stops
+    leave the price multiplier near a session's without them (from `baseline`); once a turn never stops
     calling tools; and memories of the calls form with the tools declared but not callable."""
-    port, root, work, fake, window = free_port(), tempfile.mkdtemp(), tempfile.mkdtemp(), str(HERE / 'fake_mcp.py'), 12000
+    port, root, work, fake, window, mock_port = free_port(), tempfile.mkdtemp(), tempfile.mkdtemp(), str(HERE / 'fake_mcp.py'), 12000, free_port()
+    mock = serve(mock_port, tls)
     servers = {'first': {'command': sys.executable, 'args': [fake]}, 'second': {'command': sys.executable, 'args': [fake, '--shadow', '--wordy']},
                'broken': {'command': '/nonexistent/server'}}
     Path(root, 'mcp.json').write_text(json.dumps({'mcpServers': servers}))
 
     def start():
         app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--base', f'https://localhost:{mock_port}', '--ca', ca, '--model', 'mock',
-                                '--window', str(window), '--reserve', '1000', '--workdir', work, '--tool-timeout', '2', '--no-open'], stderr=subprocess.PIPE, text=True)
+                                '--window', str(window), '--reserve', '1000', '--tool-timeout', '1', '--no-open'], stderr=subprocess.PIPE, text=True)
         for _ in range(100):
             try:
                 call(port, '/api/sessions')
@@ -331,7 +366,11 @@ def tooled(mock_port, ca, multiplier) -> str:
             raise SystemExit(f'"{text}" asked to run {seen["asked"][before:]}, not {asked}')
         return {r['tool_use_id'].split('-')[1]: r for r in seen['results'][-1]}
     try:
-        call(port, '/api/sessions', {'name': 'tools'})
+        call(port, '/api/sessions', {'name': 'tools', 'workspace': work})
+        if (names := [t['name'] for t in call(port, '/api/sessions', {'name': 'bare'})['tools']]) != ['fail', 'picture', 'hang', 'die', 'add']:
+            raise SystemExit(f'a session without a workspace has tools {names}')
+        if (spaces := {s['name']: s['workspace'] for s in call(port, '/api/sessions')}) != {'tools': work, 'bare': None}:
+            raise SystemExit(f'the sessions\' workspaces: {spaces}')
         state = call(port, '/api/s/tools')
         if (names := [t['name'] for t in state['tools']]) != ['bash', 'fail', 'picture', 'hang', 'die', 'add'] or state['overhead'] < 2000:
             raise SystemExit(f'tools {names} ({state["overhead"]} tokens): expected bash, the first server\'s but its add, then the second\'s wordy add')
@@ -343,9 +382,9 @@ def tooled(mock_port, ca, multiplier) -> str:
             raise SystemExit(f'tool results: {got}')
         if [e.get('tool', e.get('result'))['id'][-1] for e in seen['events']] != ['0', '0', '1', '1', '2', '2', '3', '3']:
             raise SystemExit(f'the page got {seen["events"]}')
-        allowed = json.loads(Path(root, 'settings.json').read_text())['allow']
-        if allowed != ['picture'] or [t['name'] for t in call(port, '/api/s/tools')['tools'] if t['allowed']] != ['picture']:
-            raise SystemExit(f'always allowed: {allowed}')
+        allowed = json.loads(Path(root, 'tools', 'session_settings.json').read_text())['allow']
+        if allowed != ['picture'] or [t['name'] for t in call(port, '/api/s/tools')['tools'] if t['allowed']] != ['picture'] or any(t['allowed'] for t in call(port, '/api/s/bare')['tools']):
+            raise SystemExit(f'always allowed: {allowed}, in the session only')
         notes = ' '.join(m['text'] for m in call(port, '/api/s/tools/messages'))
         if '[tool call add {"a":2,"b":3}]' not in notes or "[tool result, failed] the user didn't allow this call" not in notes:
             raise SystemExit(f'the log shows {notes[:400]}')
@@ -353,18 +392,62 @@ def tooled(mock_port, ca, multiplier) -> str:
         if got['0']['content'] != f'{work}\nout\nerr\n\n[exit code 3]' or got['0'].get('is_error'):
             raise SystemExit(f'bash: {got}')
         started = time.monotonic()
-        got = results('call [["bash", {"command": "(sleep 1.5; touch survived) & sleep 5; echo never", "timeout": 1}]]', asked=[])
-        if got['0']['content'] != '\n[killed after 1 s]' or not got['0'].get('is_error') or time.monotonic() - started > 4:
+        got = results('call [["bash", {"command": "(sleep 0.8; touch survived) & sleep 5; echo never", "timeout": 0.4}]]', asked=[])
+        if got['0']['content'] != '\n[killed after 0.4 s]' or not got['0'].get('is_error') or time.monotonic() - started > 4:
             raise SystemExit(f'bash past its timeout: {got} after {time.monotonic() - started:.1f} s')
-        time.sleep(max(0.0, started + 2.5 - time.monotonic()))
+        time.sleep(max(0.0, started + 1.4 - time.monotonic()))
         if Path(work, 'survived').exists():
             raise SystemExit('a process that a command past its timeout started outlived it')
+        shared, shown, secret = Path(root, 'shared'), Path(root, 'shown'), Path(root, 'secret')
+        shared.mkdir()
+        shown.mkdir()
+        Path(shown, 'seen').write_text('seen\n')
+        secret.write_text('hidden')
+        everything = json.loads(Path(root, 'settings.json').read_text())
+        everything['sandbox'].update(ro=everything['sandbox']['ro'] + [str(shown)], rw=[str(shared)], network=False)   # the rest of /tmp, where root is, out of sight
+        Path(root, 'settings.json').write_text(json.dumps(everything))
+        call(port, '/api/s/tools/settings', {'sandbox': True})
+        command = f'pwd; echo made > inside; cat inside; echo noted > {shared}/note; cat {secret} 2>&1; cat {shown}/seen; touch {shown}/x 2>&1; echo $$; tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d " "'
+        got = results('call ' + json.dumps([['bash', {'command': command}]]), asked=[])
+        sandboxed = f"{work}\nmade\ncat: {secret}: No such file or directory\nseen\ntouch: cannot touch '{shown}/x': Read-only file system\n2\nlo\n\n[exit code 0]"
+        if got['0']['content'] != sandboxed or Path(work, 'inside').read_text() != 'made\n' or Path(shared, 'note').read_text() != 'noted\n':
+            raise SystemExit(f'bash in the sandbox: {got}')
+        started = time.monotonic()
+        got = results('call ' + json.dumps([['bash', {'command': '(sleep 0.8; touch survived) & sleep 5', 'timeout': 0.4}]]), asked=[])
+        time.sleep(max(0.0, started + 1.4 - time.monotonic()))
+        if got['0']['content'] != '\n[killed after 0.4 s]' or Path(work, 'survived').exists():
+            raise SystemExit(f'a sandboxed command past its timeout: {got}, or what it started outlived it')
+        call(port, '/api/s/tools/settings', {'sandbox': False})
         got = results('call [["hang", {}], ["picture", {}]]', asked=['hang'])
-        if got['0']['content'] != 'MCP server first: tools/call timed out after 2 s' or got['1'].get('is_error'):
+        if got['0']['content'] != 'MCP server first: tools/call timed out after 1 s' or got['1'].get('is_error'):
             raise SystemExit(f'a call past its timeout, then another of the same server: {got}')
         got = results('call [["die", {}], ["picture", {}]]', asked=['die'])
         if got['0']['content'] != 'MCP server first: the server stopped' or got['1'].get('is_error'):
             raise SystemExit(f'a server that stops, then a call that starts it again: {got}')
+        first, asking = [], 'call ' + json.dumps([['add', {'a': 1, 'b': 2}]])
+
+        def started():
+            request = urllib.request.Request(f'http://127.0.0.1:{port}/api/s/tools/say', data=json.dumps({'text': asking}).encode(), headers={'x-connectome': '1'})
+            with urllib.request.urlopen(request, timeout=60) as r:
+                first.extend(json.loads(line) for line in r)
+        starter = threading.Thread(target=started)
+        starter.start()
+        for _ in range(500):                                            # the turn waits for an answer, so it runs until one comes
+            if call(port, '/api/s/tools')['running'] is not None:
+                break
+            time.sleep(0.02)
+        else:
+            raise SystemExit('a turn waiting for an answer did not show as running')
+        late = []
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/s/tools/live', timeout=15) as r:
+            for line in r:
+                late.append(json.loads(line))
+                if 'approve' in late[-1]:
+                    call(port, '/api/approve', {'id': late[-1]['approve'], 'answer': 'allow'})
+        starter.join()
+        kinds = [next(iter(e)) for e in late if 'text' not in e and 'thinking' not in e]
+        if late != first or kinds != ['tool', 'approve', 'answered', 'result', 'ok'] or call(port, '/api/s/tools')['running'] is not None:
+            raise SystemExit(f'a page that came in during the turn got {kinds}; the page that started it {len(first)} events, it {len(late)}')
         try:
             say(port, 'tools', 'use tools forever', {'add': 'always'})
             raise SystemExit('a turn that never stops calling tools ended')
@@ -380,9 +463,9 @@ def tooled(mock_port, ca, multiplier) -> str:
             raise SystemExit(f'the API would reject a request: {seen["problems"][0]}')
         if not seen['tool memories']:
             raise SystemExit('no memory request carried tool calls')
-        if state['multiplier'] > multiplier + 0.1:
+        if state['multiplier'] > (multiplier := baseline.get(timeout=120)) + 0.1:
             raise SystemExit(f'the tool definitions skewed the price multiplier: {state["multiplier"]:.3f}, without them {multiplier:.3f}')
-        call(port, '/api/settings', {'allow': ['bash']})
+        call(port, '/api/s/tools/settings', {'allow': ['bash']})
         app.terminate()
         app.wait()
         app = start()
@@ -390,21 +473,14 @@ def tooled(mock_port, ca, multiplier) -> str:
             raise SystemExit(f'after a restart the tools always allowed are {allowed}, not bash, as the page set them')
         return f'{len(seen["results"])} tool steps, {len(seen["asked"])} calls asked to run, {seen["tool memories"]} memory requests with tool calls, {state["messages"]} messages, multiplier {state["multiplier"]:.3f}'
     finally:
-        seen['limit'] = None
         app.terminate()
-        shutil.rmtree(root)
-        shutil.rmtree(work)
+        mock.shutdown()
 
 
-def main(turns=60):
-    turns = int(turns)
-    build = subprocess.run(['cargo', 'build', '--release', '--quiet', '-p', 'connectome-web'], cwd=HERE.parent, capture_output=True, text=True)
-    if build.returncode and not os.environ.get('CONNECTOME_WEB'):
-        print(build.stderr)
-        return 1
-    mock_port, plain_port, port, root, keys = free_port(), free_port(), free_port(), tempfile.mkdtemp(), tempfile.mkdtemp()
-    ca, cert, key = certificates(keys)
-    mock, plain = serve(mock_port, (cert, key)), serve(plain_port)
+def chatted(turns, tls, ca, baseline) -> str:
+    """The long chat, the fork and the settings; the main session's price multiplier goes to `baseline`."""
+    mock_port, plain_port, port, root = free_port(), free_port(), free_port(), tempfile.mkdtemp()
+    mock, plain = serve(mock_port, tls), serve(plain_port)
     app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--base', f'https://localhost:{mock_port}', '--ca', ca,
                             '--model', 'mock', '--window', str(WINDOW), '--reserve', '1000', '--no-open'], stderr=subprocess.PIPE, text=True)
     try:
@@ -418,6 +494,7 @@ def main(turns=60):
         state = chat(port, 'main', turns, 0)
         if abs(state['multiplier'] - 1) < 0.01:
             raise SystemExit(f'the price multiplier ({state["multiplier"]}) never calibrated to the prompt sizes the API reports')
+        baseline.put(state['multiplier'])
         if seen['problems']:
             raise SystemExit(f'the API would reject a request: {seen["problems"][0]}')
         if not seen['thought']:
@@ -425,10 +502,13 @@ def main(turns=60):
         levels = {level for level, _ in state['frontier'] or []}
         if len(state['layers']) < 3 or not levels - {0}:
             raise SystemExit(f'memories did not form or show: layers {state["layers"]}, frontier {state["frontier"]}')
+        call(port, '/api/s/main/settings', {'system': 'You are being tested.'})
         call(port, '/api/s/main/fork', {'at': 20, 'name': 'branch'})
         parent, fork = call(port, '/api/s/main/messages?from=0&to=21'), call(port, '/api/s/branch/messages?from=0')
         if fork != parent:
             raise SystemExit('the fork does not share its parent\'s messages')
+        if call(port, '/api/s/branch')['settings'] != call(port, '/api/s/main')['settings']:
+            raise SystemExit('the fork\'s settings are not its parent\'s')
         forked = chat(port, 'branch', turns // 3, turns)
         if seen['problems']:
             raise SystemExit(f'the API would reject a request: {seen["problems"][0]}')
@@ -440,37 +520,126 @@ def main(turns=60):
             except urllib.error.HTTPError as error:
                 if error.code != 403:
                     raise
-        call(port, '/api/settings', {'key': 'k-123', 'model': 'mock-2', 'base': f'http://127.0.0.1:{plain_port}/v1'})   # a base with /v1, as OpenRouter's
+        call(port, '/api/settings', {'name': 'plain', 'key': 'k-123', 'base': f'http://127.0.0.1:{plain_port}/v1'})   # a base with /v1, as OpenRouter's
+        call(port, '/api/s/branch/settings', {'provider': 'plain', 'model': 'mock-2'})
         say(port, 'branch', 'with the saved key, over plain HTTP')
         settle(port, 'branch')
-        settings, mode = call(port, '/api/settings'), os.stat(os.path.join(root, 'settings.json')).st_mode & 0o777
-        if seen['key'] != 'k-123' or settings != {'base': f'http://127.0.0.1:{plain_port}/v1', 'model': 'mock-2', 'key': True} or mode != 0o600:
-            raise SystemExit(f'settings: the API saw key {seen["key"]!r}, the page sees {settings}, settings.json has mode {mode:o}')
-        call(port, '/api/settings', {'base': f'https://127.0.0.1:{mock_port}'})
+        shown, mode = call(port, '/api/settings')['providers'], os.stat(os.path.join(root, 'settings.json')).st_mode & 0o777
+        listed = next((p for p in shown if p['name'] == 'plain'), None)
+        kept, own = Path(root, 'settings.json').read_text(), Path(root, 'branch', 'session_settings.json').read_text()
+        if (seen['key'], seen['model']) != ('k-123', 'mock-2') or listed != {'name': 'plain', 'base': f'http://127.0.0.1:{plain_port}/v1', 'key': True} \
+                or 'k-123' in json.dumps(shown) + own or 'k-123' not in kept or mode != 0o600:
+            raise SystemExit(f'settings: the API saw key {seen["key"]!r} and model {seen["model"]!r}, the page sees {shown}, settings.json has mode {mode:o}')
+        if not next(p for p in call(port, '/api/settings', {'name': 'plain', 'base': f'http://127.0.0.1:{plain_port}/v1', 'key': ' '})['providers'] if p['name'] == 'plain')['key']:
+            raise SystemExit('a provider saved without a key lost the one it had')
+        Path(root, 'old').mkdir()                                       # a session from before session settings
+        if call(port, '/api/s/old')['settings'] != json.loads(Path(root, 'settings.json').read_text())['defaults']:
+            raise SystemExit('a session without settings did not get the defaults')
+        for wrong in ({'provider': 'nowhere'}, {'workspace': '/nonexistent/dir'}, {'config': {'merge_threshold': 3}}):
+            try:
+                call(port, '/api/s/main/settings', wrong)
+                raise SystemExit(f'a session took the settings {wrong}')
+            except urllib.error.HTTPError as error:
+                if error.code != 400:
+                    raise
+        call(port, '/api/sessions', {'name': 'shell', 'workspace': tempfile.mkdtemp()})
+        say(port, 'shell', 'call ' + json.dumps([['bash', {'command': 'echo hi'}]]))
+        call(port, '/api/s/shell/settings', {'workspace': None})
+        asked = len(seen['asked'])
+        say(port, 'shell', 'call ' + json.dumps([['bash', {'command': 'echo again'}]]))
+        if 'no workspace' not in (lost := seen['results'][-1][0]).get('content', '') or not lost.get('is_error') or seen['problems'] or seen['asked'][asked:]:
+            raise SystemExit(f'bash after the workspace went: {lost}, asked {seen["asked"]}, problems {seen["problems"][:1]}')
+        call(port, '/api/sessions', {'name': 'story'})
+        try:
+            call(port, '/api/s/story/continue', {})
+            raise SystemExit('a session without messages continued')
+        except urllib.error.HTTPError as error:
+            if error.code != 400:
+                raise
+        say(port, 'story', 'tell me a long story')
+        say(port, 'story', None)                                        # the reply was cut short: it goes on
+        try:
+            say(port, 'story', 'fail once please')
+            raise SystemExit('a turn whose request failed went through')
+        except SystemExit as failed:
+            if 'Overloaded' not in str(failed):
+                raise
+        say(port, 'story', None)                                        # the request failed: the message gets its answer
+        told = [(m['participant'], m['text'][:16]) for m in call(port, '/api/s/story/messages')]
+        if told[:4] != [('user', 'tell me a long s'), ('assistant', 'Once upon a time'), ('assistant', ' and so the stor'), ('user', 'fail once please')] \
+                or told[4:] != [('assistant', told[4][1])] or not told[4][1].startswith('Reply') or seen['prefills'] != 1:
+            raise SystemExit(f'continuing: the log holds {told}, {seen["prefills"]} requests went on from a reply')
+        call(port, '/api/s/branch/settings', {'provider': 'default'})
+        call(port, '/api/settings', {'name': 'default', 'base': f'https://127.0.0.1:{mock_port}'})
         try:
             say(port, 'branch', 'to a name the certificate does not hold')
             raise SystemExit('the app talked to a server whose certificate names another host')
         except SystemExit as refused:
             if 'certificate' not in str(refused).lower():
                 raise
-        call(port, '/api/settings', {'base': f'https://localhost:{mock_port}'})
+        call(port, '/api/settings', {'name': 'default', 'base': f'https://localhost:{mock_port}'})
         settle(port, 'branch')
         _, _, times = say(port, 'branch', 'answer slowly please')
         if len(times) < 5 or times[-1] - times[0] < 0.75:
             raise SystemExit(f'the reply reached the page all at once: {len(times)} pieces over {times[-1] - times[0]:.2f} s')
-        peak = peak_kb(app.pid)
-        tooling = tooled(mock_port, ca, state['multiplier'])
-        large = streamed_large(mock_port, ca)
-        print(f'{seen["chat"]} chat turns and {seen["memory"]} memory requests; main: {state["messages"]} messages, layers {state["layers"]}, '
-              f'context {state["armed"]:.0f}/{WINDOW} tokens, multiplier {state["multiplier"]:.3f}; branch: {forked["messages"]} messages, layers {forked["layers"]}; '
-              f'{seen["bytes"] // 1024} KB of requests streamed (largest {seen["largest"] // 1024} KB), app peak memory {peak} KB; {tooling}; {large}')
-        return 0
+        return (f'main: {state["messages"]} messages, layers {state["layers"]}, context {state["armed"]:.0f}/{WINDOW} tokens, multiplier {state["multiplier"]:.3f}; '
+                f'branch: {forked["messages"]} messages, layers {forked["layers"]}; app peak memory {peak_kb(app.pid)} KB')
     finally:
         app.terminate()
         mock.shutdown()
         plain.shutdown()
-        shutil.rmtree(root)
-        shutil.rmtree(keys)
+
+
+def part(name, run, done):
+    """A part of the test in a process group of its own, which its apps and their servers join, so
+    that killing the group stops them all: (name, its summary or None, why it failed or None, counts)."""
+    os.setpgrp()
+    try:
+        done.put((name, run(), None, seen))
+    except SystemExit as failed:
+        done.put((name, None, str(failed), seen))
+    except Exception as e:
+        done.put((name, None, f'{type(e).__name__}: {e}', seen))
+
+
+def main(turns=60):
+    turns = int(turns)
+    if not os.environ.get('CONNECTOME_WEB'):
+        build = subprocess.run(['cargo', 'build', '--release', '--quiet', '-p', 'connectome-web'], cwd=HERE.parent, capture_output=True, text=True)
+        if build.returncode:
+            print(build.stderr)
+            return 1
+    tempfile.tempdir = tempfile.mkdtemp()   # every part's directories, removed at the end whatever happens
+    ca, cert, key = certificates(tempfile.mkdtemp())
+    forked = multiprocessing.get_context('fork')
+    done, baseline = forked.Queue(), forked.Queue()
+    parts = {'chat': lambda: chatted(turns, (cert, key), ca, baseline), 'tools': lambda: tooled((cert, key), ca, baseline), 'large': lambda: streamed_large((cert, key), ca)}
+    running = [forked.Process(target=part, args=(name, run, done)) for name, run in parts.items()]
+    summaries, totals, failure = {}, {'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0}, None
+    try:
+        for p in running:
+            p.start()
+        for _ in running:
+            name, summary, failed, counts = done.get(timeout=300)
+            if failed:
+                failure = f'{name}: {failed}'
+                break
+            summaries[name] = summary
+            totals = {k: max(v, counts[k]) if k == 'largest' else v + counts[k] for k, v in totals.items()}
+    finally:
+        for p in running:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):   # it ended, or never got its own group
+                p.kill()
+            p.join()
+        shutil.rmtree(tempfile.tempdir)
+    if failure:
+        print(failure)
+        return 1
+    print(f'{totals["chat"]} chat turns and {totals["memory"]} memory requests; {summaries["chat"]}; {totals["bytes"] // 1024} KB of requests streamed '
+          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}')
+    return 0
 
 
 if __name__ == '__main__':

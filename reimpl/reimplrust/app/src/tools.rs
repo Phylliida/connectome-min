@@ -1,5 +1,6 @@
 //! Tools the model can call, as plugins. A tool is its definition, as the Messages API takes it
-//! ({name, description, input_schema}), and a function from its input to its outcome: Ok(content), or
+//! ({name, description, input_schema}), whether a call waits for the user's yes, and a function from
+//! its input to its outcome: Ok(content), or
 //! Err(content) for a failure, the content being a tool result's (a string, or text and image blocks
 //! as the library logs them). A Toolbox is a monoid under `+`: the union of two, a tool on the right
 //! shadowing a same-named one on the left, with the empty toolbox as identity. So tool sources compose
@@ -16,6 +17,7 @@ pub type Outcome = Result<Value, Value>;
 
 pub struct Tool {
     pub definition: Value,
+    pub asks: bool,
     pub run: Box<dyn Fn(&Value) -> Outcome + Send + Sync>,
 }
 
@@ -64,7 +66,7 @@ mod tests {
 
     fn tool(name: &str, answer: &'static str) -> Toolbox {
         let definition = obj! {"name" => name, "description" => "", "input_schema" => obj! {"type" => "object"}};
-        Toolbox(vec![Arc::new(Tool { definition, run: Box::new(move |_| if answer == "panic" { panic!("boom") } else { Ok(answer.into()) }) })])
+        Toolbox(vec![Arc::new(Tool { definition, asks: true, run: Box::new(move |_| if answer == "panic" { panic!("boom") } else { Ok(answer.into()) }) })])
     }
 
     fn answers(tools: &Toolbox) -> Vec<String> {
