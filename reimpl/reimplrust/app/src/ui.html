@@ -368,9 +368,9 @@ function setStatus(text, warn) {
 const tokens = (n) => new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(n);
 
 function drawMemory() {
-  const s = state, used = s.armed || 0, { window = 0, model = '', allow = [], config = {} } = s.settings || {};
+  const s = state, used = s.prompt ?? s.armed ?? 0, { window = 0, model = '', allow = [], config = {} } = s.settings || {};
   $('stats').innerHTML = `
-    <div class="stat"><span>Last context</span><span>${Math.round(used).toLocaleString()} / ${window.toLocaleString()} tokens</span></div>
+    <div class="stat"><span>Last context</span><span title="${s.prompt == null ? 'The last compile\'s estimate' : 'The last request\'s prompt, as the provider counted it'}">${Math.round(used).toLocaleString()} / ${window.toLocaleString()} tokens${s.prompt == null ? ' (estimated)' : ''}</span></div>
     <div class="bar"><div style="width:${Math.min(100, 100 * used / window)}%"></div></div>
     <div class="stat"><span>Messages</span><span>${s.messages}</span></div>
     <div class="stat"><span>Chunks · memories</span><span>${s.layers[0] || 0} · ${s.layers.slice(1).join(' / ') || 0}</span></div>
@@ -470,8 +470,9 @@ async function follow(response) {
         thinking.lastElementChild.textContent += event.thinking;
         thinking.querySelector('.last').textContent = lastLine(thinking.lastElementChild.textContent);
       }
-      if (event.spent) {   // what the session's requests have used so far
+      if (event.spent) {   // what the session's requests have used so far, and the last reply's prompt
         state.spent = event.spent;
+        state.prompt = event.prompt ?? state.prompt;
         drawMemory();
       }
       if (event.calling) draw($('reply'), { type: 'calling', name: event.calling });

@@ -47,7 +47,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
-seen = {'costs': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None}
+seen = {'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None}
 
 
 class Mock(BaseHTTPRequestHandler):
@@ -297,6 +297,8 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
                 seen['events'].append(last)
             if 'spent' in last:
                 seen['costs'][name] = last['spent']
+            if 'prompt' in last:
+                seen['prompts'][name] = last['prompt']
             if 'calling' in last:
                 calls.append([last['calling'], ''])
             if 'input' in last:
@@ -342,6 +344,8 @@ def chat(port, name, turns, start, window=WINDOW):
         seen['thought'] += bool(thinking)
         if state['armed'] and state['armed'] > window * 1.02:
             raise SystemExit(f'turn {t}: a context of {state["armed"]} tokens in a window of {window}')
+        if state['prompt'] != seen['prompts'][name]:                         # the last reply's, though memories' requests come after it
+            raise SystemExit(f'turn {t}: the last prompt {state["prompt"]}, the last reply\'s {seen["prompts"][name]}')
     return state
 
 
@@ -435,7 +439,7 @@ def tooled(tls, ca, baseline) -> str:
         call(port, '/api/sessions', {'name': 'tools', 'workspace': work + '/'})   # kept without the slash
         if (names := call(port, '/api/sessions', {'name': 'bare'})['tools']) != ['fail', 'picture', 'hang', 'die', 'add']:
             raise SystemExit(f'a session without a workspace has tools {names}')
-        if call(port, '/api/s/bare')['spent'] is not None:
+        if call(port, '/api/s/bare')['spent'] is not None or call(port, '/api/s/bare')['prompt'] is not None:
             raise SystemExit('a session no request has priced has a cost')
         if (spaces := {s['name']: s['workspace'] for s in call(port, '/api/sessions')}) != {'tools': work, 'bare': None}:
             raise SystemExit(f'the sessions\' workspaces: {spaces}')
@@ -605,6 +609,8 @@ def chatted(turns, tls, ca, baseline) -> str:
         if {c['for'] for c in costs} != {'reply', 'memories'} or any(abs(sums[k] - state['spent'][k]) > 1e-9 for k in sums) or seen['costs']['main'] != state['spent'] \
                 or any(c['used']['input'] <= 0 or c['used']['cached'] <= 0 or c['used']['output'] <= 0 for c in costs) or state['spent'] != costs[-1]['total']:
             raise SystemExit(f'main used {state["spent"]}, its log {sums} in {len(costs)} records, the page last heard {seen["costs"].get("main")}')
+        if state['prompt'] != next(c['used']['input'] for c in reversed(costs) if c['for'] == 'reply') or state['prompt'] != seen['prompts']['main']:
+            raise SystemExit(f'main\'s last prompt {state["prompt"]}, the page last heard {seen["prompts"].get("main")}')
         if seen['problems']:
             raise SystemExit(f'the API would reject a request: {seen["problems"][0]}')
         if not seen['thought']:

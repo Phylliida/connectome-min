@@ -422,7 +422,8 @@ fn work(app: &App, name: &str, jobs: Receiver<Job>, tell: &dyn Fn(Msg)) {
 /// API continues (a prefill). The turn tells the hub (`tell`) what the pages following it see: the
 /// log's length each time it grows ({"logged"}), the pieces of a reply's reasoning and text
 /// ({"thinking"}, {"text"}), each call's tool as the reply starts it and its input as it comes
-/// ({"calling"}, {"input"}), what the session's requests have used after each ({"spent"}), the question whether each call may run ({"approve"}: its id; the answers
+/// ({"calling"}, {"input"}), what the session's requests have used after each ({"spent"}, and a reply's
+/// prompt as its provider counted it, {"prompt"}), the question whether each call may run ({"approve"}: its id; the answers
 /// come from the pages: {"answered": the id, "answer"}), and each call's result ({"result"}: the
 /// tool_result block, brief). Memories form between steps; the session's thread tells the turn's end
 /// ({"ok": true} once it has joined the log, or {"error"}), then forms the memories after it.
@@ -513,8 +514,14 @@ fn spend(s: &Session, setup: &Setup, what: &str, tell: &dyn Fn(Msg)) {
     if used.input + used.output > 0.0 {
         let total = spent(s).unwrap_or_default() + used;
         s.append("costs", obj! {"for" => what, "used" => used, "total" => total});
-        tell(Msg::Event(obj! {"spent" => total}));
+        tell(Msg::Event(sparse(obj! {"spent" => total, "prompt" => (what == "reply").then_some(used.input)})));
     }
+}
+
+/// The last reply's prompt in tokens, as its provider counted it: the newest reply's record in the
+/// session's costs log, a few from its end (rounds of memories come between); None before any.
+fn prompted(s: &Session) -> Option<f64> {
+    (0..s.count("costs")).rev().map(|i| s.read("costs", i)).find(|c| c["for"] == "reply").and_then(|c| c["used"]["input"].as_f64())
 }
 
 /// What the session's requests have used: its costs log's last running total; None before any.
@@ -655,8 +662,8 @@ fn parent(s: &Session) -> Value {
 
 /// What the page shows of a session: counts, each layer's size, the last compile, its settings as its
 /// file has them, the tools that ask before they run and the tokens every request carries (or the
-/// problem that keeps it from running), whether a job runs (a turn, then its memories forming), and
-/// what its requests have used.
+/// problem that keeps it from running), whether a job runs (a turn, then its memories forming), what
+/// its requests have used, and the last reply's prompt as its provider counted it.
 fn state(app: &App, name: &str, s: &Session) -> Value {
     let layers: Vec<Value> = (0..).map(|n| s.count(&format!("layer{n}"))).take_while(|&c| c > 0).map(Value::from).collect();
     let last = s.last("compiles").unwrap_or(obj! {});
@@ -665,7 +672,7 @@ fn state(app: &App, name: &str, s: &Session) -> Value {
     obj! {
         "messages" => s.count("messages"), "layers" => layers,
         "frontier" => last["frontier"].clone(), "armed" => last["armed"].clone(), "multiplier" => last["multiplier"].clone(), "refused" => refused,
-        "running" => running, "spent" => spent(s),
+        "running" => running, "spent" => spent(s), "prompt" => prompted(s),
         "settings" => profile(app, name).ok().map(|p| serde_json::to_value(p).expect("settings are JSON")),
         "tools" => setup.as_ref().map_or(vec![], |x| x.tools.asking()), "overhead" => setup.as_ref().map_or(0.0, |x| x.overhead),
         "problem" => setup.as_ref().err().map(String::as_str),
