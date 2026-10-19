@@ -2,8 +2,7 @@
 //! text-only prices, its image bytes, and its shape. Blocks are the library's JSON objects
 //! ({"type": "text", "text": ...}); lengths are JavaScript's (js.rs).
 
-use crate::js::{js_len, js_round, js_trim, json_len};
-use crate::json::{Json, Value};
+use crate::{js::{js_len, js_round, js_trim, json_len}, json::{Json, Value}};
 
 pub const PROSE: f64 = 2.9; // chars per token
 pub const DENSE: f64 = 2.3; // also prices all tool JSON

@@ -83,8 +83,9 @@ def python(r, folder: str, snapshot: str | None = None) -> tuple[list, dict]:
 def odd_turn(r, t) -> list[dict]:
     """Now and then, what generate.turn doesn't make: a call answered twice in one turn, a non-user turn
     mixing text and a tool result (the newest message, so it carries the cache mark when it splits), a
-    call that repeats its id, a user message of images that fill a 600-byte live limit exactly, a quiet
-    stretch, a long text whose density the first 2000 units decide, and reasoning with its text removed."""
+    call that repeats its id (answered at once, or a turn late, so its result moves up once), a user
+    message of images that fill a 600-byte live limit exactly, a quiet stretch, a long text whose density
+    the first 2000 units decide, and reasoning with its text removed."""
     text = {'type': 'text', 'text': 'odd é'}
     call = lambda tid, n=1: {'participant': 'assistant', 'content': [text] + [{'type': 'tool_use', 'id': tid, 'name': 'read', 'input': {}}] * n}
     result = lambda tid: {'type': 'tool_result', 'toolUseId': tid, 'content': 'ok'}
@@ -93,6 +94,8 @@ def odd_turn(r, t) -> list[dict]:
         out += [call(f'd{t}'), {'participant': 'user', 'content': [result(f'd{t}'), text, result(f'd{t}')]}]
     if r.random() < 0.04:
         out += [call(f'u{t}', 2), {'participant': 'user', 'content': [result(f'u{t}')]}]
+    if r.random() < 0.04:
+        out += [call(f'v{t}', 2), {'participant': 'Claude', 'content': [text]}, {'participant': 'user', 'content': [result(f'v{t}')]}]
     if r.random() < 0.04:
         out += [call(f'm{t}'), {'participant': r.choice(['assistant', 'Claude']), 'content': [text, result(f'm{t}'), text, result(f'x{t}')]}]
     if r.random() < 0.06:

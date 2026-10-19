@@ -4,10 +4,8 @@
 //! and replacing images past a byte cap. They move blocks by where they are and add blocks of their
 //! own; none reads content.
 
-use crate::blocks::{reasoning, shape, At, Block};
-use crate::json::{sparse, Value};
-use crate::obj;
-use crate::segment::budget;
+use crate::{blocks::{reasoning, shape, At, Block}, json::{sparse, Value}, obj, segment::budget};
+use itertools::Itertools;
 
 pub const LABEL: &str = "Context Manager";
 pub const STUB: &str = "[tool result unavailable — omitted during context compression]";
@@ -15,14 +13,10 @@ pub const DROPPED: &str = "[image dropped from live context]";
 pub const LOOKAHEAD: usize = 6; // entries searched for a displaced tool result
 
 /// A text block the plan makes.
-pub fn text(s: &str) -> Block {
-    shape(&obj! {"type" => "text", "text" => s}, None)
-}
+pub fn text(s: &str) -> Block { shape(&obj! {"type" => "text", "text" => s}, None) }
 
 /// A turn of the Context Manager's.
-pub fn say(s: &str) -> Turn {
-    Turn::new(LABEL, vec![text(s)], None)
-}
+pub fn say(s: &str) -> Turn { Turn::new(LABEL, vec![text(s)], None) }
 
 /// A turn of a plan: whose it is, its blocks, the message it came from, and whether a cache
 /// breakpoint follows it.
@@ -39,9 +33,7 @@ impl Turn {
         Turn { participant: participant.to_string(), content, source, mark: false }
     }
 
-    pub fn has(&self, kind: &str) -> bool {
-        self.content.iter().any(|b| b.kind == kind)
-    }
+    pub fn has(&self, kind: &str) -> bool { self.content.iter().any(|b| b.kind == kind) }
 
     /// As the library writes it: {participant, content, cacheBreakpoint?}, each block as `block` gives it.
     pub fn value(&self, block: impl FnMut(&Block) -> Value) -> Value {
@@ -75,11 +67,8 @@ pub fn collapse(turns: &[Turn]) -> Vec<Turn> {
 /// cache_control markers in the blocks go as they're read.)
 pub fn normalize(turns: Vec<Turn>) -> Vec<Turn> {
     let joined = pair_tools(collapse(&turns.iter().flat_map(|t| split(t, false)).collect::<Vec<_>>()));
-    joined
-        .into_iter()
-        .map(|t| Turn::new(&t.participant, t.content.into_iter().filter(|b| !b.blank).collect(), None))
-        .filter(|t| !t.content.is_empty())
-        .collect()
+    let unblank = |t: Turn| Turn::new(&t.participant, t.content.into_iter().filter(|b| !b.blank).collect(), None);
+    joined.into_iter().map(unblank).filter(|t| !t.content.is_empty()).collect()
 }
 
 /// enforceToolPairing: a tool_result must answer a tool_use in the entry just before it, once;
@@ -101,12 +90,7 @@ pub fn pair_tools(entries: Vec<Turn>) -> Vec<Turn> {
         } else {
             content.splice(0..0, results);
         }
-        uses.clear();
-        for b in content.iter().filter(|b| b.kind == "tool_use") {
-            if !uses.contains(&b.tool) {
-                uses.push(b.tool.clone());
-            }
-        }
+        uses = content.iter().filter(|b| b.kind == "tool_use").map(|b| b.tool.clone()).unique().collect();
         out.push(Turn { content, ..entry.clone() });
     }
     if !uses.is_empty() {
@@ -120,21 +104,13 @@ pub fn pair_tools(entries: Vec<Turn>) -> Vec<Turn> {
 /// library edits entries in place, but only up to the one it checks, so the entries after it are
 /// the input's.)
 fn take_result(entries: &[Turn], i: usize, use_id: &Option<String>) -> Block {
-    entries[i + 1..entries.len().min(i + 1 + LOOKAHEAD)]
-        .iter()
-        .flat_map(|later| &later.content)
-        .find(|b| b.kind == "tool_result" && b.tool == *use_id)
-        .cloned()
-        .unwrap_or_else(|| stub(use_id))
+    let mut later = entries[i + 1..entries.len().min(i + 1 + LOOKAHEAD)].iter().flat_map(|later| &later.content);
+    later.find(|b| b.kind == "tool_result" && b.tool == *use_id).cloned().unwrap_or_else(|| stub(use_id))
 }
 
-pub fn stub(use_id: &Option<String>) -> Block {
-    shape(&obj! {"type" => "tool_result", "toolUseId" => use_id.as_deref(), "content" => STUB}, None)
-}
+pub fn stub(use_id: &Option<String>) -> Block { shape(&obj! {"type" => "tool_result", "toolUseId" => use_id.as_deref(), "content" => STUB}, None) }
 
-pub fn strip_reasoning(content: &[Block]) -> Vec<Block> {
-    content.iter().filter(|b| !reasoning(&b.kind)).cloned().collect()
-}
+pub fn strip_reasoning(content: &[Block]) -> Vec<Block> { content.iter().filter(|b| !reasoning(&b.kind)).cloned().collect() }
 
 /// capCompressionImageBytes: newest turn first, images, a tool result's too, become placeholders
 /// once the bytes kept would pass `cap`; a cap of 0 keeps them all. A tool result keeps its place

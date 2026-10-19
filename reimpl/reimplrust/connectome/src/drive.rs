@@ -6,16 +6,8 @@
 //!      at that size if it plus the reserve fits the routed window (compile);
 //!   4. memories form until one makes a call or none is due (drive).
 
-use crate::chunking::close_chunks;
-use crate::config::Config;
-use crate::emit::{select, Refusal};
-use crate::estimate::Calibration;
-use crate::json::Value;
+use crate::{chunking::close_chunks, config::Config, emit::{select, Refusal}, estimate::Calibration, json::Value, memory::Host, obj, store::Session, turns::Turn};
 pub use crate::memory::drive;
-use crate::memory::Host;
-use crate::obj;
-use crate::store::Session;
-use crate::turns::Turn;
 
 /// The messages the log gained, the last step's usage (None without a new report), the compile and
 /// the memories. Returns the compiled turns, whose blocks an emit::Reader reads as they're written

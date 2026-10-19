@@ -14,20 +14,10 @@
 //! A Reader then reads each block's content as the caller writes the turns out, so the context is
 //! never in memory, only one record of it at a time.
 
-use crate::blocks::{reasoning, shape, At, Block};
-use crate::chunking::{close_chunks, live_price, open_start, priced, stripped_raw, tail_start};
-use crate::config::Config;
-use crate::estimate::Calibration;
-use crate::js::{digest, js_len, js_trim, py_round};
-use crate::json::{Json, Value};
-use crate::obj;
-use crate::planner::{chunks, plan, Node};
-use crate::segment::budget;
-use crate::store::Session;
-use crate::turns::{pair_tools, say, split, text, Turn, DROPPED};
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::ops::Range;
+use crate::{blocks::{reasoning, shape, At, Block}, chunking::{close_chunks, live_price, open_start, priced, stripped_raw, tail_start}, config::Config};
+use crate::{estimate::Calibration, js::{digest, js_len, js_trim, py_round}, json::{Json, Value}, obj, planner::{chunks, plan, Node}, segment::budget};
+use crate::{store::Session, turns::{pair_tools, say, split, text, Turn, DROPPED}};
+use std::{cell::RefCell, collections::HashMap, ops::Range};
 
 /// An OverBudgetError: the compile renders nothing and commits nothing.
 #[derive(Clone, Debug, PartialEq)]

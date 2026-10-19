@@ -3,7 +3,7 @@
 A port of `../reimplclean2` (a clean reimplementation of `@animalabs/context-manager` 0.10.1's
 autobiographical compaction) and a web app around it.
 
-- `connectome/`: the library, whose one dependency is serde_json. A session is append-only JSONL files on disk
+- `connectome/`: the library, over serde_json (with smart-default and itertools). A session is append-only JSONL files on disk
   (`store.rs`), in the same format the Python port writes, so either can carry on from the other's
   files. A compile plans the context from prices and block shapes only (`emit::select`), and an
   `emit::Reader` reads each block from disk as the caller writes the request, so neither a session nor
@@ -95,5 +95,5 @@ python3 tests/mutants.py tests/test_app.py app/src/main.rs=mutants.json   # muta
 ```
 
 The three take under 30 seconds together. A batch of mutants takes about as long as its slowest one
-(66 of them, under a minute): they build without link-time optimization, from a build kept in
+(68 of the app's, under a minute): they build without link-time optimization, from a build kept in
 `target/mutants`.

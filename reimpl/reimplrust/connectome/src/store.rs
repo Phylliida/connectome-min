@@ -17,15 +17,9 @@
 //! The session is the only writer of its files. A failed read or write of a file panics: the store
 //! is the session's memory, and nothing can go on without it.
 
-use crate::estimate::Priced;
-use crate::json::{self, Json, Value};
-use crate::obj;
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use crate::{estimate::Priced, json::{self, Json, Value}, obj};
+use std::{cell::RefCell, collections::{HashMap, HashSet}, fs::{self, File, OpenOptions}, path::{Path, PathBuf}, rc::Rc};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 pub struct Session {
     pub path: PathBuf,
@@ -68,13 +62,9 @@ impl Session {
         child
     }
 
-    fn shared(&self, name: &str) -> u64 {
-        self.fork["shared"][name].u64()
-    }
+    fn shared(&self, name: &str) -> u64 { self.fork["shared"][name].u64() }
 
-    fn file(&self, name: &str) -> PathBuf {
-        self.path.join(format!("{name}.jsonl"))
-    }
+    fn file(&self, name: &str) -> PathBuf { self.path.join(format!("{name}.jsonl")) }
 
     /// The newest record, or None.
     pub fn last(&self, name: &str) -> Option<Value> {
@@ -226,9 +216,7 @@ fn read_at(file: &mut File, start: u64, end: u64) -> Vec<u8> {
 fn repair(path: &Path) {
     let Ok(mut file) = OpenOptions::new().read(true).write(true).open(path) else { return };
     let size = file.metadata().expect("metadata").len();
-    if size == 0 {
-        return;
-    }
+    if size == 0 { return }
     let end = size - (read_at(&mut file, size - 1, size) == b"\n") as u64;
     let start = line_start(&mut file, end);
     if json::parse(&read_at(&mut file, start, end)).is_err() {

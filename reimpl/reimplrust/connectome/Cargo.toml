@@ -8,3 +8,4 @@ description = "Autobiographical context compaction (a port of reimplclean2): ses
 serde = { version = "1", features = ["derive"] }
 smart-default = "0.7.1"
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
+itertools = "0.15.0"

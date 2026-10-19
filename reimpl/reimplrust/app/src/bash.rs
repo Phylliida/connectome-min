@@ -8,16 +8,9 @@
 //! the paths the sandbox's settings name that exist, in its own PID namespace, which goes when bwrap is
 //! killed, so a timeout still takes everything the command started.
 
-use crate::settings::{expand, Sandbox};
-use crate::tools::{Outcome, Tool, Toolbox};
-use connectome::json::Value;
-use connectome::obj;
-use std::ffi::OsString;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use crate::{settings::{expand, Sandbox}, tools::{Outcome, Tool, Toolbox}};
+use connectome::{json::Value, obj};
+use std::{ffi::OsString, fs::File, io::{Read, Seek, SeekFrom}, path::{Path, PathBuf}, process::{Command, Stdio}, time::Duration};
 use wait_timeout::ChildExt;
 
 const KEPT: u64 = 12_000; // bytes of output kept from each end
@@ -101,9 +94,5 @@ fn read(path: &Path) -> String {
         let _ = file.seek(SeekFrom::Start(from)).and_then(|_| file.by_ref().take(len).read_to_end(&mut bytes));
         String::from_utf8_lossy(&bytes).into_owned()
     };
-    if size <= 2 * KEPT {
-        return part(0, size);
-    }
-    let (head, tail) = (part(0, KEPT), part(size - KEPT, KEPT));
-    format!("{head}\n[… {} bytes cut …]\n{tail}", size - 2 * KEPT)
+    if size <= 2 * KEPT { part(0, size) } else { format!("{}\n[… {} bytes cut …]\n{}", part(0, KEPT), size - 2 * KEPT, part(size - KEPT, KEPT)) }
 }

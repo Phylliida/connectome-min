@@ -4,11 +4,7 @@
 //! goes out in HTTP chunks, so a context streams from the session's files to the socket one block at a
 //! time; the reply streams back as server-sent events.
 
-use connectome::blocks::Block;
-use connectome::emit::Reader;
-use connectome::json::{self, sparse, Json, Value};
-use connectome::obj;
-use connectome::turns::Turn;
+use connectome::{blocks::Block, emit::Reader, json::{self, sparse, Json, Value}, obj, turns::Turn};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use ureq::tls::{PemItem, TlsConfig};
 
@@ -21,14 +17,11 @@ pub struct Llm {
 /// An HTTP client that trusts Mozilla's roots, or instead only the certificates in `ca` (PEM): a
 /// company proxy's, a test server's.
 pub fn agent(ca: Option<&[u8]>) -> Result<ureq::Agent, String> {
-    let mut tls = TlsConfig::builder();
-    if let Some(pem) = ca {
-        let certs: Vec<_> = ureq::tls::parse_pem(pem).filter_map(|item| match item { Ok(PemItem::Certificate(c)) => Some(c), _ => None }).collect();
-        if certs.is_empty() {
-            return Err("no certificates in the PEM".into());
-        }
-        tls = tls.root_certs(certs.into());
+    let certs = ca.map(|pem| ureq::tls::parse_pem(pem).filter_map(|item| match item { Ok(PemItem::Certificate(c)) => Some(c), _ => None }).collect::<Vec<_>>());
+    if certs.as_ref().is_some_and(Vec::is_empty) {
+        return Err("no certificates in the PEM".into());
     }
+    let tls = certs.map_or(TlsConfig::builder(), |certs| TlsConfig::builder().root_certs(certs.into()));
     // buffers of a request's chunks and the response's headers, below ureq's 128 KB each per connection
     let config = ureq::Agent::config_builder().http_status_as_error(false).input_buffer_size(64 * 1024).output_buffer_size(16 * 1024);
     Ok(config.tls_config(tls.build()).build().into())
@@ -49,9 +42,7 @@ impl Llm {
         let (body, out) = io::pipe().map_err(|e| e.to_string())?;
         let response = std::thread::scope(|scope| {
             let sent = scope.spawn(|| request.send(ureq::SendBody::from_owned_reader(body)));
-            let mut out = BufWriter::new(out);
-            let written = write_body(&mut out, &head, turns, reader).and_then(|()| out.flush());
-            drop(out);
+            let written = write_body(BufWriter::new(out), &head, turns, reader); // the pipe closes as it returns
             match (sent.join().expect("the sending thread"), written) {
                 (Err(e), _) => Err(format!("{url}: {e}")),
                 (_, Err(e)) => Err(format!("{url}: writing the request: {e}")),
@@ -65,10 +56,8 @@ impl Llm {
             return Err(format!("HTTP {status}: {}", text.chars().take(500).collect::<String>()));
         }
         // each event's data, until OpenRouter's [DONE] (it ends the stream as OpenAI's does, past message_stop)
-        let data = BufReader::new(body.into_reader()).lines().filter_map(|line| match line {
-            Ok(line) => Some(Ok(line.strip_prefix("data:")?.trim().to_string())),
-            Err(e) => Some(Err(e.to_string())),
-        });
+        let lines = BufReader::new(body.into_reader()).lines().map(|line| line.map_err(|e| e.to_string()));
+        let data = lines.filter_map(|line| line.map(|l| l.strip_prefix("data:").map(|d| d.trim().to_string())).transpose());
         let mut events = data.take_while(|d| d.as_deref() != Ok("[DONE]"));
         events.try_fold(Reply::default(), |reply, d| reply.event(&json::parse(d?.as_bytes())?, &mut piece)).and_then(Reply::done)
     }
@@ -157,7 +146,7 @@ fn to_api(mut b: Value, cache: bool) -> Value {
         "tool_use" => obj! {"type" => "tool_use", "id" => b["id"].take(), "name" => b["name"].take(), "input" => b["input"].take()},
         "tool_result" => {
             let content = match b["content"].take() {
-                Value::Array(blocks) => Value::Array(blocks.into_iter().filter(|c| SENT.contains(&c.kind())).map(|c| to_api(c, false)).collect()),
+                Value::Array(blocks) => blocks.into_iter().filter(|c| SENT.contains(&c.kind())).map(|c| to_api(c, false)).collect(),
                 content => content,
             };
             sparse(obj! {"type" => "tool_result", "tool_use_id" => b["toolUseId"].take(), "content" => content, "is_error" => b["isError"].take()})
@@ -181,7 +170,7 @@ const SENT: [&str; 4] = ["text", "tool_use", "tool_result", "image"];
 /// everyone else's (the user's, the Context Manager's) as the user; a role's consecutive turns join;
 /// blocks the request doesn't carry and blank text are left out, and a turn left empty goes. A turn's
 /// cache breakpoint marks its last block.
-fn write_body(out: &mut impl Write, head: &Value, turns: &[Turn], reader: &mut Reader) -> io::Result<()> {
+fn write_body(mut out: impl Write, head: &Value, turns: &[Turn], reader: &mut Reader) -> io::Result<()> {
     let sent = turns.iter().map(|t| (t, t.content.iter().filter(|b| SENT.contains(&b.kind.as_str()) && !b.blank).collect::<Vec<_>>()));
     let turns: Vec<(&Turn, Vec<&Block>)> = sent.filter(|(_, blocks)| !blocks.is_empty()).collect();
     let head = json::to_string(head);
@@ -192,9 +181,9 @@ fn write_body(out: &mut impl Write, head: &Value, turns: &[Turn], reader: &mut R
         let blocks = run.iter().flat_map(|(t, blocks)| blocks.iter().enumerate().map(move |(j, &b)| (b, t.mark && j + 1 == blocks.len())));
         for (j, (b, mark)) in blocks.enumerate() {
             out.write_all(if j > 0 { b"," } else { b"" })?;
-            json::write(&to_api(reader.load(b), mark), &mut *out)?;
+            json::write(&to_api(reader.load(b), mark), &mut out)?;
         }
         out.write_all(b"]}")?;
     }
-    out.write_all(b"]}")
+    out.write_all(b"]}").and_then(|()| out.flush())
 }

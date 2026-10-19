@@ -577,7 +577,8 @@ def chatted(turns, tls, ca, baseline) -> str:
         if len(state['layers']) < 3 or not levels - {0}:
             raise SystemExit(f'memories did not form or show: layers {state["layers"]}, frontier {state["frontier"]}')
         call(port, '/api/s/main/settings', {'system': 'You are being tested.'})
-        call(port, '/api/s/main/fork', {'at': 20, 'name': 'branch'})
+        if (made := call(port, '/api/s/main/fork', {'at': 20, 'name': 'branch'})).get('messages') != 21:   # the fork as the page then shows it
+            raise SystemExit(f'the fork answered {str(made)[:80]}, not its state with 21 messages')
         logged = lambda name, query: [{k: v for k, v in m.items() if k != 'shown'} for m in call(port, f'/api/s/{name}/messages?{query}')]   # how each context shows them aside
         parent, fork = logged('main', 'from=0&to=21'), logged('branch', 'from=0')
         if fork != parent:

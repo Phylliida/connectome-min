@@ -5,11 +5,7 @@
 //! tail. Images count only in the tail, newest first within the live limits; elsewhere a placeholder
 //! stands for each.
 
-use crate::config::Config;
-use crate::estimate::{price, store_tokens, Priced};
-use crate::obj;
-use crate::segment::{budget, runs};
-use crate::store::Session;
+use crate::{config::Config, estimate::{price, store_tokens, Priced}, obj, segment::{budget, runs}, store::Session};
 use std::rc::Rc;
 
 /// ceil(len('[image dropped from live context]') / 4)

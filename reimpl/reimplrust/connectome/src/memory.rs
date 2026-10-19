@@ -16,16 +16,8 @@
 //! eventually, folding: the window then overflows, as it should); any other failure is retried, at most
 //! attempt_limit times until the log grows.
 
-use crate::blocks::{reasoning, At, Block};
-use crate::chunking::priced;
-use crate::config::Config;
-use crate::emit::{answer, recall_tokens, recalled, Reader};
-use crate::js::{digest, is_js_space, js_len, js_round, js_trim};
-use crate::json::{sparse, Json, Value};
-use crate::obj;
-use crate::planner::{chunks, Node};
-use crate::store::Session;
-use crate::turns::{cap_images, normalize, say, strip_reasoning, Turn, LABEL};
+use crate::{blocks::{reasoning, At, Block}, chunking::priced, config::Config, emit::{answer, recall_tokens, recalled, Reader}, js::{digest, is_js_space, js_len, js_round, js_trim}};
+use crate::{json::{sparse, Json, Value}, obj, planner::{chunks, Node}, store::Session, turns::{cap_images, normalize, say, strip_reasoning, Turn, LABEL}};
 
 const MARKER: &str = "System: You will soon form a new memory, get ready. The messages that follow are the slice of \
 recent experience you are about to compress. After them, write the memory in your own voice.";

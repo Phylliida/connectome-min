@@ -4,9 +4,7 @@
 //!   store      prices the windows (MessageStore.estimateTokens): density-aware chars/token, each top-level
 //!              block scaled by the calibration multiplier and rounded.
 
-use crate::blocks::{raw_tokens, shape, text_only_tokens, At, Block};
-use crate::js::js_round;
-use crate::json::{Json, Value};
+use crate::{blocks::{raw_tokens, shape, text_only_tokens, At, Block}, js::js_round, json::{Json, Value}};
 
 /// What plans read from a message: its prices and its blocks' shapes, never its content. Messages
 /// never change, so this is computed once; the multiplier applies on read, as in the library's

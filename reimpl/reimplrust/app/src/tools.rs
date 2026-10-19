@@ -8,10 +8,8 @@
 //! (mcp.rs). A tool built in is a Tool whose `run` does the work in-process. A toolbox is made for each
 //! step, from the settings as they are then, and owns its tools.
 
-use connectome::json::{sparse, Value};
-use connectome::obj;
-use std::ops::Add;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use connectome::{json::{sparse, Value}, obj};
+use std::{ops::Add, panic::{catch_unwind, AssertUnwindSafe}};
 
 pub type Outcome = Result<Value, Value>;
 
@@ -22,9 +20,7 @@ pub struct Tool {
 }
 
 impl Tool {
-    pub fn name(&self) -> &str {
-        self.definition["name"].as_str().unwrap_or("")
-    }
+    pub fn name(&self) -> &str { self.definition["name"].as_str().unwrap_or("") }
 }
 
 #[derive(Default)]
@@ -32,9 +28,7 @@ pub struct Toolbox(pub Vec<Tool>);
 
 impl Toolbox {
     /// The tools a request declares; None without any.
-    pub fn definitions(&self) -> Option<Value> {
-        (!self.0.is_empty()).then(|| self.0.iter().map(|t| t.definition.clone()).collect())
-    }
+    pub fn definitions(&self) -> Option<Value> { (!self.0.is_empty()).then(|| self.0.iter().map(|t| t.definition.clone()).collect()) }
 
     /// A tool_use block's result. A call to no tool, or one whose tool panics, fails.
     pub fn call(&self, call: &Value) -> Value {
@@ -43,14 +37,10 @@ impl Toolbox {
         result(call, tool.map_or_else(|| Err(format!("no tool {}", call["name"].as_str().unwrap_or("?")).into()), run))
     }
 
-    pub fn names(&self) -> Vec<&str> {
-        self.0.iter().map(|t| t.name()).collect()
-    }
+    pub fn names(&self) -> Vec<&str> { self.0.iter().map(Tool::name).collect() }
 
     /// The tools whose calls wait for the user's yes.
-    pub fn asking(&self) -> Vec<&str> {
-        self.0.iter().filter(|t| t.asks).map(|t| t.name()).collect()
-    }
+    pub fn asking(&self) -> Vec<&str> { self.0.iter().filter(|t| t.asks).map(Tool::name).collect() }
 }
 
 impl Add for Toolbox {
@@ -64,10 +54,8 @@ impl Add for Toolbox {
 
 /// A call's result as the library logs it: {type, toolUseId, content, isError?}.
 pub fn result(call: &Value, outcome: Outcome) -> Value {
-    let (content, failed) = match outcome {
-        Ok(content) => (content, None),
-        Err(content) => (content, Some(true)),
-    };
+    let failed = outcome.is_err().then_some(true);
+    let (Ok(content) | Err(content)) = outcome;
     sparse(obj! {"type" => "tool_result", "toolUseId" => call["id"].clone(), "content" => content, "isError" => failed})
 }
 

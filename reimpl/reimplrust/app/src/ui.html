@@ -36,14 +36,12 @@ input[type=checkbox] { width: auto; }
 .group summary, .provider { cursor: pointer; padding: 4px 0; }
 .group summary small, .provider small { display: block; font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
 .settings { display: flex; flex-direction: column; gap: 6px; padding: 0; border: 0; }
-.settings label { font-size: 12px; color: var(--muted); }
-.settings small { color: var(--muted); font-size: 12px; }
+.settings label, .settings small, .legend, .msg .who { font-size: 12px; color: var(--muted); }
 #chat { display: flex; flex-direction: column; padding: 0; }
 #log { flex: 1; overflow: auto; padding: 16px; }
 .msg { position: relative; background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--raw); border-radius: 6px; padding: 8px 10px; margin: 0 0 8px; white-space: pre-wrap; word-wrap: break-word; }
 .msg.tail { border-left-color: var(--tail); }
 .msg.recalled { opacity: .55; }
-.msg .who { font-size: 12px; color: var(--muted); }
 .thinking { color: var(--muted); font-style: italic; margin: 2px 0 6px; }
 .thinking summary { cursor: pointer; font-style: normal; font-size: 12px; }
 .tool { border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; margin: 4px 0; }
@@ -66,7 +64,6 @@ form textarea { resize: vertical; min-height: 42px; }
 .cell.shown { border-color: var(--ink); }
 .row.chunks .cell { background: var(--raw); opacity: .5; }
 .row.chunks .cell.shown { opacity: 1; }
-.legend { font-size: 12px; color: var(--muted); }
 .stat { display: flex; justify-content: space-between; font-size: 13px; padding: 2px 0; }
 .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 4px 0 12px; }
 .bar div { height: 100%; background: var(--accent); }
@@ -132,11 +129,16 @@ const current = () => decodeURIComponent(location.hash.slice(1));   // the sessi
 const post = (body, signal) => ({ method: 'POST', headers: { 'x-connectome': '1' }, body: JSON.stringify(body), signal });
 
 async function api(path, body) {
-  const r = await fetch(path, body ? post(body) : {});
-  const v = await r.json();
-  if (v && v.error) throw new Error(v.error);
+  const v = await (await fetch(path, body ? post(body) : {})).json();
+  if (v?.error) throw new Error(v.error);
   return v;
 }
+
+// a form's submit runs `save`, then says so in `note`, or why it failed
+const saves = (form, note, save) => $(form).onsubmit = async (e) => {
+  e.preventDefault();
+  try { await save(); $(note).textContent = 'Saved.'; } catch (err) { $(note).textContent = err.message; }
+};
 
 function escape(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
@@ -223,16 +225,12 @@ function fill() {
   for (const el of fields()) el[el.type === 'checkbox' ? 'checked' : 'value'] = (state.settings || {})[el.name] ?? '';
 }
 
-$('session').onsubmit = async (e) => {
-  e.preventDefault();
+saves('session', 'ssaved', async () => {
   const value = (el) => el.type === 'checkbox' ? el.checked : el.type === 'number' ? Number(el.value) : el.value || null;
-  try {
-    state = await api(`/api/s/${current()}/settings`, Object.fromEntries(fields().map((el) => [el.name, value(el)])));
-    fill();
-    drawMemory();
-    $('ssaved').textContent = 'Saved.';
-  } catch (err) { $('ssaved').textContent = err.message; }
-};
+  state = await api(`/api/s/${current()}/settings`, Object.fromEntries(fields().map((el) => [el.name, value(el)])));
+  fill();
+  drawMemory();
+});
 
 function setStatus(text, warn) {
   const s = $('status');
@@ -251,18 +249,14 @@ function drawMemory() {
     <div class="stat"><span>Model</span><span>${escape(model)}</span></div>
     <div class="stat"><span>Tools</span><span>${s.tools.map((t) => `<button class="chip ${allow.includes(t) ? 'on' : ''}" data-tool="${escape(t)}" title="${allow.includes(t) ? 'Always allowed. Click to ask first.' : 'Asks first. Click to always allow.'}">${escape(t)}</button>`).join('') || 'none'}</span></div>
     <div class="stat"><span>Tools and system prompt</span><span>${Math.round(s.overhead).toLocaleString()} tokens</span></div>`;
-  const chunks = s.layers[0] || 0, shown = new Set((s.frontier || []).map(([l, p]) => `${l}/${p}`));
-  const rows = [];
-  for (let level = s.layers.length - 1; level >= 0; level--) {
-    const span = level === 0 ? 1 : config.merge_threshold ** (level - 1), cells = [];
-    for (let p = 0; p < s.layers[level]; p++) {
-      const left = 100 * p * span / Math.max(chunks, 1), width = 100 * span / Math.max(chunks, 1);
-      const color = level === 0 ? '' : `background: var(--l${Math.min(level, 5)});`;
-      cells.push(`<div class="cell ${shown.has(`${level}/${p}`) ? 'shown' : ''}" data-node="${level}/${p}" title="${level ? 'L' + level : 'chunk'} ${p}" style="left:${left}%;width:calc(${width}% - 2px);${color}"></div>`);
-    }
-    rows.push(`<div class="row ${level === 0 ? 'chunks' : ''}">${cells.join('')}</div>`);
-  }
-  $('pyramid').innerHTML = rows.join('') || '<small class="legend">No chunks yet: everything is still in the raw tail.</small>';
+  // a row per layer, the top one first; a cell spans the chunks it covers
+  const width = (n) => 100 * n / Math.max(s.layers[0] || 0, 1), shown = new Set((s.frontier || []).map(([l, p]) => `${l}/${p}`));
+  const rows = s.layers.map((count, level) => {
+    const span = level === 0 ? 1 : config.merge_threshold ** (level - 1), color = level === 0 ? '' : `background: var(--l${Math.min(level, 5)});`;
+    const cells = Array.from({ length: count }, (_, p) => `<div class="cell ${shown.has(`${level}/${p}`) ? 'shown' : ''}" data-node="${level}/${p}" title="${level ? 'L' + level : 'chunk'} ${p}" style="left:${width(p * span)}%;width:calc(${width(span)}% - 2px);${color}"></div>`);
+    return `<div class="row ${level === 0 ? 'chunks' : ''}">${cells.join('')}</div>`;
+  });
+  $('pyramid').innerHTML = rows.reverse().join('') || '<small class="legend">No chunks yet: everything is still in the raw tail.</small>';
 }
 
 // a tool's chip toggles whether the session always allows it
@@ -301,9 +295,7 @@ $('log').onclick = async (e) => {
 $('say').onsubmit = (e) => {
   e.preventDefault();
   const text = $('text').value.trim();
-  if (!text) return;
-  $('text').value = '';
-  turn(text);
+  if (text) { $('text').value = ''; turn(text); }
 };
 
 $('continue').onclick = () => turn(null);
@@ -326,7 +318,7 @@ async function follow(response) {
   setStatus('Waiting for the model…');
   let error = null;
   try {
-    const reader = (await response).body.getReader(), decoder = new TextDecoder();
+    const reader = (await response).body.pipeThrough(new TextDecoderStream()).getReader();
     let buffered = '';
     // a run of reasoning or of text continues the streaming reply's last part
     const part = (kind) => {
@@ -352,11 +344,10 @@ async function follow(response) {
       setStatus(event.approve ? 'Waiting for you to allow or deny the call…' : event.forming ? 'Forming memories…' : '');
       $('log').scrollTop = $('log').scrollHeight;
     };
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffered += decoder.decode(value, { stream: true });
-      for (let i; (i = buffered.indexOf('\n')) >= 0; buffered = buffered.slice(i + 1)) await take(buffered.slice(0, i));
+    for (let read; !(read = await reader.read()).done;) {
+      const lines = (buffered + read.value).split('\n');
+      buffered = lines.pop();
+      for (const line of lines) await take(line);
     }
     await take(buffered);
   } catch (err) {
@@ -381,15 +372,11 @@ $('providers').onclick = (e) => {
   if (p) [$('pname').value, $('base').value, $('key').value] = [p.name, p.base, ''];
 };
 
-$('provider').onsubmit = async (e) => {
-  e.preventDefault();
-  try {
-    await api('/api/settings', { name: $('pname').value, base: $('base').value, key: $('key').value });
-    await loadProviders();
-    $('key').value = '';
-    $('saved').textContent = 'Saved.';
-  } catch (err) { $('saved').textContent = err.message; }
-};
+saves('provider', 'saved', async () => {
+  await api('/api/settings', { name: $('pname').value, base: $('base').value, key: $('key').value });
+  await loadProviders();
+  $('key').value = '';
+});
 
 $('text').onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('say').requestSubmit(); } };
 
