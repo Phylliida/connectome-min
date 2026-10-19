@@ -12,11 +12,12 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
 const PAGE: &str = include_str!("ui.html");
 
-/// The page's libraries, as published (vendor/): marked, which turns the assistant's markdown into
-/// HTML, DOMPurify, which cleans that HTML, KaTeX, which sets its math, jsdiff, which finds the lines
-/// an edit changes, and highlight.js, which colors code; with KaTeX's stylesheet and the fonts it
-/// names (fonts/NAME.woff2).
+/// The page's libraries, as published (vendor/): Preact, which draws the page from what it shows, and
+/// htm, its templates; marked, which turns the assistant's markdown into HTML, DOMPurify, which cleans
+/// that HTML, KaTeX, which sets its math, jsdiff, which finds the lines an edit changes, and
+/// highlight.js, which colors code; with KaTeX's stylesheet and the fonts it names (fonts/NAME.woff2).
 const LIBS: &str = concat!(
+    include_str!("../vendor/preact/preact.min.umd.js"), "\n;", include_str!("../vendor/htm/htm.umd.js"), "\n;",
     include_str!("../vendor/marked.umd.js"), "\n;", include_str!("../vendor/purify.min.js"), "\n;", include_str!("../vendor/katex/katex.min.js"),
     "\n;", include_str!("../vendor/diff/diff.min.js"), "\n;", include_str!("../vendor/highlight/highlight.min.js"),
 );

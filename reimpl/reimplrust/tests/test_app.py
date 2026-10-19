@@ -122,7 +122,8 @@ class Mock(BaseHTTPRequestHandler):
 
     def stream(self, blocks, input_tokens, pause, stop, cut=False):
         """The reply as server-sent events, its text in five pieces `pause` seconds apart and a tool
-        call's input in three, the stream ending there if `cut`; chunked or until the close, by turns."""
+        call's input in three, the same, the stream ending there if `cut`; chunked or until the close,
+        by turns."""
         chunked = (seen['chat'] + seen['memory']) % 2 == 0
         self.protocol_version = 'HTTP/1.1' if chunked else 'HTTP/1.0'
         self.send_response(200)
@@ -142,6 +143,7 @@ class Mock(BaseHTTPRequestHandler):
                 event('content_block_start', index=i, content_block={**block, 'input': {}})
                 text = json.dumps(block['input'])
                 for k in range(3):
+                    time.sleep(pause)
                     event('content_block_delta', index=i, delta={'type': 'input_json_delta', 'partial_json': text[k * len(text) // 3:(k + 1) * len(text) // 3]})
                 event('content_block_stop', index=i)
                 continue

@@ -19,11 +19,15 @@ autobiographical compaction) and a web app around it.
   following a turn see (`hub.rs`), and each session has one, which runs its turns and alone writes
   its log (`work.rs`).
 
-The page shows the assistant's text as markdown, through marked and then DOMPurify, which keeps only
-the HTML markdown makes, so a reply can neither run code on the page nor load anything; its math
-(`$…$` or `\(…\)` inline, `$$…$$` or `\[…\]` displayed) KaTeX sets in its own fonts, and
-highlight.js colors its code blocks. These, and jsdiff for edits' diffs, are in `app/vendor/` as
-published, built in.
+The page draws itself with Preact, its templates written with htm, as a function of what it shows:
+the session as the server has it, its log's messages, and the turn it follows, which only the page's
+actions change. A turn it follows goes through phases the line under the chat shows (waiting for the
+model, streaming, asking whether a call may run, forming memories); its reply streams in below the
+log and is drawn at most once a frame, its finished markdown blocks once. The page shows the
+assistant's text as markdown, through marked and then DOMPurify, which keeps only the HTML markdown
+makes, so a reply can neither run code on the page nor load anything; its math (`$…$` or `\(…\)`
+inline, `$$…$$` or `\[…\]` displayed) KaTeX sets in its own fonts, and highlight.js colors its code
+blocks. These, jsdiff for edits' diffs, Preact and htm are in `app/vendor/` as published, built in.
 
 The page also shows what a session's requests have used, from the session's `costs.jsonl`
 (`costs.rs`): a record for each step's reply and each round of memories, `{id, for, used, total}`.
