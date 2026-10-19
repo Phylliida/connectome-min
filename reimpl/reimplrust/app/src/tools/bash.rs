@@ -9,10 +9,10 @@
 //! killed, so a timeout still takes everything the command started. The rest is bwrap's own root, kept
 //! read-only, so a write anywhere else fails rather than vanishing with the sandbox.
 
-use super::{Outcome, Tool, Toolbox};
+use super::{Outcome, Stopped, Tool, Toolbox, POLL};
 use crate::settings::{expand, Sandbox};
 use connectome::{json::Value, obj};
-use std::{ffi::OsString, fs::File, io::{Read, Seek, SeekFrom}, path::{Path, PathBuf}, process::{Command, Stdio}, time::Duration};
+use std::{ffi::OsString, fs::File, io::{Read, Seek, SeekFrom}, path::{Path, PathBuf}, process::{Command, Stdio}, time::{Duration, Instant}};
 use wait_timeout::ChildExt;
 
 const KEPT: u64 = 12_000; // bytes of output kept from each end
@@ -34,7 +34,7 @@ pub fn tool(dir: PathBuf, limit: Duration, sandbox: Option<Sandbox>) -> Toolbox 
     let timeout = format!("Seconds before the command is killed (default {DEFAULT_TIMEOUT}, at most {}).", limit.as_secs());
     let properties = obj! {"command" => obj! {"type" => "string"}, "timeout" => obj! {"type" => "number", "description" => timeout}};
     let definition = obj! {"name" => "bash", "description" => description, "input_schema" => obj! {"type" => "object", "properties" => properties, "required" => vec!["command"]}};
-    Toolbox(vec![Tool { definition, asks: true, run: Box::new(move |input| run(&dir, input, limit, sandbox.as_ref())) }])
+    Toolbox(vec![Tool { definition, asks: true, run: Box::new(move |input, stopped| run(&dir, input, limit, sandbox.as_ref(), stopped)) }])
 }
 
 /// bash where it can't run (super::unavailable).
@@ -42,7 +42,7 @@ pub fn unavailable(why: &'static str) -> Toolbox {
     super::unavailable("bash", &format!("Runs a command in {}", SHELL[0]), why)
 }
 
-fn run(dir: &Path, input: &Value, limit: Duration, sandbox: Option<&Sandbox>) -> Outcome {
+fn run(dir: &Path, input: &Value, limit: Duration, sandbox: Option<&Sandbox>, stopped: Stopped) -> Outcome {
     let command = input["command"].as_str().ok_or("bash needs a command")?;
     let timeout = Duration::from_secs_f64(input["timeout"].as_f64().unwrap_or(DEFAULT_TIMEOUT).clamp(0.1, limit.as_secs_f64()));
     // a thread runs one command at a time, so its id makes the file this call's
@@ -56,7 +56,13 @@ fn run(dir: &Path, input: &Value, limit: Duration, sandbox: Option<&Sandbox>) ->
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut shell, 0);
     let mut child = shell.spawn().map_err(|e| format!("{}: {e}", shell.get_program().to_string_lossy()))?;
-    let status = child.wait_timeout(timeout).ok().flatten();
+    let by = Instant::now() + timeout;
+    let status = loop { // till it exits, runs out of time, or its turn is stopped
+        match child.wait_timeout(by.saturating_duration_since(Instant::now()).min(POLL)) {
+            Ok(None) if Instant::now() < by && !stopped() => continue,
+            exited => break exited.ok().flatten(),
+        }
+    };
     if status.is_none() {
         #[cfg(unix)]
         unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) }; // its process group: the command and what it started
@@ -68,6 +74,7 @@ fn run(dir: &Path, input: &Value, limit: Duration, sandbox: Option<&Sandbox>) ->
     match status.map(|s| s.code()) {
         Some(Some(code)) => Ok(format!("{output}\n[exit code {code}]").into()),
         Some(None) => Ok(format!("{output}\n[killed by a signal]").into()),
+        None if stopped() => Err(format!("{output}\n[stopped by the user]").into()),
         None => Err(format!("{output}\n[killed after {} s]", timeout.as_secs_f64()).into()),
     }
 }

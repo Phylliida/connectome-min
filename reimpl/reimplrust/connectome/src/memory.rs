@@ -14,7 +14,8 @@
 //!
 //! Two outcomes besides a memory: a refusal stops memory formation, all of it, until surgery (and so,
 //! eventually, folding: the window then overflows, as it should); any other failure is retried, at most
-//! attempt_limit times until the log grows.
+//! attempt_limit times until the log grows. A request its host says was stopped (INTERRUPTED, not the
+//! library's) is neither: as if it wasn't made.
 
 use crate::{blocks::{reasoning, At, Block}, chunking::priced, config::Config, emit::{answer, recall_tokens, recalled, Reader}, js::{digest, is_js_space, js_len, js_round, js_trim}};
 use crate::{json::{sparse, Json, Value}, obj, planner::{chunks, Node}, store::Session, turns::{cap_images, normalize, say, strip_reasoning, Turn, LABEL}};
@@ -69,6 +70,10 @@ impl Request {
     }
 }
 
+/// What a host answers for a request it was told to stop before its answer came (its user stopped
+/// it): no attempt is recorded, as if the request wasn't made.
+pub const INTERRUPTED: &str = "interrupted";
+
 /// driveTick: the memories that are due form, in order (a stub without a call), until one makes a
 /// call or none may be tried; the error a failed call gave, if one did.
 pub fn drive(session: &Session, host: &mut dyn Host, cfg: &Config) -> Option<String> {
@@ -83,6 +88,7 @@ pub fn drive(session: &Session, host: &mut dyn Host, cfg: &Config) -> Option<Str
         // an L1 waits while it carries tool blocks and the host has declared no tools
         let request = if level == 1 { l1_request(session, p, host, cfg)? } else { merge_request(session, level, p, host, cfg) };
         let (outcome, error) = match host.complete(&request, &mut Reader::new(session, true)) {
+            Err(error) if error == INTERRUPTED => return None,
             Err(error) => ("retry", Some(error)),
             Ok(response) if response["stopReason"] == "refusal" => ("refusal", None),
             Ok(response) => match usable(&response) {
@@ -257,4 +263,36 @@ fn memory(first: u64, last: u64, text: &str, blocks: Value, tokens: f64, provena
 /// A setting as Python's str() writes an int.
 fn number(n: f64) -> String {
     crate::json::to_string(&Value::from(n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::drive::append;
+
+    /// A host that gives every request the same answer, and counts them.
+    struct Answering(Result<Value, String>, usize);
+
+    impl Host for Answering {
+        fn complete(&mut self, _: &Request, _: &mut Reader) -> Result<Value, String> {
+            self.1 += 1;
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn an_interrupted_request_is_no_attempt() {
+        let dir = std::env::temp_dir().join(format!("connectome-interrupted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (session, cfg) = (Session::open(&dir), Config { target_chunk_tokens: 50.0, recent_window_tokens: 50.0, l1_holdback_chunks: 0, ..Config::default() });
+        for (i, who) in ["user", "assistant"].iter().cycle().take(6).enumerate() {
+            append(&session, &obj! {"participant" => *who, "content" => vec![obj! {"type" => "text", "text" => format!("message {i}: {}", "words ".repeat(60))}]}, &cfg);
+        }
+        assert!(due(&session, &cfg).is_some());
+        let mut stopped = Answering(Err(INTERRUPTED.into()), 0);
+        assert_eq!((drive(&session, &mut stopped, &cfg), stopped.1, session.count("attempts")), (None, 1, 0));
+        let mut failing = Answering(Err("down".into()), 0);
+        assert_eq!((drive(&session, &mut failing, &cfg), session.count("attempts")), (Some("down".into()), 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

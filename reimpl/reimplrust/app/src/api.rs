@@ -127,6 +127,7 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
             Ok(Some(obj! {"job" => app.ask_session(name, |job| Msg::Job(Job::Say { text }, job))}))
         }
         ("GET", ["stream"]) => follow(app, name, query, stream),
+        ("POST", ["stop"]) => app.ask_session(name, Msg::Stop).map(|()| Some(obj! {})),
         ("POST", ["approve"]) => {
             let (id, answer) = (body["id"].as_str().unwrap_or("").into(), body["answer"].as_str().unwrap_or("deny").into());
             app.ask_session(name, |reply| Msg::Approve { id, answer, reply }).map(|()| Some(obj! {}))

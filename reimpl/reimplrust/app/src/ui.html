@@ -31,6 +31,9 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: v
 button, input, textarea, select { font: inherit; color: inherit; }
 button { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
 button:hover { border-color: var(--accent); }
+button:disabled { opacity: .35; cursor: default; border-color: var(--line); }
+.icon { display: inline-flex; align-items: center; justify-content: center; padding: 7px; }
+.icon svg { width: 20px; height: 20px; }
 input, textarea, select { width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
 input[type=checkbox] { width: auto; }
 .settings { display: flex; flex-direction: column; gap: 6px; padding: 0; border: 0; }
@@ -53,7 +56,8 @@ input[type=checkbox] { width: auto; }
 .msg.more > .who, #reply.empty { display: none; }
 .msg[data-who="user"]:not(.results) { display: flex; flex-direction: column; align-items: flex-end; }
 .msg[data-who="user"]:not(.results) .bubble { max-width: 85%; }
-.msg > button { position: absolute; top: 0; right: 0; font-size: 12px; padding: 1px 6px; display: none; }
+.msg > button { position: absolute; top: 0; right: 0; padding: 2px 5px; display: none; color: var(--muted); }
+.msg > button svg { width: 17px; height: 17px; }
 .msg[data-who="user"] > button { right: auto; left: 0; }
 .msg:hover > button { display: block; }
 .fold { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin: 14px 0 2px; }
@@ -110,6 +114,9 @@ input[type=checkbox] { width: auto; }
 /* the message box */
 form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
 form textarea { resize: vertical; min-height: 42px; }
+#say { align-items: flex-end; }
+#say .send { color: var(--accent); }
+#say .stop:not(:disabled) { color: var(--warn); border-color: var(--warn); }
 #status { color: var(--muted); font-size: 12px; padding: 0 16px 8px; min-height: 18px; }
 #status.warn { color: var(--warn); }
 
@@ -223,7 +230,7 @@ function escape(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;',
 
 // the line under the chat: what the turn the page follows waits for (its phase), else what failed or
 // keeps the session from running
-const PHASES = { waiting: 'Waiting for the model…', streaming: '', asking: 'Waiting for you to allow or deny the call…', running: 'Running…', denied: 'Denied.', forming: 'Forming memories…', ended: '' };
+const PHASES = { waiting: 'Waiting for the model…', streaming: '', asking: 'Waiting for you to allow or deny the call…', running: 'Running…', denied: 'Denied.', forming: 'Forming memories…', stopping: 'Stopping…', ended: '' };
 function status() {
   if (page.error || page.broken) return [page.error || page.broken, true];
   if (page.live) return [PHASES[page.live.phase], false];
@@ -335,8 +342,30 @@ function SayForm() {
     }
   };
   const enter = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.form.requestSubmit(); } };
-  return html`<form id="say" onSubmit=${say}><textarea id="text" name="text" placeholder="Message (Enter sends, Shift+Enter for a new line)" onKeyDown=${enter}></textarea><button>Send</button><button type="button" id="continue" title="Let the model go on, without a message" onClick=${() => turn(null)}>Continue</button></form>`;
+  return html`<form id="say" onSubmit=${say}>
+    <textarea id="text" name="text" placeholder="Message (Enter sends, Shift+Enter for a new line)" onKeyDown=${enter}></textarea>
+    <button class="icon send" title="Send (Enter)" aria-label="Send">${ICONS.send()}</button>
+    <button type="button" id="continue" class="icon" title="Let the model go on, without a message" aria-label="Continue" onClick=${() => turn(null)}>${ICONS.go()}</button>
+    <button type="button" id="stop" class="icon stop" title="Stop the turn" aria-label="Stop" disabled=${!page.live} onClick=${stop}>${ICONS.stop()}</button>
+  </form>`;
 }
+
+// the buttons' pictures (each drawn anew where it's used), in the text's color: a paper plane flying off (send), a step after a
+// trail of dots (go on), a stop sign (stop), and a fork whose tines branch like a log does (fork)
+const ICONS = {
+  send: () => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M21.5 2.5 6 9.4l5.3 3.3 3.3 5.3z" fill="currentColor" fill-opacity=".18" /><path d="M21.5 2.5 11.3 12.7" />
+    <path d="M2.5 16.5 5.5 13.5M4.5 20.5l3.2-3.2M8.6 21.6l1.6-1.6" opacity=".5" /></svg>`,
+  go: () => html`<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+    <circle cx="3.2" cy="12" r="1.4" opacity=".3" /><circle cx="7.6" cy="12" r="1.7" opacity=".6" />
+    <path d="M12 5.4v13.2c0 .8.9 1.3 1.6.8l8.8-6.6a1 1 0 0 0 0-1.6l-8.8-6.6c-.7-.5-1.6 0-1.6.8z" /></svg>`,
+  stop: () => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true">
+    <path d="M8.3 2.5h7.4l5.8 5.8v7.4l-5.8 5.8H8.3l-5.8-5.8V8.3z" /><rect x="8.6" y="8.6" width="6.8" height="6.8" rx="1.3" fill="currentColor" stroke="none" /></svg>`,
+  fork: () => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+    <path d="M12 22v-8.5M12 13.5c0-3.2-5-3.4-5-7M12 13.5c0-3.2 5-3.4 5-7M12 13.5V6.5" />
+    <circle cx="7" cy="4.6" r="1.8" fill="currentColor" stroke="none" /><circle cx="12" cy="4.2" r="1.8" fill="currentColor" stroke="none" />
+    <circle cx="17" cy="4.6" r="1.8" fill="currentColor" stroke="none" /></svg>`,
+};
 
 // the log's messages, then the reply streaming in. A message's line (whose it is) shows only where the
 // speaker changes, and a message of tool results whose results all joined their calls isn't shown.
@@ -388,7 +417,7 @@ class Message extends Component {
     };
     return html`<div class=${'msg' + (all ? ' results' : '') + (more ? ' more' : '')} data-id=${m.id} data-who=${m.participant} hidden=${hidden}>
       <div class="who">${m.participant}${all ? ' · tool results' : ''}</div>
-      <button data-fork=${m.id} onClick=${() => fork(m.id)}>fork here</button>
+      <button class="icon" data-fork=${m.id} title="Fork the session here" aria-label="Fork here" onClick=${() => fork(m.id)}>${ICONS.fork()}</button>
       ${m.content.map(block)}
     </div>`;
   }
@@ -587,6 +616,13 @@ async function approve(id, answer) {
   if (page.live) page.live.phase = answer === 'deny' ? 'denied' : 'running';
   draw();
   try { await api(`/api/s/${current()}/approve`, { id, answer }); } catch (err) { fail(err); }
+}
+
+// the turn running stopped where it is (work.rs's Worker::stopped)
+async function stop() {
+  if (page.live) page.live.phase = 'stopping';
+  draw();
+  try { await api(`/api/s/${current()}/stop`, {}); } catch (err) { fail(err); }
 }
 
 // a turn: `text` joins the log and the model answers it, or without text the model goes on from the

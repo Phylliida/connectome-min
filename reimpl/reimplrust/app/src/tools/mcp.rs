@@ -10,7 +10,7 @@
 //!
 //!     {"mcpServers": {"NAME": {"command": "...", "args": ["..."], "env": {"KEY": "..."}}}}
 
-use super::{Outcome, Tool, Toolbox};
+use super::{Outcome, Stopped, Tool, Toolbox, POLL};
 use connectome::{json::{self, sparse, Json, Value}, obj};
 use std::{collections::HashMap, io::{BufRead, BufReader, Write}, process::{Child, ChildStdin, Command, Stdio}, time::{Duration, Instant}};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
@@ -67,24 +67,32 @@ pub fn toolbox(servers: &[Server]) -> Toolbox {
     servers.iter().fold(Toolbox::default(), |tools, server| {
         tools + Toolbox(server.tools.iter().map(|definition| {
             let (link, name) = (server.link.clone(), definition["name"].as_str().unwrap_or("").to_string());
-            Tool { definition: definition.clone(), asks: true, run: Box::new(move |input| link.call(&name, input)) }
+            Tool { definition: definition.clone(), asks: true, run: Box::new(move |input, stopped| link.call(&name, input, stopped)) }
         }).collect())
     })
 }
 
 impl Link {
-    /// A request's answer from the server.
-    fn request(&self, method: &str, params: Value) -> Answer {
+    /// A request's answer from the server; none once the turn it's made in is stopped (the server
+    /// is told to cancel it when it times out).
+    fn request(&self, method: &str, params: Value, stopped: Stopped) -> Answer {
         let (answer, answered) = channel();
         self.told.send(Told::Request(method.into(), params, answer)).expect("the server's thread runs");
-        answered.recv().expect("the server's thread answers").map_err(|e| format!("MCP server {}: {e}", self.name))
+        let answer = loop {
+            match answered.recv_timeout(POLL) {
+                Err(RecvTimeoutError::Timeout) if !stopped() => continue,
+                Err(RecvTimeoutError::Timeout) => break Err("stopped by the user".into()),
+                answer => break answer.expect("the server's thread answers"),
+            }
+        };
+        answer.map_err(|e| format!("MCP server {}: {e}", self.name))
     }
 
     /// Every tool the server lists.
     fn tools(&self) -> Result<Vec<Value>, String> {
         let (mut tools, mut cursor) = (vec![], Some(Value::Null));
         while let Some(at) = cursor {
-            let page = self.request("tools/list", sparse(obj! {"cursor" => at}))?;
+            let page = self.request("tools/list", sparse(obj! {"cursor" => at}), &|| false)?;
             let listed = page["tools"].arr().iter().map(|t| obj! {"name" => t["name"].as_str().unwrap_or(""), "description" => t["description"].clone(), "input_schema" => t["inputSchema"].clone()});
             tools.extend(listed);
             cursor = Some(page["nextCursor"].clone()).filter(|c| !c.is_null());
@@ -93,8 +101,8 @@ impl Link {
     }
 
     /// tools/call: the result's content blocks as a tool result's, failed if the server says so.
-    fn call(&self, name: &str, input: &Value) -> Outcome {
-        let result = self.request("tools/call", obj! {"name" => name, "arguments" => input.clone()}).map_err(Value::from)?;
+    fn call(&self, name: &str, input: &Value, stopped: Stopped) -> Outcome {
+        let result = self.request("tools/call", obj! {"name" => name, "arguments" => input.clone()}, stopped).map_err(Value::from)?;
         let content: Value = result["content"].arr().iter().map(block).collect();
         if result["isError"] == true { Err(content) } else { Ok(content) }
     }

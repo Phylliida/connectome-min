@@ -8,7 +8,7 @@
 //! (mcp.rs). A toolbox is made for each step, from the settings as they are then, and owns its tools.
 
 use connectome::{json::{sparse, Value}, obj};
-use std::{ops::Add, panic::{catch_unwind, AssertUnwindSafe}};
+use std::{ops::Add, panic::{catch_unwind, AssertUnwindSafe}, time::Duration};
 
 pub mod bash;
 pub mod edit;
@@ -16,10 +16,19 @@ pub mod mcp;
 
 pub type Outcome = Result<Value, Value>;
 
+/// Whether the user has stopped the turn a call runs in, which a call that takes long asks every POLL
+/// and ends at once if so.
+pub type Stopped<'a> = &'a dyn Fn() -> bool;
+
+pub const POLL: Duration = Duration::from_millis(100);
+
+/// A tool's work: from a call's input to its outcome.
+pub type Run = Box<dyn Fn(&Value, Stopped) -> Outcome>;
+
 pub struct Tool {
     pub definition: Value,
     pub asks: bool,
-    pub run: Box<dyn Fn(&Value) -> Outcome>,
+    pub run: Run,
 }
 
 impl Tool {
@@ -34,9 +43,9 @@ impl Toolbox {
     pub fn definitions(&self) -> Option<Value> { (!self.0.is_empty()).then(|| self.0.iter().map(|t| t.definition.clone()).collect()) }
 
     /// A tool_use block's result. A call to no tool, or one whose tool panics, fails.
-    pub fn call(&self, call: &Value) -> Value {
+    pub fn call(&self, call: &Value, stopped: Stopped) -> Value {
         let tool = self.0.iter().find(|t| call["name"] == t.name());
-        let run = |t: &Tool| catch_unwind(AssertUnwindSafe(|| (t.run)(&call["input"]))).unwrap_or_else(|_| Err("the tool crashed".into()));
+        let run = |t: &Tool| catch_unwind(AssertUnwindSafe(|| (t.run)(&call["input"], stopped))).unwrap_or_else(|_| Err("the tool crashed".into()));
         result(call, tool.map_or_else(|| Err(format!("no tool {}", call["name"].as_str().unwrap_or("?")).into()), run))
     }
 
@@ -60,7 +69,7 @@ impl Add for Toolbox {
 /// `does`, but not here, and why; each call fails at once, saying `why`, without asking.
 pub fn unavailable(name: &str, does: &str, why: &'static str) -> Toolbox {
     let definition = obj! {"name" => name, "description" => format!("{does}, but not in this session: {why}."), "input_schema" => obj! {"type" => "object"}};
-    Toolbox(vec![Tool { definition, asks: false, run: Box::new(move |_| Err(why.into())) }])
+    Toolbox(vec![Tool { definition, asks: false, run: Box::new(move |_, _| Err(why.into())) }])
 }
 
 /// A call's result as the library logs it: {type, toolUseId, content, isError?}.
@@ -76,11 +85,11 @@ mod tests {
 
     fn tool(name: &str, answer: &'static str) -> Toolbox {
         let definition = obj! {"name" => name, "description" => "", "input_schema" => obj! {"type" => "object"}};
-        Toolbox(vec![Tool { definition, asks: true, run: Box::new(move |_| if answer == "panic" { panic!("boom") } else { Ok(answer.into()) }) }])
+        Toolbox(vec![Tool { definition, asks: true, run: Box::new(move |_, _| if answer == "panic" { panic!("boom") } else { Ok(answer.into()) }) }])
     }
 
     fn answers(tools: &Toolbox) -> Vec<String> {
-        tools.names().iter().map(|&name| tools.call(&obj! {"id" => "t", "name" => name})["content"].as_str().unwrap_or("").to_string()).collect()
+        tools.names().iter().map(|&name| tools.call(&obj! {"id" => "t", "name" => name}, &|| false)["content"].as_str().unwrap_or("").to_string()).collect()
     }
 
     #[test]
@@ -95,8 +104,8 @@ mod tests {
     #[test]
     fn failures_are_results() {
         let tools = tool("bad", "panic");
-        assert_eq!(tools.call(&obj! {"id" => "t1", "name" => "bad"}), obj! {"type" => "tool_result", "toolUseId" => "t1", "content" => "the tool crashed", "isError" => true});
-        assert_eq!(tools.call(&obj! {"id" => "t2", "name" => "gone"})["content"], "no tool gone");
-        assert_eq!(tool("ok", "fine").call(&obj! {"id" => "t3", "name" => "ok"}), obj! {"type" => "tool_result", "toolUseId" => "t3", "content" => "fine"});
+        assert_eq!(tools.call(&obj! {"id" => "t1", "name" => "bad"}, &|| false), obj! {"type" => "tool_result", "toolUseId" => "t1", "content" => "the tool crashed", "isError" => true});
+        assert_eq!(tools.call(&obj! {"id" => "t2", "name" => "gone"}, &|| false)["content"], "no tool gone");
+        assert_eq!(tool("ok", "fine").call(&obj! {"id" => "t3", "name" => "ok"}, &|| false), obj! {"type" => "tool_result", "toolUseId" => "t3", "content" => "fine"});
     }
 }

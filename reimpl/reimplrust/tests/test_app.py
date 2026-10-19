@@ -619,6 +619,54 @@ def tooled(tls, ca, baseline) -> str:
                 pass
         if len(heard) != 1 or heard[0]['state']['running']:
             raise SystemExit(f'a page following a session no turn runs in heard {heard}')
+
+        call(port, '/api/sessions', {'name': 'halt', 'workspace': tempfile.mkdtemp()})   # a session to stop turns in, bash always allowed
+        call(port, '/api/s/halt/settings', {'allow': ['bash', 'hang']})
+
+        def stopped(text, at):
+            """The turn `text` starts, stopped at the first event `at` takes: its events, and the seconds
+            from the stop to the turn's end."""
+            r, events = following(port, 'halt')
+            with r:
+                next(events)
+                job, heard, asked = call(port, '/api/s/halt/say', {'text': text})['job'], [], None
+                for e in events:
+                    heard.append(e)
+                    if asked is None and at(e):
+                        asked = time.monotonic()
+                        call(port, '/api/s/halt/stop', {})
+                    if 'end' in e:
+                        took = time.monotonic() - asked
+                    if e.get('done') == job:
+                        return heard, took
+        last = lambda: call(port, '/api/s/halt/messages')[-1]
+        story = 'stop me ' * 40
+        heard, took = stopped(f'echo {story}slowly', lambda e: 'text' in e)   # a reply streaming in ends where it is, and joins the log so
+        if {'end': 'Stopped by the user.'} not in heard or took > 1 or not 0 < len(words(last())) < len(story) or any('forming' in e for e in heard):
+            raise SystemExit(f'a reply stopped as it streamed ended {[e for e in heard if "end" in e]} {took:.1f} s on, the log has {words(last())[:40]!r}')
+        def running(tool):                                              # a call running a tenth of a second: once the reply that makes it has joined the log
+            logged = []
+            return lambda e: (logged.append(e) if 'logged' in e else None, len(logged) == 2 and not time.sleep(0.1))[1]
+        heard, took = stopped('call ' + json.dumps([['bash', {'command': 'sleep 30; echo late'}]]), running('bash'))   # a command running is killed
+        if not last()['content'][0]['content'].endswith('[stopped by the user]') or 'late' in last()['content'][0]['content'] or took > 0.6:   # --tool-timeout is 1 s
+            raise SystemExit(f'a command stopped as it ran gave {last()["content"]}, the turn ending {took:.1f} s on')
+        say(port, 'halt', 'echo next')                                  # the mock answers results and a message together with a reply
+        heard, took = stopped('call ' + json.dumps([['hang', {}]]), running('hang'))   # an MCP call running is left
+        if 'stopped by the user' not in last()['content'][0]['content'] or took > 0.6:
+            raise SystemExit(f'an MCP call stopped as it ran gave {last()["content"]}, the turn ending {took:.1f} s on')
+        say(port, 'halt', 'echo next')
+        heard, took = stopped('call ' + json.dumps([['add', {'a': 1, 'b': 1, 'pace': 'slowly'}]]), lambda e: 'calling' in e)   # a call the reply is writing goes
+        if [b['type'] for b in last()['content']] != ['text'] or {'end': 'Stopped by the user.'} not in heard:
+            raise SystemExit(f'a reply stopped as it wrote a call joined the log as {last()}')
+        heard, took = stopped('call ' + json.dumps([['add', {'a': 1, 'b': 1}], ['add', {'a': 2, 'b': 2}]]), lambda e: 'approve' in e)   # calls waiting or yet to run don't
+        if [(b['content'], b.get('isError')) for b in last()['content']] != [('Stopped by the user.', True)] * 2 or {'end': 'Stopped by the user.'} not in heard:
+            raise SystemExit(f'calls stopped while one waited for an answer: {last()["content"]}')
+        try:
+            call(port, '/api/s/halt/stop', {})
+            raise SystemExit('a session no turn runs in took a stop')
+        except urllib.error.HTTPError as error:
+            if error.code != 400:
+                raise
         try:
             say(port, 'tools', 'use tools forever', {'add': 'always'})
             raise SystemExit('a turn that never stops calling tools ended')

@@ -4,11 +4,12 @@
 //! the context compiles and streams from disk into the request, the reply joins the log, and the tools
 //! it calls run, each once the user allows it, their results joining the log. Memories form between
 //! steps and after the turn. The thread tells the hub what the pages following the job see (Msg).
+//! The user can stop a turn: it ends where it is (Worker::stopped).
 
 use crate::{api::brief, costs::{self, For}, hub::{Event, Job, Msg}, llm::Llm, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
-use connectome::{memory::{Host, Request}, store::Session};
-use std::{panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver}, time::Duration};
+use connectome::{memory::{Host, Request, INTERRUPTED}, store::Session};
+use std::{panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
 
 /// Steps a turn may take, a model request each, before it stops.
 const MAX_STEPS: usize = 64;
@@ -18,6 +19,9 @@ const APPROVAL_WAIT: Duration = Duration::from_secs(600);
 
 /// A denied call's result.
 pub const DENIED: &str = "the user didn't allow this call";
+
+/// A stopped turn's end, and the result of each of its calls that didn't run.
+pub const STOPPED: &str = "Stopped by the user.";
 
 /// What a session's step runs with: its settings, the model client and tools they give, the tools'
 /// definitions, and the tokens the system prompt and those take, which every request carries.
@@ -41,17 +45,23 @@ impl Setup {
     }
 }
 
-/// The summarizer's host: the session's model unless the library names one, and the agent's tools,
-/// which the library sends with tool choice "none" so a memory's request can carry tool blocks; no
-/// system prompt.
-impl Host for &Setup {
-    fn tools(&self) -> Option<&Value> { self.definitions.as_ref() }
+/// The summarizer, the library's host: the session's model unless the library names one, and the
+/// agent's tools, which the library sends with tool choice "none" so a memory's request can carry tool
+/// blocks; no system prompt. A request its turn's user stops ends at once, as never made (INTERRUPTED).
+struct Summarizer<'a> {
+    setup: &'a Setup,
+    stopped: tools::Stopped<'a>,
+}
+
+impl Host for Summarizer<'_> {
+    fn tools(&self) -> Option<&Value> { self.setup.definitions.as_ref() }
 
     fn complete(&mut self, request: &Request, reader: &mut Reader) -> Result<Value, String> {
-        let model = if request.model.is_empty() { &self.settings.model } else { &request.model };
+        let model = if request.model.is_empty() { &self.setup.settings.model } else { &request.model };
         let none = request.tools.as_ref().map(|_| obj! {"type" => "none"});
         let head = sparse(obj! {"model" => model.as_str(), "max_tokens" => request.max_tokens, "tools" => request.tools.clone(), "tool_choice" => none});
-        self.llm.messages(head, &request.messages, reader, |_| {})
+        let reply = self.setup.llm.messages(head, &request.messages, reader, |_| !(self.stopped)())?;
+        if (self.stopped)() { Err(INTERRUPTED.into()) } else { Ok(reply) }
     }
 }
 
@@ -87,7 +97,8 @@ pub fn overhead(system: Option<&str>, definitions: &Option<Value>) -> f64 {
 /// the library can't read) fails, and the next runs.
 pub fn work(app: &App, name: &str, jobs: Receiver<(u64, Job)>) {
     for (id, job) in jobs {
-        let done = catch_unwind(AssertUnwindSafe(|| Worker { app, name, s: app.session(name) }.run(id, job)));
+        let (stop, halt) = channel();
+        let done = catch_unwind(AssertUnwindSafe(|| Worker { app, name, s: app.session(name), halt }.run(id, job, stop)));
         if done.is_err() {
             app.tell(name, Msg::Event(Event::Forming(false)));
             app.tell(name, Msg::Event(Event::End(Some("the session's thread failed; the server's output says why".into()))));
@@ -96,11 +107,13 @@ pub fn work(app: &App, name: &str, jobs: Receiver<(u64, Job)>) {
     }
 }
 
-/// A job in a session, as it reads the session's files again.
+/// A job in a session, as it reads the session's files again; and where it hears that the user has
+/// stopped its turn: the hub holds the other end while the turn runs, and lets go of it to stop it.
 struct Worker<'a> {
     app: &'a App,
     name: &'a str,
     s: Session,
+    halt: Receiver<()>,
 }
 
 impl Worker<'_> {
@@ -112,11 +125,16 @@ impl Worker<'_> {
     /// The pages told that the log has grown, and to what length.
     fn logged(&self) { self.tell(Msg::Logged(self.s.count("messages"))) }
 
-    /// Job `id`.
-    fn run(&self, id: u64, job: Job) {
+    /// Whether the user has stopped the turn: then a reply streaming in stops where it is (and joins
+    /// the log so), a call not yet run doesn't run (STOPPED is its result), one running ends (its
+    /// tool's run hears so), a memory forming is dropped, and no step comes after.
+    fn stopped(&self) -> bool { self.halt.try_recv() == Err(TryRecvError::Disconnected) }
+
+    /// Job `id`; `stop` the hub holds while its turn runs.
+    fn run(&self, id: u64, job: Job, stop: Sender<()>) {
         match job {
             Job::Say { text } => {
-                self.tell(Msg::Start(id));
+                self.tell(Msg::Start(id, stop));
                 self.event(Event::End(self.turn(text.as_deref()).err()));
                 if let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup) } // the turn's memories
             }
@@ -142,6 +160,7 @@ impl Worker<'_> {
         }
         self.logged();
         for _ in 0..MAX_STEPS {
+            if self.stopped() { return Err(STOPPED.into()) }
             if !self.step()? { return Ok(()) }
         }
         Err(format!("the turn stopped after {MAX_STEPS} steps"))
@@ -168,19 +187,28 @@ impl Worker<'_> {
             self.form(&setup);
             compiled = select(s, w, current(s), cfg);
         }
+        if self.stopped() { return Err(STOPPED.into()) } // before the request
         let turns = compiled.map_err(|r| refused(&r, &setup))?;
         if let Some(fold) = costs::fold(s) { self.event(Event::Fold(fold)) }
         let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.settings.system.as_deref(), "tools" => setup.definitions.clone()});
-        let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), |piece| self.event(Event::Piece(piece)))?;
+        let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), |piece| {
+            self.event(Event::Piece(piece));
+            !self.stopped()
+        })?;
         self.spend(&setup, For::Reply);
         append(s, &obj! {"participant" => "assistant", "content" => reply["content"].clone()}, cfg);
         self.logged();
         let calls = reply["content"].arr().iter().filter(|b| b.kind() == "tool_use");
-        let results = calls.map(|call| self.approve(&setup, call).map_or_else(|why| tools::result(call, Err(why.into())), |()| setup.tools.call(call)));
+        let run = |call| self.approve(&setup, call).map_or_else(|why| tools::result(call, Err(why.into())), |()| setup.tools.call(call, &|| self.stopped()));
+        let results = calls.map(|call| if self.stopped() { tools::result(call, Err(STOPPED.into())) } else { run(call) });
         let results: Vec<Value> = results.inspect(|result| self.event(Event::Result(brief(result.clone())))).collect();
-        if results.is_empty() { return Ok(false) }
-        append(s, &obj! {"participant" => "user", "content" => results}, cfg);
-        self.logged();
+        let called = !results.is_empty();
+        if called {
+            append(s, &obj! {"participant" => "user", "content" => results}, cfg);
+            self.logged();
+        }
+        if self.stopped() { return Err(STOPPED.into()) }
+        if !called { return Ok(false) }
         self.form(&setup);
         Ok(true)
     }
@@ -198,10 +226,11 @@ impl Worker<'_> {
         answered.recv_timeout(APPROVAL_WAIT).unwrap_or_else(|_| Err(DENIED.into()))
     }
 
-    /// Memories form (memory::drive), the pages told while they do.
+    /// Memories form (memory::drive), the pages told while they do; none once the turn is stopped.
     fn form(&self, setup: &Setup) {
+        if self.stopped() { return }
         self.event(Event::Forming(true));
-        if let Some(error) = drive(&self.s, &mut &*setup, &setup.settings.config) {
+        if let Some(error) = drive(&self.s, &mut Summarizer { setup, stopped: &|| self.stopped() }, &setup.settings.config) {
             eprintln!("{}: forming a memory: {error}", self.name);
         }
         self.spend(setup, For::Memories);

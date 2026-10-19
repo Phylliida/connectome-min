@@ -15,7 +15,7 @@ pub fn tool(dir: PathBuf) -> Toolbox {
     let all = obj! {"type" => "boolean", "description" => "Replace the text each time it occurs"};
     let properties = obj! {"path" => text("The file"), "old" => text("The text to replace; empty for a new file"), "new" => text("The text to put in its place"), "all" => all};
     let definition = obj! {"name" => "edit", "description" => description, "input_schema" => obj! {"type" => "object", "properties" => properties, "required" => vec!["path", "old", "new"]}};
-    Toolbox(vec![Tool { definition, asks: true, run: Box::new(move |input| edit(&dir, input)) }])
+    Toolbox(vec![Tool { definition, asks: true, run: Box::new(move |input, _| edit(&dir, input)) }])
 }
 
 /// edit where it can't run (super::unavailable).

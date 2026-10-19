@@ -2,7 +2,7 @@
 //! and the sessions' settings files, which sessions have a thread (started the first time one is told
 //! something), and each session's pages and what they hear (Live).
 
-use crate::{api::Shown, costs::{Fold, Spent}, llm::Piece, settings::{self, SessionSettings, Settings}, work::{work, DENIED}, App};
+use crate::{api::Shown, costs::{Fold, Spent}, llm::Piece, settings::{self, SessionSettings, Settings}, work::{work, DENIED, STOPPED}, App};
 use connectome::json::Value;
 use serde::Serialize;
 use std::{collections::HashMap, sync::mpsc::{channel, Receiver, Sender}};
@@ -32,8 +32,11 @@ pub enum Msg {
     Status(Sender<bool>),
     /// A change to the session's settings (SessionSettings::tuned), and whether its memories have merged.
     Tune(Value, bool, Sender<Result<(), String>>),
-    /// From the session's thread: job `id`'s turn starts.
-    Start(u64),
+    /// The user stops the turn running (work's Worker::stopped); answered with whether one ran.
+    Stop(Sender<Result<(), String>>),
+    /// From the session's thread: job `id`'s turn starts; while it runs the hub holds `stop`, and lets
+    /// go of it to stop it.
+    Start(u64, Sender<()>),
     /// From the session's thread: the log has grown to this many messages.
     Logged(u64),
     /// From the session's thread: an event for the pages.
@@ -122,10 +125,12 @@ struct Live {
 }
 
 /// A turn as a page that comes in during it hears it first: its start, then the events since the log
-/// last grew (what the log holds, the page reads from it); and the calls waiting for an answer.
+/// last grew (what the log holds, the page reads from it); the calls waiting for an answer; and the
+/// session's thread's line, until the user stops the turn.
 struct Turn {
     events: Vec<Event>,
     asked: HashMap<String, (String, Sender<Result<(), String>>)>, // by call id: its tool, where to answer
+    stop: Option<Sender<()>>,
 }
 
 impl Live {
@@ -155,9 +160,19 @@ impl Live {
                 let tune = |all: Settings| settings::change(&app.profile_path(name), |old: &mut SessionSettings| old.tuned(&v, merged, &all).map(|new| *old = new));
                 let _ = reply.send(app.settings().and_then(tune).map(drop));
             }
-            Msg::Start(id) => {
-                self.turn = Some(Turn { events: vec![], asked: HashMap::new() });
+            Msg::Start(id, stop) => {
+                self.turn = Some(Turn { events: vec![], asked: HashMap::new(), stop: Some(stop) });
                 self.send(Event::Turn(id));
+            }
+            Msg::Stop(reply) => {
+                let Some(turn) = &mut self.turn else { return drop(reply.send(Err("no turn runs".into()))) };
+                turn.stop = None;
+                let asked: Vec<_> = turn.asked.drain().collect();
+                for (id, (_, waiting)) in asked { // the calls waiting for an answer don't run
+                    let _ = waiting.send(Err(STOPPED.into()));
+                    self.send(Event::Answered(id));
+                }
+                let _ = reply.send(Ok(()));
             }
             Msg::Done(id) => {
                 self.turn = None;
