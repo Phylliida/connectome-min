@@ -30,6 +30,10 @@ use std::{path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender}, time::
 
 const PAGE: &str = include_str!("ui.html");
 
+/// The page's libraries, as published: marked, which turns the assistant's markdown into HTML, and
+/// DOMPurify, which cleans that HTML (vendor/).
+const LIBS: &str = concat!(include_str!("../vendor/marked.umd.js"), "\n;", include_str!("../vendor/purify.min.js"));
+
 /// What every thread reads, set once at the start and never changed.
 struct App {
     root: PathBuf,
@@ -274,6 +278,7 @@ fn handle(app: &App, mut stream: TcpStream) -> std::io::Result<()> {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     let reply = match (method.as_str(), parts.as_slice()) {
         ("GET", []) => return send(&mut stream, "200 OK", "text/html; charset=utf-8", PAGE.as_bytes()),
+        ("GET", ["libs.js"]) => return send(&mut stream, "200 OK", "text/javascript; charset=utf-8", LIBS.as_bytes()),
         ("GET", ["api", "sessions"]) => Ok(Some(sessions(app))),
         ("GET", ["api", "settings"]) => global(app).map(|all| Some(providers(&all))),
         ("POST", ["api", "settings"]) => ask(app, |reply| Routed::Provide(body.clone(), reply)).map(|all| Some(providers(&all))),

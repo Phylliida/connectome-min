@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Connectome</title>
+<script src="/libs.js"></script>
 <style>
 :root {
   --bg: #f7f6f3; --panel: #ffffff; --ink: #1d1c1a; --muted: #6b6862; --line: #e3e0da;
@@ -43,6 +44,16 @@ input[type=checkbox] { width: auto; }
 .msg.tail { border-left-color: var(--tail); }
 .msg.recalled { opacity: .55; }
 .thinking { color: var(--muted); font-style: italic; margin: 2px 0 6px; }
+.md { white-space: normal; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md pre, .md code { font: 12px/1.4 ui-monospace, monospace; background: var(--bg); border-radius: 4px; }
+.md pre { padding: 8px; overflow: auto; }
+.md :not(pre) > code { padding: 1px 4px; }
+.md table { border-collapse: collapse; }
+.md th, .md td { border: 1px solid var(--line); padding: 2px 8px; }
+.md a[href] { color: var(--accent); }
+.md blockquote { margin: 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
 .thinking summary { cursor: pointer; font-style: normal; font-size: 12px; }
 .tool { border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; margin: 4px 0; }
 .tool summary { cursor: pointer; font-size: 12px; color: var(--muted); }
@@ -140,6 +151,15 @@ const saves = (form, note, save) => $(form).onsubmit = async (e) => {
   try { await save(); $(note).textContent = 'Saved.'; } catch (err) { $(note).textContent = err.message; }
 };
 
+// an assistant's text as markdown, its line breaks kept. The HTML keeps only what markdown makes, so
+// the model's text can't run code on the page or load anything (an image would tell its server what
+// the page shows); its links open in a new tab.
+const markdown = (text) => DOMPurify.sanitize(marked.parse(text, { breaks: true }), {
+  ALLOWED_TAGS: ['p', 'br', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'strong', 'em', 'del', 'code', 'pre', 'blockquote', 'ul', 'ol', 'li', 'a', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'input'],
+  ALLOWED_ATTR: ['href', 'title', 'start', 'align', 'type', 'checked', 'disabled'],
+});
+DOMPurify.addHook('afterSanitizeAttributes', (node) => node.tagName === 'A' && node.setAttribute('target', '_blank'));
+
 function escape(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
 // the workspaces whose groups are folded, kept in this browser
@@ -187,17 +207,17 @@ async function showLog(n) {
   $('log').innerHTML = '';
   for (const m of messages) {
     const results = m.content.every((b) => b.type === 'tool_result') ? ' · tool results, on the calls' : '';
-    $('log').insertAdjacentHTML('beforeend', `<div class="msg ${m.shown}"><div class="who">#${m.id} · ${escape(m.participant)}${results}</div><button data-fork="${m.id}">fork here</button></div>`);
+    $('log').insertAdjacentHTML('beforeend', `<div class="msg ${m.shown}" data-who="${escape(m.participant)}"><div class="who">#${m.id} · ${escape(m.participant)}${results}</div><button data-fork="${m.id}">fork here</button></div>`);
     for (const b of m.content) draw($('log').lastElementChild, b);
   }
   $('log').scrollTop = $('log').scrollHeight;
 }
 
-// how a block shows: text as it is, reasoning folded, a call as a card that stays open until its
-// result joins it, anything else as a note (an image as its size)
+// how a block shows: text as it is (the assistant's as markdown), reasoning folded, a call as a card
+// that stays open until its result joins it, anything else as a note (an image as its size)
 const note = (b) => b.type === 'image' ? `[image, ${b.kb} KB]` : `[${b.type}]`;
 const parts = {
-  text: (b) => `<div>${escape(b.text)}</div>`,
+  text: (b, into) => into.dataset.who === 'assistant' ? `<div class="md">${markdown(b.text)}</div>` : `<div>${escape(b.text)}</div>`,
   thinking: (b) => `<details class="thinking"><summary>Thinking</summary><span>${escape(b.thinking)}</span></details>`,
   tool_use: (b) => `<details class="tool" id="call-${escape(b.id)}" open><summary>${escape(b.name)}</summary><pre>${escape(JSON.stringify(b.input))}</pre></details>`,
 };
@@ -205,7 +225,7 @@ const parts = {
 // block b at the end of `into`; a tool result joins its call's card when the page shows it
 function draw(into, b) {
   if (b.type === 'tool_result') return result($(`call-${b.toolUseId}`) ?? into, b);
-  into.insertAdjacentHTML('beforeend', (parts[b.type] ?? ((b) => `<div>${escape(note(b))}</div>`))(b));
+  into.insertAdjacentHTML('beforeend', (parts[b.type] ?? ((b) => `<div>${escape(note(b))}</div>`))(b, into));
   into.lastElementChild.dataset.kind = b.type;
 }
 
@@ -330,10 +350,13 @@ async function follow(response) {
       const event = JSON.parse(line);
       if (event.logged != null) {
         await showLog(event.logged);
-        $('log').insertAdjacentHTML('beforeend', '<div class="msg tail" id="reply"><div class="who">assistant</div></div>');
+        $('log').insertAdjacentHTML('beforeend', '<div class="msg tail" id="reply" data-who="assistant"><div class="who">assistant</div></div>');
       }
       if (event.thinking) Object.assign(part('thinking'), { open: true }).lastElementChild.textContent += event.thinking;
-      if (event.text) part('text').textContent += event.text;
+      if (event.text) {   // the reply's markdown so far, drawn again
+        const text = part('text');
+        text.innerHTML = markdown(text.source = (text.source ?? '') + event.text);
+      }
       if (event.approve) $(`call-${event.approve}`).insertAdjacentHTML('beforeend', '<div class="ask"><button data-answer="allow">Allow</button><button data-answer="always">Always allow</button><button data-answer="deny">Deny</button></div>');
       if (event.answered) $(`call-${event.answered}`).querySelector('.ask')?.remove();
       if (event.result) draw($('reply'), event.result);

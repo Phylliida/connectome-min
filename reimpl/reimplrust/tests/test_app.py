@@ -88,6 +88,9 @@ class Mock(BaseHTTPRequestHandler):
         elif 'fail once' in last and last not in seen['failed']:
             seen['failed'].append(last)
             return self.answer(529, {'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'Overloaded'}})
+        elif last.startswith('echo '):                             # the message back, as the reply
+            seen['chat'] += 1
+            blocks = [{'type': 'text', 'text': last[len('echo '):]}]
         elif 'a long story' in last:
             seen['chat'] += 1
             blocks, stop = [{'type': 'text', 'text': 'Once upon a time'}], 'max_tokens'
@@ -596,6 +599,9 @@ def chatted(turns, tls, ca, baseline) -> str:
             except urllib.error.HTTPError as error:
                 if error.code != 403:
                     raise
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/libs.js', timeout=10) as r:        # the page's markdown, and what cleans it
+            if b'marked v16' not in (libs := r.read()) or b'DOMPurify' not in libs:
+                raise SystemExit('the app does not serve the page its libraries')
         call(port, '/api/settings', {'name': 'plain', 'key': 'k-123', 'base': f'http://127.0.0.1:{plain_port}/v1'})   # a base with /v1, as OpenRouter's
         call(port, '/api/s/branch/settings', {'provider': 'plain', 'model': 'mock-2'})
         say(port, 'branch', 'with the saved key, over plain HTTP')

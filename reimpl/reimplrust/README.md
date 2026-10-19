@@ -14,7 +14,9 @@ autobiographical compaction) and a web app around it.
   speaks the Anthropic Messages API (Anthropic, DeepSeek at `https://api.deepseek.com/anthropic`,
   OpenRouter at `https://openrouter.ai/api/v1`), each request body streaming in chunks straight from
   the session's files, over ureq with TLS compiled in (rustls, ring, and Mozilla's root certificates),
-  so the binary needs nothing from the system but sockets.
+  so the binary needs nothing from the system but sockets. The page shows the assistant's text as
+  markdown, through marked and then DOMPurify, which keeps only the HTML markdown makes, so a reply can
+  neither run code on the page nor load anything; both are in `app/vendor/` as published, built in.
 
 `.github/workflows/connectome-web.yml` builds standalone binaries on GitHub's runners: Linux (static,
 x86_64 and arm64), Windows (x86_64) and macOS (arm64 and x86_64). Locally, `cargo build --release`.
