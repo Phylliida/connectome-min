@@ -47,7 +47,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
-seen = {'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None}
+seen = {'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None}
 
 
 class Mock(BaseHTTPRequestHandler):
@@ -276,9 +276,10 @@ def words(message, kind='text'):
 def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
     """A chat turn as the page has it, or without text one that continues the log, followed until its
     memories have formed: the reply's text and reasoning, and when each piece of text arrived. A call
-    that asks to run gets the answer `answers` has for its tool, else allow."""
+    that asks to run gets the answer `answers` has for its tool, else allow. The calls as the replies
+    stream them in, each its tool and its input's JSON, go to seen['calls']."""
     request = urllib.request.Request(f'http://127.0.0.1:{port}/api/s/{name}/{"continue" if text is None else "say"}', data=json.dumps({'text': text}).encode(), headers={'x-connectome': '1'})
-    pieces, thoughts, times, last, end, logged = [], [], [], {}, {}, 0
+    pieces, thoughts, times, last, end, logged, calls = [], [], [], {}, {}, 0, []
     with urllib.request.urlopen(request, timeout=15) as r:                   # no turn here goes 15 s without an event
         for line in r:
             last = json.loads(line)
@@ -288,6 +289,10 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
                 times.append(time.monotonic())
             if 'result' in last:
                 seen['events'].append(last)
+            if 'calling' in last:
+                calls.append([last['calling'], ''])
+            if 'input' in last:
+                calls[-1][1] += last['input']
             seen['forming'] |= last.get('forming', False)
             end = last if {'ok', 'error'} & set(last) else end
             if 'approve' in last:                                           # a call of the reply just logged
@@ -296,6 +301,7 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
                 seen['asked'].append(tool)
                 call(port, f'/api/s/{name}/approve', {'id': last['approve'], 'answer': (answers or {}).get(tool, 'allow')})
             thoughts.append(last.get('thinking', ''))
+    seen['calls'] = calls
     if not end.get('ok'):
         raise SystemExit(f'{name}: "{(text or "(continue)")[:40]}" got {end or last}')
     return ''.join(pieces), ''.join(thoughts), times
@@ -349,8 +355,8 @@ def streamed_large(tls, ca) -> str:
                 time.sleep(0.05)
         configure(root, f'https://localhost:{mock_port}', 20000000, 30000, 3000)
         call(port, '/api/sessions', {'name': 'large', 'workspace': tempfile.mkdtemp()})
-        if (tools := call(port, '/api/s/large')['tools']) != []:
-            raise SystemExit(f'without bash, a session with a workspace has tools {tools}')
+        if (tools := call(port, '/api/s/large')['tools']) != ['edit']:
+            raise SystemExit(f'without bash, a session with a workspace has tools {tools}, not only edit')
         peaks, contexts = [], []
         for t in range(12):
             words = ' '.join(f'w{t}x{i}' for i in range(size // 8))[:size]
@@ -424,8 +430,8 @@ def tooled(tls, ca, baseline) -> str:
         if (spaces := {s['name']: s['workspace'] for s in call(port, '/api/sessions')}) != {'tools': work, 'bare': None}:
             raise SystemExit(f'the sessions\' workspaces: {spaces}')
         state = call(port, '/api/s/tools')
-        if (names := state['tools']) != ['bash', 'fail', 'picture', 'hang', 'die', 'add'] or state['overhead'] < 2000:
-            raise SystemExit(f'tools {names} ({state["overhead"]} tokens): expected bash, the first server\'s but its add, then the second\'s wordy add')
+        if (names := state['tools']) != ['bash', 'edit', 'fail', 'picture', 'hang', 'die', 'add'] or state['overhead'] < 2000:
+            raise SystemExit(f'tools {names} ({state["overhead"]} tokens): expected bash, edit, the first server\'s but its add, then the second\'s wordy add')
         got = results('please use tools now', {'fail': 'deny', 'picture': 'always'}, ['add', 'fail', 'picture'])
         expected = {'0': [{'type': 'text', 'text': '5 (shadow)'}], '1': "the user didn't allow this call",
                     '2': [{'type': 'text', 'text': 'a picture:'}, {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': 'iVBORw0KGgo='}}],
@@ -472,6 +478,23 @@ def tooled(tls, ca, baseline) -> str:
         if got['0']['content'] != '\n[killed after 0.4 s]' or Path(work, 'survived').exists():
             raise SystemExit(f'a sandboxed command past its timeout: {got}, or what it started outlived it')
         call(port, '/api/s/tools/settings', {'sandbox': False})
+        os.symlink(root, Path(work, 'out'))                             # edits: a file made, its text replaced; refusals; ways out
+        edits = [{'path': 'notes/a.txt', 'old': '', 'new': 'one\ntwo\ntwo\n'}, {'path': 'notes/a.txt', 'old': 'one', 'new': 'uno'},
+                 {'path': 'notes/a.txt', 'old': 'two', 'new': 'dos'}, {'path': 'notes/a.txt', 'old': 'two', 'new': 'dos', 'all': True},
+                 {'path': 'notes/a.txt', 'old': 'three', 'new': 'x'}, {'path': 'notes/a.txt', 'old': '', 'new': 'x'},
+                 {'path': '../escaped', 'old': '', 'new': 'x'}, {'path': 'new/../../escaped', 'old': '', 'new': 'x'}, {'path': f'{root}/escaped', 'old': '', 'new': 'x'},
+                 {'path': 'out/escaped', 'old': '', 'new': 'x'}]
+        got = results('call ' + json.dumps([['edit', e] for e in edits]), asked=['edit'] * len(edits))
+        outcomes = [(got[str(k)]['content'], got[str(k)].get('is_error', False)) for k in range(len(edits))]
+        outside = lambda path: (f'{path} is outside the workspace, {work}', True)
+        expected = [('made notes/a.txt, 3 lines', False), ('edited notes/a.txt at line 1', False),
+                    ('the text to replace is in notes/a.txt 2 times: give more of it, around the change, or all', True), ('edited notes/a.txt in 2 places, the first at line 2', False),
+                    ("the text to replace isn't in notes/a.txt", True), ('notes/a.txt exists: give the text to replace in it', True), outside('../escaped'), outside('new/../../escaped'), outside(f'{root}/escaped'), outside('out/escaped')]
+        if outcomes != expected or Path(work, 'notes/a.txt').read_text() != 'uno\ndos\ndos\n' or Path(root, 'escaped').exists() or Path(work).parent.joinpath('escaped').exists():
+            raise SystemExit(f'edits: {outcomes}')
+        if [[tool, json.loads(given)] for tool, given in seen['calls']] != [['edit', e] for e in edits]:
+            raise SystemExit(f'the calls as the reply streamed them: {seen["calls"][:2]}')
+        os.remove(Path(work, 'out'))
         got = results('call [["hang", {}], ["picture", {}]]', asked=['hang'])
         if got['0']['content'] != 'MCP server first: tools/call timed out after 1 s' or got['1'].get('is_error'):
             raise SystemExit(f'a call past its timeout, then another of the same server: {got}')

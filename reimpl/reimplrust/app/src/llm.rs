@@ -31,7 +31,8 @@ impl Llm {
     /// POSTs to {base}/v1/messages (or {base}/messages for a base that ends in /v1) `head`'s fields
     /// and `turns` as the messages, read through `reader` as they're written out, asking for a stream;
     /// hands `piece` each piece of the reply's text or reasoning as it arrives ("text" or "thinking",
-    /// and the piece), and gives the whole reply as the library takes it: {stopReason, content, usage:
+    /// and the piece), and each call's tool as it starts and its input as it comes ("calling" and the
+    /// tool's name, "input" and a piece of its JSON), and gives the whole reply as the library takes it: {stopReason, content, usage:
     /// {inputTokens, outputTokens}}.
     pub fn messages(&self, mut head: Value, turns: &[Turn], reader: &mut Reader, mut piece: impl FnMut(&str, &str)) -> Result<Value, String> {
         let base = self.base.trim_end_matches('/');
@@ -81,7 +82,12 @@ impl Reply {
                 self.input = tokens(usage, "input_tokens") + tokens(usage, "cache_read_input_tokens") + tokens(usage, "cache_creation_input_tokens");
                 self.output = tokens(usage, "output_tokens");
             }
-            "content_block_start" => self.blocks.push(e["content_block"].clone()),
+            "content_block_start" => {
+                if e["content_block"].kind() == "tool_use" {
+                    show("calling", e["content_block"]["name"].as_str().unwrap_or(""));
+                }
+                self.blocks.push(e["content_block"].clone());
+            }
             "content_block_delta" => {
                 let block = self.blocks.last_mut().ok_or("a delta before its block")?;
                 let key = match e["delta"].kind().strip_suffix("_delta") {
@@ -94,8 +100,10 @@ impl Reply {
                     Value::String(s) => s.push_str(more),
                     slot => *slot = more.into(),
                 }
-                if key == "text" || key == "thinking" {
-                    show(key, more);
+                match key {
+                    "partial_json" => show("input", more),
+                    "signature" => {}
+                    _ => show(key, more),
                 }
             }
             "content_block_stop" => {

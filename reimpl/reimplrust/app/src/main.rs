@@ -2,7 +2,7 @@
 //! shows each session's memory pyramid and what its context shows, and forks a session at any message.
 //! One binary that needs nothing installed: the page is built in, and so is TLS (rustls, ring and
 //! Mozilla's roots). README.md describes its flags, its settings files (settings.rs) and its tools
-//! (bash.rs, mcp.rs).
+//! (tools/).
 //!
 //! Whatever changes has one thread that owns it, and threads tell each other things through channels,
 //! sharing nothing that changes. A request's thread reads files and tells the hub what it wants of a
@@ -14,13 +14,11 @@
 //! the user allows it, their results joining the log. Memories form between steps and after the turn.
 //! A session's files are its only record: the hub keeps beside them only what they don't hold yet.
 
-mod bash;
 mod llm;
-mod mcp;
 mod settings;
 mod tools;
 
-use crate::{llm::Llm, settings::{SessionSettings, Settings}, tools::Toolbox};
+use crate::{llm::Llm, settings::{SessionSettings, Settings}, tools::{bash, edit, mcp, Toolbox}};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Reader}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{Host, Request}, store::Session};
 use serde::{de::DeserializeOwned, Serialize, Serializer};
@@ -31,9 +29,13 @@ use std::{path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender}, time::
 const PAGE: &str = include_str!("ui.html");
 
 /// The page's libraries, as published (vendor/): marked, which turns the assistant's markdown into
-/// HTML, DOMPurify, which cleans that HTML, and KaTeX, which sets its math, with KaTeX's stylesheet
-/// and the fonts it names (fonts/NAME.woff2).
-const LIBS: &str = concat!(include_str!("../vendor/marked.umd.js"), "\n;", include_str!("../vendor/purify.min.js"), "\n;", include_str!("../vendor/katex/katex.min.js"));
+/// HTML, DOMPurify, which cleans that HTML, KaTeX, which sets its math, jsdiff, which finds the lines
+/// an edit changes, and highlight.js, which colors code; with KaTeX's stylesheet and the fonts it
+/// names (fonts/NAME.woff2).
+const LIBS: &str = concat!(
+    include_str!("../vendor/marked.umd.js"), "\n;", include_str!("../vendor/purify.min.js"), "\n;", include_str!("../vendor/katex/katex.min.js"),
+    "\n;", include_str!("../vendor/diff/diff.min.js"), "\n;", include_str!("../vendor/highlight/highlight.min.js"),
+);
 const KATEX_CSS: &str = include_str!("../vendor/katex/katex.min.css");
 static FONTS: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/vendor/katex/fonts");
 
@@ -233,7 +235,7 @@ fn main() {
     let (addr, agent) = (arg("--addr", "127.0.0.1:8080"), llm::agent(ca.as_deref()).expect("--ca"));
     let app: &'static App = Box::leak(Box::new(App { root, addr, agent, mcp, bash: !flag("--no-bash"), limit, hub: told }));
     if !global_path(app).exists() {
-        let tools = if app.bash { bash::tool(PathBuf::new(), limit, None) } else { Toolbox::default() } + mcp::toolbox(&app.mcp);
+        let tools = if app.bash { bash::tool(PathBuf::new(), limit, None) } else { Toolbox::default() } + edit::tool(PathBuf::new()) + mcp::toolbox(&app.mcp);
         settings::write(&global_path(app), &Settings::first(overhead(None, &tools.definitions()))).expect("settings.json");
     }
     std::thread::spawn(move || hub(app, inbox));
@@ -434,7 +436,8 @@ fn work(app: &App, name: &str, jobs: Receiver<Job>, tell: &dyn Fn(Msg)) {
 /// user's message or the tool results, and after a reply cut short with that reply, which the Messages
 /// API continues (a prefill). The turn tells the hub (`tell`) what the pages following it see: the
 /// log's length each time it grows ({"logged"}), the pieces of a reply's reasoning and text
-/// ({"thinking"}, {"text"}), the question whether each call may run ({"approve"}: its id; the answers
+/// ({"thinking"}, {"text"}), each call's tool as the reply starts it and its input as it comes
+/// ({"calling"}, {"input"}), the question whether each call may run ({"approve"}: its id; the answers
 /// come from the pages: {"answered": the id, "answer"}), and each call's result ({"result"}: the
 /// tool_result block, brief). Memories form between steps; the session's thread tells the turn's end
 /// ({"ok": true} once it has joined the log, or {"error"}), then forms the memories after it.
@@ -521,12 +524,12 @@ fn setup(app: &App, name: &str) -> Result<Setup, String> {
     let (all, s) = (global(app)?, profile(app, name)?);
     let p = all.providers.get(&s.provider).ok_or_else(|| format!("no provider {} in settings.json", s.provider))?;
     let llm = Llm { base: p.base.clone(), key: p.key.clone(), agent: app.agent.clone() };
-    let bash = match &s.workspace {
-        Some(dir) if app.bash => bash::tool(dir.clone(), app.limit, s.sandbox.then_some(all.sandbox)),
-        None if app.bash => bash::unavailable("it has no workspace; the user can set one in the session's settings"),
-        _ => Toolbox::default(),
+    let no_workspace = "it has no workspace; the user can set one in the session's settings";
+    let (bash, edit) = match &s.workspace {
+        Some(dir) => (bash::tool(dir.clone(), app.limit, s.sandbox.then_some(all.sandbox)), edit::tool(dir.clone())),
+        None => (bash::unavailable(no_workspace), edit::unavailable(no_workspace)),
     };
-    let tools = bash + mcp::toolbox(&app.mcp);
+    let tools = if app.bash { bash } else { Toolbox::default() } + edit + mcp::toolbox(&app.mcp);
     let definitions = tools.definitions();
     Ok(Setup { overhead: overhead(s.system.as_deref(), &definitions), settings: s, llm, tools, definitions })
 }

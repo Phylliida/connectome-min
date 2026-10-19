@@ -8,7 +8,8 @@
 //! the paths the sandbox's settings name that exist, in its own PID namespace, which goes when bwrap is
 //! killed, so a timeout still takes everything the command started.
 
-use crate::{settings::{expand, Sandbox}, tools::{Outcome, Tool, Toolbox}};
+use super::{Outcome, Tool, Toolbox};
+use crate::settings::{expand, Sandbox};
 use connectome::{json::Value, obj};
 use std::{ffi::OsString, fs::File, io::{Read, Seek, SeekFrom}, path::{Path, PathBuf}, process::{Command, Stdio}, time::Duration};
 use wait_timeout::ChildExt;
@@ -35,13 +36,9 @@ pub fn tool(dir: PathBuf, limit: Duration, sandbox: Option<Sandbox>) -> Toolbox 
     Toolbox(vec![Tool { definition, asks: true, run: Box::new(move |input| run(&dir, input, limit, sandbox.as_ref())) }])
 }
 
-/// bash where it can't run, declared all the same, so that a session whose history calls it still
-/// declares it (as the Messages API requires, and so a call comes back as one, not as text); each
-/// call fails at once, saying `why`, without asking.
+/// bash where it can't run (super::unavailable).
 pub fn unavailable(why: &'static str) -> Toolbox {
-    let description = format!("Runs a command in {}, but not in this session: {why}.", SHELL[0]);
-    let definition = obj! {"name" => "bash", "description" => description, "input_schema" => obj! {"type" => "object"}};
-    Toolbox(vec![Tool { definition, asks: false, run: Box::new(move |_| Err(why.into())) }])
+    super::unavailable("bash", &format!("Runs a command in {}", SHELL[0]), why)
 }
 
 fn run(dir: &Path, input: &Value, limit: Duration, sandbox: Option<&Sandbox>) -> Outcome {

@@ -4,12 +4,16 @@
 //! Err(content) for a failure, the content being a tool result's (a string, or text and image blocks
 //! as the library logs them). A Toolbox is a monoid under `+`: the union of two, a tool on the right
 //! shadowing a same-named one on the left, with the empty toolbox as identity. So tool sources compose
-//! in order: the tools built into the binary (bash.rs), then each MCP server's, in the config's order
-//! (mcp.rs). A tool built in is a Tool whose `run` does the work in-process. A toolbox is made for each
+//! in order: the tools built into the binary (bash.rs, edit.rs), then each MCP server's, in the
+//! config's order (mcp.rs). A tool built in is a Tool whose `run` does the work in-process. A toolbox is made for each
 //! step, from the settings as they are then, and owns its tools.
 
 use connectome::{json::{sparse, Value}, obj};
 use std::{ops::Add, panic::{catch_unwind, AssertUnwindSafe}};
+
+pub mod bash;
+pub mod edit;
+pub mod mcp;
 
 pub type Outcome = Result<Value, Value>;
 
@@ -50,6 +54,14 @@ impl Add for Toolbox {
         let kept: Vec<Tool> = self.0.into_iter().filter(|t| !right.names().contains(&t.name())).collect();
         Toolbox(kept.into_iter().chain(right.0).collect())
     }
+}
+
+/// A tool where it can't run, declared all the same, so that a session whose history calls it still
+/// declares it (as the Messages API requires, and so a call comes back as one, not as text): what it
+/// `does`, but not here, and why; each call fails at once, saying `why`, without asking.
+pub fn unavailable(name: &str, does: &str, why: &'static str) -> Toolbox {
+    let definition = obj! {"name" => name, "description" => format!("{does}, but not in this session: {why}."), "input_schema" => obj! {"type" => "object"}};
+    Toolbox(vec![Tool { definition, asks: false, run: Box::new(move |_| Err(why.into())) }])
 }
 
 /// A call's result as the library logs it: {type, toolUseId, content, isError?}.

@@ -10,7 +10,7 @@
 //!
 //!     {"mcpServers": {"NAME": {"command": "...", "args": ["..."], "env": {"KEY": "..."}}}}
 
-use crate::tools::{Outcome, Tool, Toolbox};
+use super::{Outcome, Tool, Toolbox};
 use connectome::{json::{self, sparse, Json, Value}, obj};
 use std::{collections::HashMap, io::{BufRead, BufReader, Write}, process::{Child, ChildStdin, Command, Stdio}, time::{Duration, Instant}};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};

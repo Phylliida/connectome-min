@@ -17,7 +17,8 @@ autobiographical compaction) and a web app around it.
   so the binary needs nothing from the system but sockets. The page shows the assistant's text as
   markdown, through marked and then DOMPurify, which keeps only the HTML markdown makes, so a reply can
   neither run code on the page nor load anything; its math (`$…$` or `\(…\)` inline, `$$…$$` or
-  `\[…\]` displayed) KaTeX sets in its own fonts. All three are in `app/vendor/` as published, built in.
+  `\[…\]` displayed) KaTeX sets in its own fonts, and highlight.js colors its code blocks. These, and
+  jsdiff for edits' diffs, are in `app/vendor/` as published, built in.
 
 `.github/workflows/connectome-web.yml` builds standalone binaries on GitHub's runners: Linux (static,
 x86_64 and arm64), Windows (x86_64) and macOS (arm64 and x86_64). Locally, `cargo build --release`.
@@ -40,8 +41,10 @@ since one holds the keys:
   a session without one has none to run with, and the page says so.
   The page edits the main fields; `config.merge_threshold` can't change once memories have merged.
 
-Tools: the model can call `bash` (built in: a command in a new shell in the session's workspace, or
-`cmd` on Windows; `--no-bash` leaves it out) and the tools
+Tools (`app/src/tools/`): the model can call `bash` (a command in a new shell in the session's
+workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in the workspace changed by
+replacing text in it, which must occur once unless the call says `all`, or made; its paths can't lead
+out of the workspace, through `..`, an absolute path or a link) and the tools
 of the MCP servers in `ROOT/mcp.json` (or `--mcp FILE`), listed all at once at startup (one whose tools
 can't be listed is stopped), in the usual format:
 
@@ -49,8 +52,8 @@ can't be listed is stopped), in the usual format:
 {"mcpServers": {"NAME": {"command": "...", "args": ["..."], "env": {"KEY": "..."}}}}
 ```
 
-A session without a workspace still declares bash, but each call fails at once, without asking, with
-a note to set one: so a session whose history calls bash still declares it, as the Messages API
+A session without a workspace still declares bash and edit, but each call fails at once, without asking, with
+a note to set one: so a session whose history calls them still declares them, as the Messages API
 requires, and the model's calls come back as calls (without the declaration, some providers return
 the model's own tool-call markup as text).
 
@@ -65,7 +68,8 @@ the session's settings; the page's tool list toggles them. A call has `--tool-ti
 default): bash kills a command still running then, with what it started, and an MCP call that runs out
 is cancelled without holding up the server's next call; a server that stops starts again at its next
 call. A turn takes steps, a model request each, until a reply calls no tools (at most 64), and the page
-shows each call as a card on its reply, which its result then joins. A turn's log is the session's: a
+shows each call as a card on its reply, its tool and input as the reply writes it, which its result
+then joins; an edit's card shows its change as a diff, colored in the file's language. A turn's log is the session's: a
 page following a turn shows the log as it grows, read from disk, and besides it only what the log
 doesn't hold yet (a reply streaming in, the questions whether its calls may run, their results,
 memories forming), which is all the app keeps of a turn; its stream ends once the turn's memories
@@ -98,5 +102,5 @@ python3 tests/mutants.py tests/test_app.py app/src/main.rs=mutants.json   # muta
 ```
 
 The three take under 30 seconds together. A batch of mutants takes about as long as its slowest one
-(68 of the app's, under a minute): they build without link-time optimization, from a build kept in
+(81 of the app's, under a minute): they build without link-time optimization, from a build kept in
 `target/mutants`.
