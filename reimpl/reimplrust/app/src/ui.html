@@ -259,14 +259,14 @@ async function open() {
 }
 
 // the log's newest messages, up to the nth if given, their blocks drawn, the user's on the right. A
-// message's line shows only where the speaker changes ("more" goes on), and a message of tool results
+// message's line (whose it is) shows only where the speaker changes ("more" goes on), and a message of tool results
 // whose results all joined their calls isn't shown at all.
 async function showLog(n) {
   const messages = await api(`/api/s/${current()}/messages${n == null ? '' : `?to=${n}`}`);
   $('log').innerHTML = '';
   for (const m of messages) {
     const results = m.content.every((b) => b.type === 'tool_result'), more = m.participant === shownLast()?.dataset.who;
-    $('log').insertAdjacentHTML('beforeend', `<div class="msg${results ? ' results' : ''}${more ? ' more' : ''}" data-who="${escape(m.participant)}"><div class="who">#${m.id} · ${escape(m.participant)}${results ? ' · tool results' : ''}</div><button data-fork="${m.id}">fork here</button></div>`);
+    $('log').insertAdjacentHTML('beforeend', `<div class="msg${results ? ' results' : ''}${more ? ' more' : ''}" data-who="${escape(m.participant)}"><div class="who">${escape(m.participant)}${results ? ' · tool results' : ''}</div><button data-fork="${m.id}">fork here</button></div>`);
     const shown = $('log').lastElementChild;
     for (const b of m.content) draw(shown, b);
     shown.hidden = results && !shown.querySelector('.tool');
