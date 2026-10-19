@@ -51,6 +51,7 @@ input[type=checkbox] { width: auto; }
 .tool pre { white-space: pre-wrap; font: 12px/1.4 ui-monospace, monospace; margin: 4px 0; }
 .tool.failed summary, .tool pre.failed { color: var(--warn); }
 .ask { display: flex; gap: 6px; margin: 4px 0 6px; }
+#reply:has(> .who:only-child) { display: none; }
 .chip { font-size: 12px; padding: 0 6px; margin-left: 4px; color: var(--muted); }
 .chip.on { border-color: var(--tail); color: var(--tail); }
 .msg > button { position: absolute; top: 6px; right: 6px; font-size: 12px; padding: 1px 6px; display: none; }
@@ -125,7 +126,8 @@ pre#detail { white-space: pre-wrap; background: var(--panel); border: 1px solid 
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
-let current = null, state = null, poll = null, providers = [], showing = null;   // showing: the turn this page follows
+let state = null, poll = null, providers = [], showing = null;   // showing: the turn this page follows
+const current = () => decodeURIComponent(location.hash.slice(1));   // the session the page shows
 
 async function api(path, body) {
   const r = await fetch(path, body ? { method: 'POST', headers: { 'x-connectome': '1' }, body: JSON.stringify(body) } : {});
@@ -145,7 +147,7 @@ async function listSessions() {
   const all = await api('/api/sessions'), workspace = (s) => s.workspace || '';
   const group = (w) => {
     const members = all.filter((s) => workspace(s) === w), inside = (s) => members.some((m) => m.name === s.parent?.name);
-    const draw = (p, depth) => members.filter((s) => (inside(s) ? s.parent.name : null) === p).map((s) => `<a href="#${s.name}" class="${s.name === current ? 'on' : ''}" style="padding-left:${6 + depth * 14}px">${escape(s.name)} <small>${s.messages}${s.parent ? ' · from ' + s.parent.at : ''}</small></a>` + draw(s.name, depth + 1)).join('');
+    const draw = (p, depth) => members.filter((s) => (inside(s) ? s.parent.name : null) === p).map((s) => `<a href="#${s.name}" class="${s.name === current() ? 'on' : ''}" style="padding-left:${6 + depth * 14}px">${escape(s.name)} <small>${s.messages}${s.parent ? ' · from ' + s.parent.at : ''}</small></a>` + draw(s.name, depth + 1)).join('');
     const title = w ? `<b>${escape(w.split(/[\\/]/).pop())}</b> · ${members.length}<small>${escape(w)}</small>` : `<b>No workspace</b> · ${members.length}`;
     return `<details class="group" data-workspace="${escape(w)}"${folded.has(w) ? '' : ' open'}><summary>${title}</summary>${draw(null, 0)}</details>`;
   };
@@ -160,25 +162,54 @@ $('sessions').addEventListener('toggle', (e) => {
   try { localStorage.setItem('folded', JSON.stringify([...folded])); } catch { /* no storage here: kept until the page reloads */ }
 }, true);
 
-async function open(name) {
+async function open() {
   showing?.abort();
-  current = name;
-  state = await api(`/api/s/${name}`);
+  state = await api(`/api/s/${current()}`);
   await showLog();
   drawMemory();
   fill();
   listSessions();
   setStatus();
-  if (state.running) follow(fetch(`/api/s/${name}/live`, { signal: (showing = new AbortController()).signal }));
+  if (state.running) follow(fetch(`/api/s/${current()}/live`, { signal: (showing = new AbortController()).signal }));
 }
 
-// the log's newest messages, up to the nth if given, each as the context shows it: in the raw tail,
-// in a raw chunk, or recalled through a memory
+// the log's newest messages, up to the nth if given, each as the context shows it (in the raw tail,
+// in a raw chunk, or recalled through a memory), its blocks drawn
 async function showLog(n) {
-  const messages = await api(`/api/s/${current}/messages${n == null ? '' : `?to=${n}`}`);
-  const thinking = (m) => m.thinking ? `<details class="thinking"><summary>Thinking</summary>${escape(m.thinking)}</details>` : '';
-  $('log').innerHTML = messages.map((m) => `<div class="msg ${m.shown}"><div class="who">#${m.id} · ${escape(m.participant)}</div>${thinking(m)}${escape(m.text)}<button data-fork="${m.id}">fork here</button></div>`).join('');
+  const messages = await api(`/api/s/${current()}/messages${n == null ? '' : `?to=${n}`}`);
+  $('log').innerHTML = '';
+  for (const m of messages) {
+    const results = m.content.every((b) => b.type === 'tool_result') ? ' · tool results, on the calls' : '';
+    $('log').insertAdjacentHTML('beforeend', `<div class="msg ${m.shown}"><div class="who">#${m.id} · ${escape(m.participant)}${results}</div><button data-fork="${m.id}">fork here</button></div>`);
+    for (const b of m.content) draw($('log').lastElementChild, b);
+  }
   $('log').scrollTop = $('log').scrollHeight;
+}
+
+// how a block shows: text as it is, reasoning folded, a call as a card that stays open until its
+// result joins it, anything else as a note (an image as its size)
+const note = (b) => b.type === 'image' ? `[image, ${b.kb} KB]` : `[${b.type}]`;
+const parts = {
+  text: (b) => `<div>${escape(b.text)}</div>`,
+  thinking: (b) => `<details class="thinking"><summary>Thinking</summary><span>${escape(b.thinking)}</span></details>`,
+  tool_use: (b) => `<details class="tool" id="call-${escape(b.id)}" open><summary>${escape(b.name)}</summary><pre>${escape(JSON.stringify(b.input))}</pre></details>`,
+};
+
+// block b at the end of `into`; a tool result joins its call's card when the page shows it
+function draw(into, b) {
+  if (b.type === 'tool_result') return result($(`call-${b.toolUseId}`) ?? into, b);
+  into.insertAdjacentHTML('beforeend', (parts[b.type] ?? ((b) => `<div>${escape(note(b))}</div>`))(b));
+  into.lastElementChild.dataset.kind = b.type;
+}
+
+// a tool result's text, and on its call's card its first line, the card then closed
+function result(card, b) {
+  const text = typeof b.content === 'string' ? b.content : b.content.map((c) => c.text ?? note(c)).join('\n');
+  card.insertAdjacentHTML('beforeend', `<pre class="${b.isError ? 'failed' : ''}">${escape(text)}</pre>`);
+  if (!card.matches('.tool')) return;
+  card.querySelector('summary').textContent += ` → ${text.split('\n')[0].slice(0, 100)}`;
+  card.classList.toggle('failed', !!b.isError);
+  card.open = false;
 }
 
 // the session form shows the session's settings, a field per input of its name
@@ -191,7 +222,7 @@ $('session').onsubmit = async (e) => {
   e.preventDefault();
   const value = (el) => el.type === 'checkbox' ? el.checked : el.type === 'number' ? Number(el.value) : el.value || null;
   try {
-    state = await api(`/api/s/${current}/settings`, Object.fromEntries(fields().map((el) => [el.name, value(el)])));
+    state = await api(`/api/s/${current()}/settings`, Object.fromEntries(fields().map((el) => [el.name, value(el)])));
     fill();
     drawMemory();
     $('ssaved').textContent = 'Saved.';
@@ -205,7 +236,7 @@ function setStatus(text, warn) {
 }
 
 function drawMemory() {
-  const s = state, used = s.armed || 0, { window = 0, model = '' } = s.settings || {};
+  const s = state, used = s.armed || 0, { window = 0, model = '', allow = [], config = {} } = s.settings || {};
   $('stats').innerHTML = `
     <div class="stat"><span>Last context</span><span>${Math.round(used).toLocaleString()} / ${window.toLocaleString()} tokens</span></div>
     <div class="bar"><div style="width:${Math.min(100, 100 * used / window)}%"></div></div>
@@ -213,12 +244,12 @@ function drawMemory() {
     <div class="stat"><span>Chunks · memories</span><span>${s.layers[0] || 0} · ${s.layers.slice(1).join(' / ') || 0}</span></div>
     <div class="stat"><span>Price multiplier</span><span>${(s.multiplier || 1).toFixed(3)}</span></div>
     <div class="stat"><span>Model</span><span>${escape(model)}</span></div>
-    <div class="stat"><span>Tools</span><span>${s.tools.map((t) => `<button class="chip ${t.allowed ? 'on' : ''}" data-tool="${escape(t.name)}" title="${t.allowed ? 'Always allowed. Click to ask first.' : 'Asks first. Click to always allow.'}">${escape(t.name)}</button>`).join('') || 'none'}</span></div>
+    <div class="stat"><span>Tools</span><span>${s.tools.map((t) => `<button class="chip ${allow.includes(t) ? 'on' : ''}" data-tool="${escape(t)}" title="${allow.includes(t) ? 'Always allowed. Click to ask first.' : 'Asks first. Click to always allow.'}">${escape(t)}</button>`).join('') || 'none'}</span></div>
     <div class="stat"><span>Tools and system prompt</span><span>${Math.round(s.overhead).toLocaleString()} tokens</span></div>`;
   const chunks = s.layers[0] || 0, shown = new Set((s.frontier || []).map(([l, p]) => `${l}/${p}`));
   const rows = [];
   for (let level = s.layers.length - 1; level >= 0; level--) {
-    const span = level === 0 ? 1 : s.k ** (level - 1), cells = [];
+    const span = level === 0 ? 1 : config.merge_threshold ** (level - 1), cells = [];
     for (let p = 0; p < s.layers[level]; p++) {
       const left = 100 * p * span / Math.max(chunks, 1), width = 100 * span / Math.max(chunks, 1);
       const color = level === 0 ? '' : `background: var(--l${Math.min(level, 5)});`;
@@ -231,17 +262,19 @@ function drawMemory() {
 
 // a tool's chip toggles whether the session always allows it
 $('stats').onclick = async (e) => {
-  const tool = e.target.dataset.tool;
-  if (!tool) return;
-  const allow = state.tools.filter((t) => t.allowed !== (t.name === tool)).map((t) => t.name);
-  try { state = await api(`/api/s/${current}/settings`, { allow }); drawMemory(); } catch (err) { setStatus(err.message, true); }
+  const tool = e.target.dataset.tool, { allow } = state.settings || {};
+  if (!tool || !allow) return;
+  try {
+    state = await api(`/api/s/${current()}/settings`, { allow: allow.includes(tool) ? allow.filter((t) => t !== tool) : [...allow, tool] });
+    drawMemory();
+  } catch (err) { setStatus(err.message, true); }
 };
 
 $('pyramid').onclick = async (e) => {
   const node = e.target.dataset.node;
   if (!node) return;
   const [level, p] = node.split('/').map(Number);
-  const [record] = await api(`/api/s/${current}/layer/${level}?from=${p}&to=${p + 1}`);
+  const [record] = await api(`/api/s/${current()}/layer/${level}?from=${p}&to=${p + 1}`);
   $('detail').textContent = level === 0
     ? `Chunk ${p}: messages ${record.first}–${record.last}, ~${Math.round(record.raw)} tokens raw`
     : `L${level} memory ${p} (messages ${record.first}–${record.last}, ${record.tokens} tokens)\n\n${record.text}`;
@@ -251,12 +284,12 @@ $('pyramid').onclick = async (e) => {
 $('log').onclick = async (e) => {
   const { fork: at, answer } = e.target.dataset, card = e.target.closest('.tool');
   try {
-    const name = at && prompt(`Name for a fork of ${current} at message #${at}`, `${current}-${at}`);
-    if (name) { await api(`/api/s/${current}/fork`, { at: Number(at), name }); location.hash = name; }
+    const name = at && prompt(`Name for a fork of ${current()} at message #${at}`, `${current()}-${at}`);
+    if (name) { await api(`/api/s/${current()}/fork`, { at: Number(at), name }); location.hash = name; }
     if (!answer) return;
     e.target.parentElement.remove();
     setStatus(answer === 'deny' ? 'Denied.' : 'Running…');
-    await api(`/api/s/${current}/approve`, { id: card.id.slice('call-'.length), answer });
+    await api(`/api/s/${current()}/approve`, { id: card.id.slice('call-'.length), answer });
   } catch (err) { setStatus(err.message, true); }
 };
 
@@ -272,30 +305,27 @@ $('continue').onclick = () => turn(null);
 
 // a turn: `text` joins the log and the model answers it, or without text the model goes on from the log as it is
 function turn(text) {
-  if (!current) return;
+  if (!current()) return;
   showing?.abort();
   showing = new AbortController();
-  follow(fetch(`/api/s/${current}/${text ? 'say' : 'continue'}`, { method: 'POST', headers: { 'x-connectome': '1' }, body: JSON.stringify({ text }), signal: showing.signal }));
+  follow(fetch(`/api/s/${current()}/${text ? 'say' : 'continue'}`, { method: 'POST', headers: { 'x-connectome': '1' }, body: JSON.stringify({ text }), signal: showing.signal }));
 }
 
 // a turn as it streams, JSON lines: {"logged": n} each time the log grows (the page shows it, then what
-// it doesn't hold yet below it), {"thinking"} or {"text"} for each piece of a reply, {"tool"} for each
-// call, {"approve"} when it asks to run and {"answered"} once a page answers, {"result"} for its result,
-// then {"ok"} or {"error"}; then the session as the turn leaves it. Opening a session stops it showing.
+// it doesn't hold yet below it), {"thinking"} or {"text"} for each piece of a reply, then for each call
+// the logged reply makes {"approve"} when it asks to run, {"answered"} once a page answers and its
+// {"result"}; then {"ok"} or {"error"}; then the session as the turn leaves it. Opening a session
+// stops it showing.
 async function follow(response) {
   setStatus('Waiting for the model…');
   let error = null;
   try {
     const reader = (await response).body.getReader(), decoder = new TextDecoder();
     let buffered = '';
-    // the reply's parts in order: a run of reasoning or of text continues its part; each call is a card
-    const part = (kind, html) => {
-      const reply = $('reply');
-      if (reply.lastElementChild.dataset.kind !== kind || kind === 'tool') {
-        reply.insertAdjacentHTML('beforeend', html);
-        reply.lastElementChild.dataset.kind = kind;
-      }
-      return reply.lastElementChild;
+    // a run of reasoning or of text continues the streaming reply's last part
+    const part = (kind) => {
+      if ($('reply').lastElementChild.dataset.kind !== kind) draw($('reply'), { type: kind, [kind]: '' });
+      return $('reply').lastElementChild;
     };
     const take = async (line) => {
       if (!line.trim()) return;
@@ -304,18 +334,11 @@ async function follow(response) {
         await showLog(event.logged);
         $('log').insertAdjacentHTML('beforeend', '<div class="msg tail" id="reply"><div class="who">assistant</div></div>');
       }
-      if (event.thinking) part('thinking', '<details class="thinking" open><summary>Thinking</summary><span></span></details>').lastElementChild.textContent += event.thinking;
-      if (event.text) part('text', '<div></div>').textContent += event.text;
-      if (event.tool) part('tool', `<details class="tool" open><summary>${escape(event.tool.name)}</summary><pre>${escape(JSON.stringify(event.tool.input))}</pre></details>`).id = `call-${event.tool.id}`;
+      if (event.thinking) Object.assign(part('thinking'), { open: true }).lastElementChild.textContent += event.thinking;
+      if (event.text) part('text').textContent += event.text;
       if (event.approve) $(`call-${event.approve}`).insertAdjacentHTML('beforeend', '<div class="ask"><button data-answer="allow">Allow</button><button data-answer="always">Always allow</button><button data-answer="deny">Deny</button></div>');
       if (event.answered) $(`call-${event.answered}`).querySelector('.ask')?.remove();
-      if (event.result) {
-        const card = $(`call-${event.result.id}`);
-        card.insertAdjacentHTML('beforeend', `<pre class="${event.result.error ? 'failed' : ''}">${escape(event.result.text)}</pre>`);
-        card.querySelector('summary').textContent += ` → ${event.result.text.split('\n')[0].slice(0, 100)}`;
-        card.classList.toggle('failed', event.result.error);
-        card.open = false;
-      }
+      if (event.result) draw($('reply'), event.result);
       if (event.error) error = event.error;
       setStatus(event.approve ? 'Waiting for you to allow or deny the call…' : '');
       $('log').scrollTop = $('log').scrollHeight;
@@ -331,7 +354,7 @@ async function follow(response) {
     if (err.name === 'AbortError') return;
     error = err.message;
   }
-  await open(current);
+  await open();
   if (error) setStatus(error, true); else watch();
 }
 
@@ -374,14 +397,14 @@ $('create').onsubmit = async (e) => {
 function watch() {
   clearInterval(poll);
   poll = setInterval(async () => {
-    state = await api(`/api/s/${current}`);
+    state = await api(`/api/s/${current()}`);
     drawMemory();
     setStatus();
-    if (!state.forming) { clearInterval(poll); open(current); }
+    if (!state.forming) { clearInterval(poll); open(); }
   }, 1500);
 }
 
-window.onhashchange = () => location.hash.length > 1 && open(decodeURIComponent(location.hash.slice(1)));
+window.onhashchange = () => current() && open();
 loadProviders();
 listSessions().then(() => window.onhashchange());
 </script>

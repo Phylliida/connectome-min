@@ -68,7 +68,7 @@ pub fn to_string(v: &(impl Serialize + ?Sized)) -> String {
 
 /// serde_json's compact form with Number.prototype.toString's numbers: decimals from 1e-6 up to
 /// 1e21, exponents outside. (serde_json writes a value that isn't finite as null itself.)
-struct Js;
+pub struct Js;
 
 impl serde_json::ser::Formatter for Js {
     fn write_f64<W: ?Sized + io::Write>(&mut self, out: &mut W, n: f64) -> io::Result<()> {

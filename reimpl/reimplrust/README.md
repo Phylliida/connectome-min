@@ -23,12 +23,13 @@ x86_64 and arm64), Windows (x86_64) and macOS (arm64 and x86_64). Locally, `carg
 ./target/release/connectome-web        # opens http://127.0.0.1:8080; add a provider's key in the page
 ```
 
-Settings are JSON files you can edit by hand, read again at each use:
+Settings are JSON files you can edit by hand, read again at each use, and only you can read them,
+since one holds the keys:
 
-- `ROOT/settings.json` (only you can read it, since it holds the keys): `providers`, each a name
-  with a `base` URL and a `key`; `defaults`, what a new session starts with; and `sandbox`, what a
-  sandboxed command sees. `--base`, `--model`, `--window`, `--reserve`, `--system` and `API_KEY`
-  write the first one, for a provider named `default`, when there's none.
+- `ROOT/settings.json`: `providers`, each a name with a `base` URL and a `key`; `defaults`, what a
+  new session starts with; and `sandbox`, what a sandboxed command sees. The first run writes it with
+  a provider named `default` for `https://api.anthropic.com` without a key, which the page then asks
+  for, and defaults for a window of 60k tokens.
 - `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its
   `window`, `reserve` and `system` prompt, and the library's settings (`config`). A new session's
@@ -60,11 +61,13 @@ the session's settings; the page's tool list toggles them. A call has `--tool-ti
 default): bash kills a command still running then, with what it started, and an MCP call that runs out
 is cancelled without holding up the server's next call; a server that stops starts again at its next
 call. A turn takes steps, a model request each, until a reply calls no tools (at most 64), and the page
-shows each call as it runs. A turn's log is the session's: a page following a turn shows the log
-as it grows, read from disk, and below it only what the log doesn't hold yet (a reply streaming in, the
-step's calls, their questions and results), which is all the app keeps of a turn. A page opened while
+shows each call as a card on its reply, which its result then joins. A turn's log is the session's: a
+page following a turn shows the log as it grows, read from disk, and besides it only what the log
+doesn't hold yet (a reply streaming in, the questions whether its calls may run, their results),
+which is all the app keeps of a turn. A page opened while
 a turn runs (after a reload, or on another device) follows it the same way, and answers its questions;
-the turn runs on whether any page follows it or not. The page's Continue button runs a turn without a message: after an
+the turn runs on whether any page follows it or not, on a thread of its session's, and a message sent
+while it runs waits for it. The page's Continue button runs a turn without a message: after an
 interruption (a failed request, the 64 steps, a restart) the model goes on from the log as it is, and
 after a reply cut short it goes on from that reply (the request ends with it, as a prefill). Tool sources compose as a monoid: a later source's tool shadows an earlier
 one of the same name. Every request carries the system prompt and the tool definitions, so their
@@ -73,11 +76,11 @@ while calibration catches up with a request bigger than its estimate, the next c
 much smaller. Memory requests declare the same tools with tool choice "none", as the library does, so
 a memory can cover tool calls.
 
-Flags: `--root DIR` (sessions and settings), `--addr`, `--ca PEM` (root certificates to trust instead
-of Mozilla's), `--mcp FILE`, `--tool-timeout SECONDS`, `--no-bash`, `--no-open`, and the first
-settings' `--base`, `--model`, `--window TOKENS` (the context budget), `--reserve TOKENS` (the reply's)
-and `--system TEXT`. The server answers only its own page: requests must name it as their Host, and
-POSTs must carry its `x-connectome` header.
+Flags: `--root DIR` (sessions and settings; `sessions` by default), `--addr` (`127.0.0.1:8080`),
+`--ca PEM` (root certificates to trust instead of Mozilla's: a company proxy's, a test server's),
+`--mcp FILE`, `--tool-timeout SECONDS`, `--no-bash`, and `--no-open` (else the page opens in the
+browser). The server answers only its own page: requests must name it as their Host, and POSTs must
+carry its `x-connectome` header.
 
 Tests:
 
@@ -89,5 +92,5 @@ python3 tests/mutants.py tests/test_app.py app/src/main.rs=mutants.json   # muta
 ```
 
 The three take under 30 seconds together. A batch of mutants takes about as long as its slowest one
-(40 of them, half a minute): they build without link-time optimization, from a build kept in
+(55 of them, under 40 seconds): they build without link-time optimization, from a build kept in
 `target/mutants`.

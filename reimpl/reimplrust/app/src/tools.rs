@@ -5,13 +5,13 @@
 //! as the library logs them). A Toolbox is a monoid under `+`: the union of two, a tool on the right
 //! shadowing a same-named one on the left, with the empty toolbox as identity. So tool sources compose
 //! in order: the tools built into the binary (bash.rs), then each MCP server's, in the config's order
-//! (mcp.rs). A tool built in is a Tool whose `run` does the work in-process.
+//! (mcp.rs). A tool built in is a Tool whose `run` does the work in-process. A toolbox is made for each
+//! step, from the settings as they are then, and owns its tools.
 
 use connectome::json::{sparse, Value};
 use connectome::obj;
 use std::ops::Add;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::Arc;
 
 pub type Outcome = Result<Value, Value>;
 
@@ -21,8 +21,14 @@ pub struct Tool {
     pub run: Box<dyn Fn(&Value) -> Outcome + Send + Sync>,
 }
 
-#[derive(Clone, Default)]
-pub struct Toolbox(pub Vec<Arc<Tool>>);
+impl Tool {
+    pub fn name(&self) -> &str {
+        self.definition["name"].as_str().unwrap_or("")
+    }
+}
+
+#[derive(Default)]
+pub struct Toolbox(pub Vec<Tool>);
 
 impl Toolbox {
     /// The tools a request declares; None without any.
@@ -32,13 +38,18 @@ impl Toolbox {
 
     /// A tool_use block's result. A call to no tool, or one whose tool panics, fails.
     pub fn call(&self, call: &Value) -> Value {
-        let tool = self.0.iter().find(|t| t.definition["name"] == call["name"]);
-        let run = |t: &Arc<Tool>| catch_unwind(AssertUnwindSafe(|| (t.run)(&call["input"]))).unwrap_or_else(|_| Err("the tool crashed".into()));
+        let tool = self.0.iter().find(|t| call["name"] == t.name());
+        let run = |t: &Tool| catch_unwind(AssertUnwindSafe(|| (t.run)(&call["input"]))).unwrap_or_else(|_| Err("the tool crashed".into()));
         result(call, tool.map_or_else(|| Err(format!("no tool {}", call["name"].as_str().unwrap_or("?")).into()), run))
     }
 
     pub fn names(&self) -> Vec<&str> {
-        self.0.iter().filter_map(|t| t.definition["name"].as_str()).collect()
+        self.0.iter().map(|t| t.name()).collect()
+    }
+
+    /// The tools whose calls wait for the user's yes.
+    pub fn asking(&self) -> Vec<&str> {
+        self.0.iter().filter(|t| t.asks).map(|t| t.name()).collect()
     }
 }
 
@@ -46,7 +57,7 @@ impl Add for Toolbox {
     type Output = Toolbox;
 
     fn add(self, right: Toolbox) -> Toolbox {
-        let kept: Vec<Arc<Tool>> = self.0.into_iter().filter(|t| !right.0.iter().any(|r| r.definition["name"] == t.definition["name"])).collect();
+        let kept: Vec<Tool> = self.0.into_iter().filter(|t| !right.names().contains(&t.name())).collect();
         Toolbox(kept.into_iter().chain(right.0).collect())
     }
 }
@@ -66,7 +77,7 @@ mod tests {
 
     fn tool(name: &str, answer: &'static str) -> Toolbox {
         let definition = obj! {"name" => name, "description" => "", "input_schema" => obj! {"type" => "object"}};
-        Toolbox(vec![Arc::new(Tool { definition, asks: true, run: Box::new(move |_| if answer == "panic" { panic!("boom") } else { Ok(answer.into()) }) })])
+        Toolbox(vec![Tool { definition, asks: true, run: Box::new(move |_| if answer == "panic" { panic!("boom") } else { Ok(answer.into()) }) }])
     }
 
     fn answers(tools: &Toolbox) -> Vec<String> {
@@ -75,11 +86,11 @@ mod tests {
 
     #[test]
     fn a_monoid_of_shadowing_unions() {
-        let (a, b, a2) = (tool("a", "a1"), tool("b", "b1"), tool("a", "a2"));
-        assert_eq!(answers(&(a.clone() + Toolbox::default())), answers(&a));
-        assert_eq!(answers(&(Toolbox::default() + a.clone())), answers(&a));
-        assert_eq!(answers(&((a.clone() + b.clone()) + a2.clone())), answers(&(a.clone() + (b.clone() + a2.clone()))));
-        assert_eq!(answers(&(a + b + a2)), ["b1", "a2"]); // the later `a` shadows the earlier
+        let (a, b, a2) = (|| tool("a", "a1"), || tool("b", "b1"), || tool("a", "a2"));
+        assert_eq!(answers(&(a() + Toolbox::default())), answers(&a()));
+        assert_eq!(answers(&(Toolbox::default() + a())), answers(&a()));
+        assert_eq!(answers(&((a() + b()) + a2())), answers(&(a() + (b() + a2()))));
+        assert_eq!(answers(&(a() + b() + a2())), ["b1", "a2"]); // the later `a` shadows the earlier
     }
 
     #[test]

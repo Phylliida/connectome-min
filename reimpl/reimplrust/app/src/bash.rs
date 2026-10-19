@@ -17,8 +17,6 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const KEPT: u64 = 12_000; // bytes of output kept from each end
@@ -35,7 +33,7 @@ pub fn tool(dir: PathBuf, limit: Duration, sandbox: Option<Sandbox>) -> Toolbox 
     let timeout = format!("Seconds before the command is killed (default {DEFAULT_TIMEOUT}, at most {}).", limit.as_secs());
     let properties = obj! {"command" => obj! {"type" => "string"}, "timeout" => obj! {"type" => "number", "description" => timeout}};
     let definition = obj! {"name" => "bash", "description" => description, "input_schema" => obj! {"type" => "object", "properties" => properties, "required" => vec!["command"]}};
-    Toolbox(vec![Arc::new(Tool { definition, asks: true, run: Box::new(move |input| run(&dir, input, limit, sandbox.as_ref())) })])
+    Toolbox(vec![Tool { definition, asks: true, run: Box::new(move |input| run(&dir, input, limit, sandbox.as_ref())) }])
 }
 
 /// bash where it can't run, declared all the same, so that a session whose history calls it still
@@ -44,14 +42,14 @@ pub fn tool(dir: PathBuf, limit: Duration, sandbox: Option<Sandbox>) -> Toolbox 
 pub fn unavailable(why: &'static str) -> Toolbox {
     let description = format!("Runs a command in {}, but not in this session: {why}.", SHELL[0]);
     let definition = obj! {"name" => "bash", "description" => description, "input_schema" => obj! {"type" => "object"}};
-    Toolbox(vec![Arc::new(Tool { definition, asks: false, run: Box::new(move |_| Err(why.into())) })])
+    Toolbox(vec![Tool { definition, asks: false, run: Box::new(move |_| Err(why.into())) }])
 }
 
 fn run(dir: &Path, input: &Value, limit: Duration, sandbox: Option<&Sandbox>) -> Outcome {
     let command = input["command"].as_str().ok_or("bash needs a command")?;
     let timeout = Duration::from_secs_f64(input["timeout"].as_f64().unwrap_or(DEFAULT_TIMEOUT).clamp(0.1, limit.as_secs_f64()));
-    static CALLS: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!("connectome-bash-{}-{}.out", std::process::id(), CALLS.fetch_add(1, Ordering::Relaxed)));
+    // a thread runs one command at a time, so its id makes the file this call's
+    let path = std::env::temp_dir().join(format!("connectome-bash-{}-{:?}.out", std::process::id(), std::thread::current().id()));
     let out = File::create(&path).map_err(|e| format!("bash: {e}"))?;
     let mut shell = Command::new(if sandbox.is_some() { "bwrap" } else { SHELL[0] });
     if let Some(b) = sandbox {

@@ -16,7 +16,6 @@ use ureq::tls::{PemItem, TlsConfig};
 pub struct Llm {
     pub base: String, // e.g. https://api.anthropic.com
     pub key: String,
-    pub model: String,
     pub agent: ureq::Agent,
 }
 

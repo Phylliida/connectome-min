@@ -1,26 +1,18 @@
 //! connectome-web: chat with a model whose context the connectome library manages, in a web page that
 //! shows each session's memory pyramid and what its context shows, and forks a session at any message.
 //! One binary that needs nothing installed: the page is built in, and so is TLS (rustls, ring and
-//! Mozilla's roots).
+//! Mozilla's roots). README.md describes its flags, its settings files (settings.rs) and its tools
+//! (bash.rs, mcp.rs).
 //!
-//!     connectome-web [--root DIR] [--addr 127.0.0.1:8080] [--base URL] [--model NAME] [--window TOKENS]
-//!                    [--reserve TOKENS] [--system TEXT] [--ca PEM] [--mcp FILE] [--tool-timeout SECONDS]
-//!                    [--no-bash] [--no-open]
-//!
-//! The settings are files in DIR (settings.rs): DIR/settings.json holds the providers, their keys and
-//! what a new session starts with, which --base, --model, --window, --reserve, --system and API_KEY,
-//! ANTHROPIC_API_KEY or DEEPSEEK_API_KEY give when there's no such file; each session holds its own.
-//! --ca trusts the root certificates in a PEM file instead of Mozilla's (a company proxy's, a test
-//! server's). The model can call bash in its session's workspace (bash.rs; unless --no-bash), in a
-//! sandbox if the session says so, and the tools of the MCP servers that --mcp names (by default
-//! DIR/mcp.json, if there is one; mcp.rs), each call once the user allows it on the page, or always
-//! allows its tool for the session, and within --tool-timeout (600 s by default). The system prompt and
-//! the tool definitions come out of the window the context compiles to, since every request carries
-//! them. A chat message joins the log, then the turn takes steps until a reply calls no tools: the
-//! context compiles and streams from disk into the request, the reply joins the log, and the tools it
-//! calls run, their results joining the log. Each step reads the settings again. Memories form between
-//! steps and, once the page has the turn, after it, the session locked throughout. The page opens in
-//! the browser unless --no-open.
+//! Whatever changes has one thread that owns it, and threads tell each other things through channels,
+//! sharing nothing that changes. A request's thread reads files and tells the hub what it wants of a
+//! session. The hub owns what changes quickly: the settings files, which sessions have a thread, and
+//! what the pages following each session's turn see. Each session's thread (work) does its jobs one
+//! at a time, the only one to write its log: a turn's chat message joins the log, then the turn takes
+//! steps until a reply calls no tools, each reading the settings again: the context compiles and
+//! streams from disk into the request, the reply joins the log, and the tools it calls run, each once
+//! the user allows it, their results joining the log. Memories form between steps and after the turn.
+//! A session's files are its only record: the hub keeps beside them only what they don't hold yet.
 
 mod bash;
 mod llm;
@@ -29,7 +21,6 @@ mod settings;
 mod tools;
 
 use connectome::blocks::density_tokens;
-use connectome::config::Config;
 use connectome::drive::{append, compile, current, drive};
 use connectome::emit::Reader;
 use connectome::estimate::Calibration;
@@ -40,122 +31,169 @@ use connectome::planner::{chunks, Node};
 use connectome::store::Session;
 use llm::Llm;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
-use settings::{Provider, Sandbox, SessionSettings, Settings};
+use serde::{Serialize, Serializer};
+use settings::{SessionSettings, Settings};
 use tools::Toolbox;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
 const PAGE: &str = include_str!("ui.html");
 
+/// What every thread reads, set once at the start and never changed.
 struct App {
     root: PathBuf,
     addr: String,
     agent: ureq::Agent,
-    mcp: Toolbox,                                   // every session's MCP tools
-    bash: bool,                                     // whether a session with a workspace has bash
-    limit: Duration,                                // a tool call's time
-    writing: Mutex<()>,                             // settings files change one at a time
-    running: Mutex<HashMap<String, Arc<Running>>>,  // by session
+    mcp: Vec<mcp::Server>, // every session's MCP servers
+    bash: bool,            // whether a session with a workspace has bash
+    limit: Duration,       // a tool call's time
+    hub: Sender<Routed>,
 }
 
-/// A session's runtime state, beside its files: the lock a turn or memory formation holds, the last
-/// request's prompt size, which calibrates the next compile, whether memories are forming, and the
-/// turn running, if one is.
-#[derive(Default)]
-struct Running {
-    busy: Mutex<()>,
-    usage: Mutex<Option<f64>>,
-    forming: AtomicBool,
-    turn: Mutex<Option<Arc<Feed>>>,
+/// What the hub is told: a message about a session, or a change to settings.json, answered with the
+/// settings it leaves.
+enum Routed {
+    To(String, Msg),
+    Provide(Value, Sender<Result<Settings, String>>),
 }
 
-/// A running turn beyond what the session's log holds: the log's length, the events since it last
-/// grew (a reply streaming in, the step's calls, their questions, the answers pages give, their
-/// results), and whether the turn has ended. The turn adds to it; pages read it, and the turn reads
-/// the answers, each waiting on it for more. What the log holds it drops, so it holds a step at most.
-#[derive(Default)]
-struct Feed {
-    now: Mutex<Now>,
-    changed: Condvar,
+/// A job for a session's thread: a turn with a message, or without (None) one that continues the log,
+/// which `page` follows, `started` once it starts or why it can't; or a fork at message `at` as `name`.
+enum Job {
+    Say { text: Option<String>, page: Sender<String>, started: Sender<Result<(), String>> },
+    Fork { at: u64, name: String, reply: Sender<Result<(), String>> },
 }
 
-#[derive(Default)]
-struct Now {
-    logged: u64,
-    events: Vec<Value>,
-    ended: bool,
+/// What the hub is told about a session, by requests' threads and by the session's.
+enum Msg {
+    /// A job for the session's thread, which does them in the order they come.
+    Job(Job),
+    /// A page that follows the turn running; with none, its stream ends at once.
+    Follow(Sender<String>),
+    /// A page's answer whether call `id` may run: allow, always (its tool, from then on) or deny.
+    Approve { id: String, answer: String, reply: Sender<Result<(), String>> },
+    /// Whether a turn runs, and whether memories are forming.
+    Status(Sender<(bool, bool)>),
+    /// A change to the session's settings (tune).
+    Tune(Value, Sender<Result<(), String>>),
+    // from the session's thread: a turn starts, which `page` follows; an event for the pages ({"logged"}
+    // when the log grows); a call's question and where to answer it (Ok: it runs); whether memories
+    // are forming; the turn's end
+    Start(Sender<String>),
+    Event(Value),
+    Ask { id: String, tool: String, answer: Sender<Result<(), String>> },
+    Forming(bool),
+    End(Value),
 }
 
-impl Feed {
-    fn change(&self, f: impl FnOnce(&mut Now)) {
-        f(&mut self.now.lock().unwrap());
-        self.changed.notify_all();
+/// The hub's thread. It owns what changes quickly, so each is told one thing at a time: settings.json
+/// and the sessions' settings files, which sessions have a thread (started the first time one is
+/// told something), and what the pages following each session's turn see (Live).
+fn hub(app: &'static App, inbox: Receiver<Routed>) {
+    let mut sessions: HashMap<String, Live> = HashMap::new();
+    for routed in inbox {
+        match routed {
+            Routed::To(name, msg) => sessions.entry(name.clone()).or_insert_with(|| Live::start(app, &name)).handle(app, &name, msg),
+            Routed::Provide(v, reply) => drop(reply.send(change(&global_path(app), |all| provide(all, &v)))),
+        }
+    }
+}
+
+/// The answer to what the hub is told, which says where to answer.
+fn ask<T>(app: &App, told: impl FnOnce(Sender<T>) -> Routed) -> T {
+    let (reply, answer) = channel();
+    app.hub.send(told(reply)).expect("the hub runs");
+    answer.recv().expect("the thread told answers")
+}
+
+/// The answer to what the hub is told about a session.
+fn ask_session<T>(app: &App, name: &str, msg: impl FnOnce(Sender<T>) -> Msg) -> T {
+    ask(app, |reply| Routed::To(name.into(), msg(reply)))
+}
+
+/// A session as the hub knows it: where its thread takes jobs, and what the pages following its turn
+/// see: whether one runs and memories are forming, the events since the log last grew (the first its
+/// length; then a reply streaming in, the questions whether the step's calls may run, the answers, the
+/// calls' results), the pages, and the calls waiting for an answer. What the log holds it drops, so it
+/// holds a step at most.
+struct Live {
+    jobs: Sender<Job>,
+    running: bool,
+    forming: bool,
+    events: Vec<String>, // JSON lines
+    pages: Vec<Sender<String>>,
+    asked: HashMap<String, (String, Sender<Result<(), String>>)>, // by call id: its tool, where to answer
+}
+
+impl Live {
+    /// A session, its thread started.
+    fn start(app: &'static App, name: &str) -> Live {
+        let (jobs, queue) = channel();
+        let (name, hub) = (name.to_string(), app.hub.clone());
+        std::thread::spawn(move || work(app, &name, queue, &|msg| drop(hub.send(Routed::To(name.clone(), msg)))));
+        Live { jobs, running: false, forming: false, events: vec![], pages: vec![], asked: HashMap::new() }
     }
 
-    fn push(&self, event: Value) {
-        self.change(|now| now.events.push(event));
-    }
-
-    /// The log has grown to `n` messages, which now hold what the events showed.
-    fn logged(&self, n: u64) {
-        self.change(|now| (now.logged, now.events) = (n, vec![]));
-    }
-
-    /// The turn to a page, a JSON line each: {"logged": the log's length} whenever it grows (the page
-    /// reads the log from disk), then the events since, as they come, until the turn ends.
-    fn follow(&self, page: &mut impl Write) -> std::io::Result<()> {
-        let (mut logged, mut seen) = (None, 0);
-        loop {
-            let now = self.changed.wait_while(self.now.lock().unwrap(), |now| logged == Some(now.logged) && seen == now.events.len() && !now.ended).unwrap();
-            let mut lines = String::new();
-            if logged != Some(now.logged) {
-                (logged, seen) = (Some(now.logged), 0);
-                lines = format!("{}\n", json::to_string(&obj! {"logged" => now.logged}));
+    fn handle(&mut self, app: &App, name: &str, msg: Msg) {
+        match msg {
+            Msg::Job(job) => drop(self.jobs.send(job)),
+            Msg::Follow(page) => {
+                if self.running && self.events.iter().all(|line| page.send(line.clone()).is_ok()) {
+                    self.pages.push(page);
+                }
             }
-            lines.extend(now.events[seen..].iter().map(|e| format!("{}\n", json::to_string(e))));
-            let (ended, count) = (now.ended, now.events.len());
-            drop(now);
-            page.write_all(lines.as_bytes())?;
-            if ended {
-                return Ok(());
+            Msg::Approve { id, answer, reply } => {
+                let Some((tool, waiting)) = self.asked.remove(&id) else { return drop(reply.send(Err("no call waits for that answer".into()))) };
+                let decided = match answer.as_str() {
+                    "always" => change(&profile_path(app, name), |s: &mut SessionSettings| { s.allow.insert(tool); Ok(()) }).map(drop),
+                    "allow" => Ok(()),
+                    _ => Err(DENIED.into()),
+                };
+                let _ = waiting.send(decided);
+                self.send(&obj! {"answered" => id, "answer" => answer});
+                let _ = reply.send(Ok(()));
             }
-            seen = count;
+            Msg::Status(reply) => drop(reply.send((self.running, self.forming))),
+            Msg::Tune(v, reply) => drop(reply.send(tune(app, name, &v))),
+            Msg::Start(page) => (self.running, self.events, self.pages) = (true, vec![], vec![page]),
+            Msg::Event(event) => self.send(&event),
+            Msg::Ask { id, tool, answer } => {
+                self.send(&obj! {"approve" => id.as_str()});
+                self.asked.insert(id, (tool, answer));
+            }
+            Msg::Forming(on) => self.forming = on,
+            Msg::End(end) => {
+                self.send(&end);
+                (self.running, self.pages) = (false, vec![]);
+                self.asked.clear();
+            }
         }
     }
 
-    /// The answer a page gives to call `id`'s question, or none within `wait`.
-    fn answer(&self, id: &str, wait: Duration) -> Option<String> {
-        let given = |now: &Now| now.events.iter().find(|e| e["answered"] == id).and_then(|e| e["answer"].as_str().map(str::to_string));
-        let (now, _) = self.changed.wait_timeout_while(self.now.lock().unwrap(), wait, |now| given(now).is_none()).unwrap();
-        given(&now)
+    /// An event to the pages following the turn, kept for those that come later; the log's length
+    /// starts the events afresh.
+    fn send(&mut self, event: &Value) {
+        let line = format!("{}\n", json::to_string(event));
+        self.pages.retain(|page| page.send(line.clone()).is_ok());
+        if event.get("logged").is_some() {
+            self.events.clear();
+        }
+        self.events.push(line);
     }
 }
 
-/// A turn to a page as it happens (Feed::follow); with none running, only the head. Then the
-/// connection closes, though the request's thread goes on to form memories with it open.
-fn show(turn: Option<Arc<Feed>>, mut page: TcpStream) {
+/// A turn to a page as it happens, a JSON line each (Live), until the hub stops sending.
+fn show(page: &mut TcpStream, lines: Receiver<String>) {
     let _ = page.set_write_timeout(Some(PAGE_WAIT));
-    if page.write_all(EVENTS).is_ok() && let Some(feed) = turn {
-        let _ = feed.follow(&mut page);
-    }
-    let _ = page.shutdown(std::net::Shutdown::Both);
+    let _ = std::iter::once(head("200 OK", "application/x-ndjson", None)).chain(lines).try_for_each(|line| page.write_all(line.as_bytes()));
 }
-
-/// The head of a turn's events, a JSON line each.
-const EVENTS: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n";
 
 /// How long a page may keep a write waiting before it's left behind.
 const PAGE_WAIT: Duration = Duration::from_secs(30);
-
-fn running(app: &App, name: &str) -> Arc<Running> {
-    app.running.lock().unwrap().entry(name.to_string()).or_default().clone()
-}
 
 /// What a session's step runs with: its settings, the model client and tools they give, and the
 /// tokens the system prompt and tool definitions take, which every request carries.
@@ -166,18 +204,19 @@ struct Setup {
     overhead: f64,
 }
 
-/// The summarizer's host. It declares the agent's tools, which the library sends with tool choice
-/// "none" so a memory's request can carry tool blocks, and no system prompt.
-struct Summarizer<'a>(&'a Llm, Option<Value>);
+/// The summarizer's host: the session's model unless the library names one, and the agent's tools,
+/// which the library sends with tool choice "none" so a memory's request can carry tool blocks; no
+/// system prompt.
+struct Summarizer<'a>(&'a Setup, Option<Value>);
 
 impl Host for Summarizer<'_> {
     fn tools(&self) -> Option<&Value> { self.1.as_ref() }
 
     fn complete(&mut self, request: &Request, reader: &mut Reader) -> Result<Value, String> {
-        let model = if request.model.is_empty() { &self.0.model } else { &request.model };
+        let model = if request.model.is_empty() { &self.0.settings.model } else { &request.model };
         let none = request.tools.as_ref().map(|_| obj! {"type" => "none"});
         let head = sparse(obj! {"model" => model.as_str(), "max_tokens" => request.max_tokens, "tools" => request.tools.clone(), "tool_choice" => none});
-        self.0.messages(head, &request.messages, reader, |_, _| {})
+        self.0.llm.messages(head, &request.messages, reader, |_, _| {})
     }
 }
 
@@ -189,51 +228,35 @@ fn main() {
     unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, 128 * 1024) };
     let args: Vec<String> = std::env::args().collect();
     let arg = |name: &str, default: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned().unwrap_or(default.into());
-    let key = ["API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY"].iter().find_map(|k| std::env::var(k).ok()).unwrap_or_default();
-    let extra = args.iter().any(|a| a == "--ca").then(|| std::fs::read(arg("--ca", "")).expect("--ca"));
-    let agent = llm::agent(extra.as_deref()).expect("--ca");
+    let flag = |name: &str| args.iter().any(|a| a == name);
+    let ca = flag("--ca").then(|| std::fs::read(arg("--ca", "")).expect("--ca"));
     let root = PathBuf::from(arg("--root", "sessions"));
-    let addr = arg("--addr", "127.0.0.1:8080");
     std::fs::create_dir_all(&root).expect("--root");
     let limit = Duration::from_secs_f64(arg("--tool-timeout", "600").parse().expect("--tool-timeout"));
-    let bash = !args.iter().any(|a| a == "--no-bash");
     let mcp = std::fs::read(arg("--mcp", &root.join("mcp.json").to_string_lossy())).ok();
-    let mcp = mcp.map_or_else(Toolbox::default, |config| mcp::toolbox(&json::parse(&config).expect("--mcp: JSON"), limit));
-    let path = root.join("settings.json");
-    if !path.exists() {
-        let (window, system): (f64, _) = (arg("--window", "60000").parse().expect("--window"), args.iter().any(|a| a == "--system").then(|| arg("--system", "")));
-        let tools = if bash { bash::tool(PathBuf::new(), limit, None) } else { Toolbox::default() } + mcp.clone();
-        let left = window - overhead(system.as_deref(), &tools); // what the context compiles to
-        let config = Config {
-            summary_participant: "assistant".into(),
-            recent_window_tokens: (left / 4.0).min(30000.0), // the library's defaults, for windows of 120k and more
-            target_chunk_tokens: (left / 16.0).min(3000.0),
-            compression_max_tokens: Some(8000.0),
-            ..Config::default()
-        };
-        let (model, reserve) = (arg("--model", "claude-sonnet-5-5"), arg("--reserve", "4000").parse().expect("--reserve"));
-        let defaults = SessionSettings { provider: "default".into(), model, workspace: None, sandbox: false, allow: Default::default(), window, reserve, system, config };
-        let providers = BTreeMap::from([("default".to_string(), Provider { base: arg("--base", "https://api.anthropic.com"), key })]);
-        settings::write(&path, &Settings { providers, defaults, sandbox: Sandbox::default() }, true).expect("settings.json");
-    }
-    let app = Arc::new(App {
-        root: root.clone(),
-        addr: addr.clone(),
-        agent,
+    let mcp = mcp.map_or_else(Vec::new, |config| mcp::servers(&json::parse(&config).expect("--mcp: JSON"), limit));
+    let (sender, inbox) = channel();
+    let app: &'static App = Box::leak(Box::new(App {
+        root,
+        addr: arg("--addr", "127.0.0.1:8080"),
+        agent: llm::agent(ca.as_deref()).expect("--ca"),
         mcp,
-        bash,
+        bash: !flag("--no-bash"),
         limit,
-        writing: Mutex::default(),
-        running: Mutex::default(),
-    });
-    let listener = TcpListener::bind(&addr).expect("--addr");
-    eprintln!("connectome-web on http://{addr}, sessions in {}, MCP tools: {:?}", root.display(), app.mcp.names());
-    if !args.iter().any(|a| a == "--no-open") {
-        let _ = open::that_detached(format!("http://{addr}"));
+        hub: sender,
+    }));
+    if !global_path(app).exists() {
+        let tools = if app.bash { bash::tool(PathBuf::new(), limit, None) } else { Toolbox::default() } + mcp::toolbox(&app.mcp);
+        settings::write(&global_path(app), &Settings::first(overhead(None, &tools))).expect("settings.json");
+    }
+    std::thread::spawn(move || hub(app, inbox));
+    let listener = TcpListener::bind(&app.addr).expect("--addr");
+    eprintln!("connectome-web on http://{}, sessions in {}, MCP tools: {:?}", app.addr, app.root.display(), mcp::toolbox(&app.mcp).names());
+    if !flag("--no-open") {
+        let _ = open::that_detached(format!("http://{}", app.addr));
     }
     for stream in listener.incoming().flatten() {
-        let app = app.clone();
-        std::thread::spawn(move || handle(&app, stream).unwrap_or_else(|e| eprintln!("{e}")));
+        std::thread::spawn(move || handle(app, stream).unwrap_or_else(|e| eprintln!("{e}")));
     }
 }
 
@@ -265,19 +288,19 @@ fn handle(app: &App, mut stream: TcpStream) -> std::io::Result<()> {
     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
     let param = |name: &str| query.split('&').find_map(|kv| kv.strip_prefix(name)?.strip_prefix('=')?.parse::<u64>().ok());
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-    let result = match (method.as_str(), parts.as_slice()) {
+    let reply = match (method.as_str(), parts.as_slice()) {
         ("GET", []) => return send(&mut stream, "200 OK", "text/html; charset=utf-8", PAGE.as_bytes()),
-        ("GET", ["api", "sessions"]) => Ok(sessions(app)),
-        ("GET", ["api", "settings"]) => global(app).map(|all| providers(&all)),
-        ("POST", ["api", "settings"]) => change(app, &app.root.join("settings.json"), true, |all| provide(all, &body)).map(|all| providers(&all)),
-        ("POST", ["api", "sessions"]) => create(app, &body),
+        ("GET", ["api", "sessions"]) => Ok(Some(sessions(app))),
+        ("GET", ["api", "settings"]) => global(app).map(|all| Some(providers(&all))),
+        ("POST", ["api", "settings"]) => ask(app, |reply| Routed::Provide(body.clone(), reply)).map(|all| Some(providers(&all))),
+        ("POST", ["api", "sessions"]) => create(app, &body).map(Some),
         (_, ["api", "s", name, rest @ ..]) if named(name) && app.root.join(name).is_dir() => session(app, &method, name, rest, &body, param, &mut stream),
         (_, ["api", "s", name, ..]) => Err(format!("no session {name}")),
         _ => Err("not found".into()),
     };
-    match result {
-        Ok(Value::Null) => Ok(()), // already answered
-        Ok(v) => send(&mut stream, "200 OK", "application/json", json::to_string(&v).as_bytes()),
+    match reply {
+        Ok(None) => Ok(()),
+        Ok(Some(v)) => send(&mut stream, "200 OK", "application/json", json::to_string(&v).as_bytes()),
         Err(e) => send(&mut stream, "400 Bad Request", "application/json", json::to_string(&obj! {"error" => e}).as_bytes()),
     }
 }
@@ -287,31 +310,30 @@ fn named(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// An HTTP response's head; without a length, the body runs until the connection closes.
+fn head(status: &str, kind: &str, length: Option<usize>) -> String {
+    let length = length.map_or(String::new(), |n| format!("content-length: {n}\r\n"));
+    format!("HTTP/1.1 {status}\r\ncontent-type: {kind}\r\n{length}cache-control: no-cache\r\nconnection: close\r\n\r\n")
+}
+
 fn send(stream: &mut TcpStream, status: &str, kind: &str, body: &[u8]) -> std::io::Result<()> {
-    write!(stream, "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len())?;
+    stream.write_all(head(status, kind, Some(body.len())).as_bytes())?;
     stream.write_all(body)
 }
 
 /// A JSON array to the page as its items are read, never held whole.
-fn send_all(stream: &mut TcpStream, items: impl Iterator<Item = Value>) -> Result<Value, String> {
-    let mut out = BufWriter::new(stream);
-    let write = || -> std::io::Result<()> {
-        out.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n[")?;
-        for (i, item) in items.enumerate() {
-            out.write_all(if i > 0 { b"," } else { b"" })?;
-            json::write(&item, &mut out)?;
-        }
-        out.write_all(b"]")?;
-        out.flush()
-    };
-    write().map(|()| Value::Null).map_err(|e| e.to_string())
+fn send_all(stream: &mut TcpStream, items: impl Iterator<Item = Value>) -> Result<Option<Value>, String> {
+    stream.write_all(head("200 OK", "application/json", None).as_bytes()).map_err(|e| e.to_string())?;
+    let mut out = serde_json::Serializer::with_formatter(BufWriter::new(stream), json::Js);
+    out.collect_seq(items).map(|()| None).map_err(|e| e.to_string())
 }
 
+/// A session's routes: the JSON to answer with, or None once the route has answered, streaming.
 fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, param: impl Fn(&str) -> Option<u64>, stream: &mut TcpStream)
-    -> Result<Value, String> {
+    -> Result<Option<Value>, String> {
     let s = Session::open(app.root.join(name));
     match (method, rest) {
-        ("GET", []) => Ok(state(app, name, &s)),
+        ("GET", []) => Ok(Some(state(app, name, &s))),
         ("GET", ["messages"]) => {
             let (from, messages) = listing(&s, "messages", 200, param);
             let class = shown_as(&s, profile(app, name)?.config.merge_threshold, from);
@@ -324,24 +346,29 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, par
             if app.root.join(fork).exists() || at >= s.count("messages") {
                 return Err(format!("can't fork {name} at {at} as {fork}"));
             }
-            let run = running(app, name);
-            let _busy = run.busy.lock().unwrap();
-            let child = Session::fork(&s, at, app.root.join(fork));
-            settings::write(&profile_path(app, fork), &profile(app, name)?, false)?;
-            Ok(state(app, fork, &child))
+            ask_session(app, name, |reply| Msg::Job(Job::Fork { at, name: fork.into(), reply }))?;
+            Ok(Some(state(app, fork, &Session::open(app.root.join(fork)))))
         }
-        ("POST", ["settings"]) => tune(app, name, &s, body),
-        ("POST", ["say"]) => say(app, name, &s, Some(body["text"].as_str().unwrap_or("")), stream),
-        ("POST", ["continue"]) => say(app, name, &s, None, stream),
+        ("POST", ["settings"]) => {
+            ask_session(app, name, |reply| Msg::Tune(body.clone(), reply))?;
+            Ok(Some(state(app, name, &s)))
+        }
+        ("POST", [said @ ("say" | "continue")]) => {
+            let (text, (page, lines)) = ((*said == "say").then(|| body["text"].as_str().unwrap_or("").to_string()), channel());
+            ask_session(app, name, |started| Msg::Job(Job::Say { text, page, started }))?;
+            show(stream, lines);
+            Ok(None)
+        }
         ("GET", ["live"]) => {
-            let turn = running(app, name).turn.lock().unwrap().clone();
-            show(turn, stream.try_clone().map_err(|e| e.to_string())?);
-            Ok(Value::Null)
+            let (page, lines) = channel();
+            app.hub.send(Routed::To(name.into(), Msg::Follow(page))).expect("the hub runs");
+            show(stream, lines);
+            Ok(None)
         }
         ("POST", ["approve"]) => {
-            let turn = running(app, name).turn.lock().unwrap().clone();
-            let answer = obj! {"answered" => body["id"].clone(), "answer" => body["answer"].clone()};
-            turn.map(|feed| feed.push(answer)).map(|()| obj! {}).ok_or_else(|| "no turn waits for an answer".into())
+            let (id, answer) = (body["id"].as_str().unwrap_or("").into(), body["answer"].as_str().unwrap_or("deny").into());
+            ask_session(app, name, |reply| Msg::Approve { id, answer, reply })?;
+            Ok(Some(obj! {}))
         }
         _ => Err("not found".into()),
     }
@@ -367,128 +394,151 @@ fn shown_as(s: &Session, k: u64, from: u64) -> impl Fn(u64) -> &'static str {
     }
 }
 
-/// Steps a turn may take, a model request each, before it stops.
-const MAX_STEPS: usize = 64;
+/// A session's thread: it does its jobs one at a time, in the order they come (a message or fork told
+/// during a turn waits for it), the only one to write the session's log, and keeps the last request's
+/// prompt size, which calibrates the next compile.
+fn work(app: &App, name: &str, jobs: Receiver<Job>, tell: &dyn Fn(Msg)) {
+    let mut usage = None;
+    for job in jobs {
+        let s = Session::open(app.root.join(name));
+        match job {
+            Job::Say { text, page, started } => {
+                let ready = match &text {
+                    Some(text) if text.trim().is_empty() => Err("say something".into()),
+                    None if s.count("messages") == 0 => Err("say something".into()),
+                    _ => profile(app, name).map(drop),
+                };
+                let go = ready.is_ok();
+                let _ = started.send(ready);
+                if go {
+                    tell(Msg::Start(page));
+                    turn(app, name, &s, text.as_deref(), &mut usage, tell);
+                }
+            }
+            Job::Fork { at, name: fork, reply } => {
+                Session::fork(&s, at, app.root.join(&fork));
+                let _ = reply.send(profile(app, name).and_then(|p| settings::write(&profile_path(app, &fork), &p)));
+            }
+        }
+    }
+}
 
 /// A chat turn: the message joins the log, then steps run until a reply calls no tools. Without a
 /// message, the turn continues the log as it is: after an interruption the context ends with the
-/// user's message or the tool results, and after a reply cut short with that reply, which the
-/// Messages API continues (a prefill); a session without messages has nothing to continue. The turn
-/// runs in a Feed, which the page that asked follows (GET /api/s/NAME/live follows it from any page):
-/// the pieces of a reply's reasoning and text ({"thinking"}, {"text"}), each tool call ({"tool"}: the
-/// tool_use block), the question whether it may run ({"approve"}: its id), the answer a page gives
-/// (POST /api/s/NAME/approve: {"answered": the id, "answer"}), and its result ({"result"}: {id, text,
-/// error}); then {"ok": true} once the turn has joined the log, or {"error"}. Memories form between
-/// steps and after the turn, the session held throughout.
-fn say(app: &App, name: &str, s: &Session, text: Option<&str>, stream: &mut TcpStream) -> Result<Value, String> {
-    if text.map_or(s.count("messages") == 0, |text| text.trim().is_empty()) {
-        return Err("say something".into());
-    }
-    let run = running(app, name);
-    let _busy = run.busy.lock().unwrap();
-    let cfg = profile(app, name)?.config;
-    if let Some(text) = text {
-        append(s, &obj! {"participant" => "user", "content" => vec![obj! {"type" => "text", "text" => text}]}, &cfg);
-    }
-    let feed = Arc::new(Feed::default());
-    feed.logged(s.count("messages"));
-    *run.turn.lock().unwrap() = Some(feed.clone());
-    let (asked, page) = (feed.clone(), stream.try_clone().map_err(|e| e.to_string())?);
-    std::thread::spawn(move || show(Some(asked), page)); // a page that has gone away still gets its turn logged
-    let stopped = (0..MAX_STEPS).map(|_| step(app, name, s, &run, &feed)).find(|called| *called != Ok(true));
-    let end = match stopped {
-        Some(Ok(_)) => obj! {"ok" => true},
-        Some(Err(e)) => obj! {"error" => e},
-        None => obj! {"error" => format!("the turn stopped after {MAX_STEPS} steps")},
-    };
-    feed.change(|now| { now.events.push(end); now.ended = true; });
-    *run.turn.lock().unwrap() = None;
+/// user's message or the tool results, and after a reply cut short with that reply, which the Messages
+/// API continues (a prefill). The turn tells the hub (`tell`) what the pages following it see: the
+/// log's length each time it grows ({"logged"}), the pieces of a reply's reasoning and text
+/// ({"thinking"}, {"text"}), the question whether each call may run ({"approve"}: its id; the answers
+/// come from the pages: {"answered": the id, "answer"}), and each call's result ({"result"}: the
+/// tool_result block, brief); then {"ok": true} once the turn has joined the log, or {"error"}.
+/// Memories form between steps and after the turn.
+fn turn(app: &App, name: &str, s: &Session, text: Option<&str>, usage: &mut Option<f64>, tell: &dyn Fn(Msg)) {
+    let end = steps(app, name, s, text, usage, tell).map_or_else(|e| obj! {"error" => e}, |()| obj! {"ok" => true});
+    tell(Msg::End(end));
     if let Ok(setup) = setup(app, name) {
-        form(&run, name, s, &setup);
+        form(tell, name, s, &setup);
     }
-    Ok(Value::Null)
 }
 
-/// One step: the context compiles and streams into a request, the reply streams to the page and joins
+/// The log's length, for the pages, which read the log up to it.
+fn logged(s: &Session) -> Msg {
+    Msg::Event(obj! {"logged" => s.count("messages")})
+}
+
+/// Steps a turn may take, a model request each, before it stops.
+const MAX_STEPS: usize = 64;
+
+/// The turn's message, then its steps.
+fn steps(app: &App, name: &str, s: &Session, text: Option<&str>, usage: &mut Option<f64>, tell: &dyn Fn(Msg)) -> Result<(), String> {
+    if let Some(text) = text {
+        append(s, &obj! {"participant" => "user", "content" => vec![obj! {"type" => "text", "text" => text}]}, &profile(app, name)?.config);
+    }
+    tell(logged(s));
+    for _ in 0..MAX_STEPS {
+        if !step(app, name, s, usage, tell)? {
+            return Ok(());
+        }
+    }
+    Err(format!("the turn stopped after {MAX_STEPS} steps"))
+}
+
+/// One step: the context compiles and streams into a request, the reply streams to the pages and joins
 /// the log, and the tools it calls run, their results joining the log; then memories form. Whether it
 /// called any.
-fn step(app: &App, name: &str, s: &Session, run: &Running, feed: &Feed) -> Result<bool, String> {
+fn step(app: &App, name: &str, s: &Session, usage: &mut Option<f64>, tell: &dyn Fn(Msg)) -> Result<bool, String> {
     let setup = setup(app, name)?;
     let (cfg, reserve) = (&setup.settings.config, setup.settings.reserve);
-    let (usage, last) = (run.usage.lock().unwrap().take(), current(s));
-    let calibration = usage.into_iter().fold(last, Calibration::observe);
+    let (reported, last) = (usage.take(), current(s));
+    let calibration = reported.into_iter().fold(last, Calibration::observe);
     // how much bigger the last request's context was than its compile thought, in a sample calibration
     // learns from: calibration takes steps to catch up, and the context compiles that much smaller meanwhile
-    let lag = usage.map(|u| u / last.armed).filter(|r| (1.0..=1.8).contains(r)).unwrap_or(1.0);
+    let lag = reported.map(|u| u / last.armed).filter(|r| (1.0..=1.8).contains(r)).unwrap_or(1.0);
     // what the context compiles to: the window less what every request carries, smaller by the lag, so
     // the request and its answer fit even at the library's grace over budget
     let budget = (setup.settings.window - setup.overhead - reserve) / lag / (1.0 + cfg.over_budget_grace) + reserve;
     let attempt = |calibration| compile(s, budget, reserve, budget, calibration, cfg);
     // a refusal escalates the session, so the memory the context waits for forms at once; then it compiles again, up to 3 times
-    let compiled = (0..3).fold(attempt(calibration), |compiled, _| compiled.or_else(|_| { form(run, name, s, &setup); attempt(current(s)) }));
+    let compiled = (0..3).fold(attempt(calibration), |compiled, _| compiled.or_else(|_| { form(tell, name, s, &setup); attempt(current(s)) }));
     let turns = compiled.map_err(|r| format!("{}: {} tokens over a budget of {}", r.stage, r.actual, r.budget))?;
     let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.settings.system.as_deref(), "tools" => setup.tools.definitions()});
-    let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), |kind, piece| feed.push(obj! {kind => piece}))?;
-    *run.usage.lock().unwrap() = Some(reply["usage"]["inputTokens"].as_f64().unwrap_or(0.0) - setup.overhead);
+    let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), |kind, piece| tell(Msg::Event(obj! {kind => piece})))?;
+    *usage = Some(reply["usage"]["inputTokens"].as_f64().unwrap_or(0.0) - setup.overhead);
     append(s, &obj! {"participant" => "assistant", "content" => reply["content"].clone()}, cfg);
-    feed.logged(s.count("messages"));
+    tell(logged(s));
     let calls = reply["content"].arr().iter().filter(|b| b.kind() == "tool_use");
     let results: Vec<Value> = calls.map(|call| {
-        feed.push(obj! {"tool" => call.clone()});
-        let result = approve(app, name, &setup, feed, call).map_or_else(|why| tools::result(call, Err(why.into())), |()| setup.tools.call(call));
-        feed.push(obj! {"result" => obj! {"id" => call["id"].clone(), "text" => content(&result["content"]), "error" => result["isError"] == true}});
+        let result = approve(app, name, &setup, tell, call).map_or_else(|why| tools::result(call, Err(why.into())), |()| setup.tools.call(call));
+        tell(Msg::Event(obj! {"result" => brief(&result)}));
         result
     }).collect();
     if results.is_empty() {
         return Ok(false);
     }
     append(s, &obj! {"participant" => "user", "content" => results}, cfg);
-    feed.logged(s.count("messages"));
-    form(run, name, s, &setup);
+    tell(logged(s));
+    form(tell, name, s, &setup);
     Ok(true)
 }
 
 /// How long a call waits for the user's answer before it's denied.
 const APPROVAL_WAIT: Duration = Duration::from_secs(600);
 
+/// A denied call's result.
+const DENIED: &str = "the user didn't allow this call";
+
 /// Whether the user lets a call run. A tool that doesn't ask, or that the session always allows, runs
-/// at once (and a call to no tool fails at once); otherwise the turn asks ({"approve": the call's id})
-/// and the call runs if a page's answer is allow, or always, which allows its tool in the session from
-/// then on. A denial, or no answer within APPROVAL_WAIT, is the call's failed result.
-fn approve(app: &App, name: &str, setup: &Setup, feed: &Feed, call: &Value) -> Result<(), String> {
+/// at once (and a call to no tool fails at once); otherwise the turn asks its session's thread, which
+/// asks the pages and decides by a page's answer (Owner). No answer within APPROVAL_WAIT is a denial.
+fn approve(app: &App, name: &str, setup: &Setup, tell: &dyn Fn(Msg), call: &Value) -> Result<(), String> {
     let (id, tool) = (call["id"].as_str().unwrap_or(""), call["name"].as_str().unwrap_or(""));
-    if !setup.tools.0.iter().any(|t| t.asks && t.definition["name"] == tool) || profile(app, name)?.allow.contains(tool) {
+    if !setup.tools.asking().contains(&tool) || profile(app, name)?.allow.contains(tool) {
         return Ok(());
     }
-    feed.push(obj! {"approve" => id});
-    let answer = feed.answer(id, APPROVAL_WAIT).unwrap_or_default();
-    match answer.as_str() {
-        "always" => change(app, &profile_path(app, name), false, |s: &mut SessionSettings| { s.allow.insert(tool.into()); Ok(()) }).map(drop),
-        "allow" => Ok(()),
-        _ => Err("the user didn't allow this call".into()),
-    }
+    let (answer, answered) = channel();
+    tell(Msg::Ask { id: id.into(), tool: tool.into(), answer });
+    answered.recv_timeout(APPROVAL_WAIT).unwrap_or_else(|_| Err(DENIED.into()))
 }
 
-/// Memories form (memory::drive), the page told that the session is forming them.
-fn form(run: &Running, name: &str, s: &Session, setup: &Setup) {
-    run.forming.store(true, Ordering::Relaxed);
-    if let Some(error) = drive(s, &mut Summarizer(&setup.llm, setup.tools.definitions()), &setup.settings.config) {
+/// Memories form (memory::drive), the session's thread told while they do.
+fn form(tell: &dyn Fn(Msg), name: &str, s: &Session, setup: &Setup) {
+    tell(Msg::Forming(true));
+    if let Some(error) = drive(s, &mut Summarizer(setup, setup.tools.definitions()), &setup.settings.config) {
         eprintln!("{name}: forming a memory: {error}");
     }
-    run.forming.store(false, Ordering::Relaxed);
+    tell(Msg::Forming(false));
 }
 
 /// What a session's step runs with, from the settings as they are now.
 fn setup(app: &App, name: &str) -> Result<Setup, String> {
     let (all, s) = (global(app)?, profile(app, name)?);
     let p = all.providers.get(&s.provider).ok_or_else(|| format!("no provider {} in settings.json", s.provider))?;
-    let llm = Llm { base: p.base.clone(), key: p.key.clone(), model: s.model.clone(), agent: app.agent.clone() };
+    let llm = Llm { base: p.base.clone(), key: p.key.clone(), agent: app.agent.clone() };
     let bash = match &s.workspace {
         Some(dir) if app.bash => bash::tool(dir.clone(), app.limit, s.sandbox.then_some(all.sandbox)),
         None if app.bash => bash::unavailable("it has no workspace; the user can set one in the session's settings"),
         _ => Toolbox::default(),
     };
-    let tools = bash + app.mcp.clone();
+    let tools = bash + mcp::toolbox(&app.mcp);
     Ok(Setup { overhead: overhead(s.system.as_deref(), &tools), settings: s, llm, tools })
 }
 
@@ -497,8 +547,12 @@ fn overhead(system: Option<&str>, tools: &Toolbox) -> f64 {
     density_tokens(system.unwrap_or("")) + tools.definitions().map_or(0.0, |d| density_tokens(&json::to_string(&d)))
 }
 
+fn global_path(app: &App) -> PathBuf {
+    app.root.join("settings.json")
+}
+
 fn global(app: &App) -> Result<Settings, String> {
-    settings::read(&app.root.join("settings.json"))
+    settings::read(&global_path(app))
 }
 
 fn profile_path(app: &App, name: &str) -> PathBuf {
@@ -509,12 +563,12 @@ fn profile(app: &App, name: &str) -> Result<SessionSettings, String> {
     settings::read(&profile_path(app, name))
 }
 
-/// A settings file as `f` changes it, written if `f` succeeds; one change at a time.
-fn change<T: Serialize + DeserializeOwned>(app: &App, path: &Path, private: bool, f: impl FnOnce(&mut T) -> Result<(), String>) -> Result<T, String> {
-    let _one = app.writing.lock().unwrap();
+/// A settings file as `f` changes it, written if `f` succeeds. The hub changes every settings file
+/// (once whoever made a session wrote its first).
+fn change<T: Serialize + DeserializeOwned>(path: &Path, f: impl FnOnce(&mut T) -> Result<(), String>) -> Result<T, String> {
     let mut settings = settings::read(path)?;
     f(&mut settings)?;
-    settings::write(path, &settings, private).map(|()| settings)
+    settings::write(path, &settings).map(|()| settings)
 }
 
 /// The providers as the page sees them: never a key, only whether there is one.
@@ -541,15 +595,15 @@ fn create(app: &App, v: &Value) -> Result<Value, String> {
     if !profile_path(app, name).exists() {
         let first = tuned(app, &global(app)?.defaults, &obj! {"workspace" => v["workspace"].clone()}, false)?;
         std::fs::create_dir_all(app.root.join(name)).map_err(|e| format!("{name}: {e}"))?;
-        settings::write(&profile_path(app, name), &first, false)?;
+        settings::write(&profile_path(app, name), &first)?;
     }
     Ok(state(app, name, &Session::open(app.root.join(name))))
 }
 
-/// A session's settings changed by what `v` gives (tuned), one change at a time.
-fn tune(app: &App, name: &str, s: &Session, v: &Value) -> Result<Value, String> {
-    change(app, &profile_path(app, name), false, |old: &mut SessionSettings| tuned(app, old, v, s.count("layer2") > 0).map(|new| *old = new))?;
-    Ok(state(app, name, s))
+/// A session's settings changed by what `v` gives (tuned).
+fn tune(app: &App, name: &str, v: &Value) -> Result<(), String> {
+    let merged = Session::open(app.root.join(name)).count("layer2") > 0;
+    change(&profile_path(app, name), |old: &mut SessionSettings| tuned(app, old, v, merged).map(|new| *old = new)).map(drop)
 }
 
 /// Session settings as what `v` gives changes them: any of their fields, and any of config's. The
@@ -578,28 +632,27 @@ fn tuned(app: &App, old: &SessionSettings, v: &Value, merged: bool) -> Result<Se
     Ok(new)
 }
 
-/// A message as the page shows it: how the context shows it, its reasoning apart, the rest as notes.
+/// A message as the page shows it: how the context shows it, and its blocks, brief.
 fn shown(m: &Value, class: &str) -> Value {
-    let (thinking, rest): (Vec<&Value>, Vec<&Value>) = m["content"].arr().iter().partition(|b| b.kind() == "thinking");
-    let thinking: Vec<&str> = thinking.iter().filter_map(|b| b["thinking"].as_str()).collect();
-    let text = rest.into_iter().map(note).collect::<Vec<_>>().join("\n");
-    obj! {"id" => m.id(), "participant" => m["participant"].clone(), "shown" => class, "thinking" => thinking.join("\n"), "text" => text}
+    obj! {"id" => m.id(), "participant" => m["participant"].clone(), "shown" => class, "content" => m["content"].arr().iter().map(brief).collect::<Vec<_>>()}
 }
 
-/// A block as the page shows it: text as it is, images, tool calls and their results as short notes.
-fn note(b: &Value) -> String {
+/// A block as the page gets it: text and tool calls as they are, reasoning without its signature, a
+/// tool result with its content's blocks brief, an image as its size, and anything else as its type.
+fn brief(b: &Value) -> Value {
     match b.kind() {
-        "text" => b["text"].as_str().unwrap_or("").to_string(),
-        "image" => format!("[image, {} KB]", b["source"]["data"].as_str().map_or(0, str::len) / 1024),
-        "tool_use" => format!("[tool call {} {}]", b["name"].as_str().unwrap_or(""), json::to_string(&b["input"])),
-        "tool_result" => format!("[tool result{}] {}", if b["isError"] == true { ", failed" } else { "" }, content(&b["content"])),
-        kind => format!("[{kind}]"),
+        "text" | "tool_use" => b.clone(),
+        "thinking" => obj! {"type" => "thinking", "thinking" => b["thinking"].clone()},
+        "tool_result" => {
+            let content = match &b["content"] {
+                Value::Array(blocks) => blocks.iter().map(brief).collect(),
+                text => text.clone(),
+            };
+            sparse(obj! {"type" => "tool_result", "toolUseId" => b["toolUseId"].clone(), "content" => content, "isError" => b["isError"].clone()})
+        }
+        "image" => obj! {"type" => "image", "kb" => b["source"]["data"].as_str().map_or(0, str::len) / 1024},
+        kind => obj! {"type" => kind},
     }
-}
-
-/// A tool result's content as the page shows it: a string, or its blocks' notes.
-fn content(c: &Value) -> String {
-    c.as_str().map_or_else(|| c.arr().iter().map(note).collect::<Vec<_>>().join("\n"), str::to_string)
 }
 
 /// Every session: its name, messages, the session it forked from, and its workspace.
@@ -619,22 +672,20 @@ fn parent(s: &Session) -> Value {
     s.fork["parent"].as_str().map_or(Value::Null, |path| obj! {"name" => name(path), "at" => s.fork["at"].clone()})
 }
 
-/// What the page shows of a session: counts, each layer's size, the last compile, its settings and
-/// tools, and whether memories are forming or a turn runs.
+/// What the page shows of a session: counts, each layer's size, the last compile, its settings as its
+/// file has them, the tools that ask before they run and the tokens every request carries (or the
+/// problem that keeps it from running), and whether memories are forming or a turn runs.
 fn state(app: &App, name: &str, s: &Session) -> Value {
     let layers: Vec<Value> = (0..).map(|n| s.count(&format!("layer{n}"))).take_while(|&c| c > 0).map(Value::from).collect();
     let last = s.last("compiles").unwrap_or(obj! {});
     let refused = s.last("attempts").is_some_and(|a| a["outcome"].as_str() == Some("refusal"));
-    let (setup, run) = (setup(app, name), running(app, name));
-    let chip = |x: &Setup, name: &str| obj! {"name" => name, "allowed" => x.settings.allow.contains(name)};
-    let tools: Vec<Value> = setup.iter().flat_map(|x| x.tools.0.iter().filter(|t| t.asks).filter_map(|t| Some(chip(x, t.definition["name"].as_str()?)))).collect();
+    let (setup, (running, forming)) = (setup(app, name), ask_session(app, name, Msg::Status));
     obj! {
-        "name" => name, "messages" => s.count("messages"), "layers" => layers,
-        "k" => setup.as_ref().map_or(Config::default().merge_threshold, |x| x.settings.config.merge_threshold),
-        "frontier" => last["frontier"].clone(), "armed" => last["armed"].clone(), "multiplier" => last["multiplier"].clone(),
-        "escalated" => last["escalated"].clone(), "refused" => refused,
-        "forming" => run.forming.load(Ordering::Relaxed), "parent" => parent(s), "running" => run.turn.lock().unwrap().is_some(),
-        "settings" => setup.as_ref().ok().map(|x| serde_json::to_value(&x.settings).expect("settings are JSON")), "problem" => setup.as_ref().err().map(String::as_str),
-        "tools" => tools, "overhead" => setup.as_ref().map_or(0.0, |x| x.overhead),
+        "messages" => s.count("messages"), "layers" => layers,
+        "frontier" => last["frontier"].clone(), "armed" => last["armed"].clone(), "multiplier" => last["multiplier"].clone(), "refused" => refused,
+        "forming" => forming, "running" => running,
+        "settings" => profile(app, name).ok().map(|p| serde_json::to_value(p).expect("settings are JSON")),
+        "tools" => setup.as_ref().map_or(vec![], |x| x.tools.asking()), "overhead" => setup.as_ref().map_or(0.0, |x| x.overhead),
+        "problem" => setup.as_ref().err().map(String::as_str),
     }
 }
