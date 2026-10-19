@@ -53,6 +53,8 @@ dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top
 #sessions small { color: var(--muted); }
 .group { margin: 0 0 6px; }
 .group summary, .provider { cursor: pointer; padding: 4px 0; }
+.group summary { list-style: none; }   /* a click on the header folds its group; no arrow */
+.group summary::-webkit-details-marker { display: none; }
 .group summary small, .provider small { display: block; font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
 
 /* the chat: a line where the speaker changes, then each block a bubble, the user's on the right */
