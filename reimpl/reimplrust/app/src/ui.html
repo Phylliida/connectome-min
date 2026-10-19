@@ -164,18 +164,22 @@ const page = {
   tuned: 0,                               // the session form's saves, after each of which it starts again
   detail: 'Select a memory or chunk.',    // the memory or chunk the pyramid last showed
   folded: new Set(),                      // the workspaces whose groups are folded, kept in this browser
-  scroll: false,                          // whether the log scrolls to its end once drawn
+  scroll: false,                          // whether the next draw takes the log to its end, wherever it's scrolled to
 };
 let stream = null;   // aborts the stream the page follows its session on
 
 // the page drawn again from what it shows: at once (draw, after what the user does), or at most once a
-// frame however fast it changes (redraw, as a turn streams)
+// frame however fast it changes (redraw, as a turn streams). The log keeps to its end as it grows while
+// the user is there (or near it), and stays where they scrolled to otherwise; opening a session or
+// sending a message takes it there (page.scroll).
 let frame = null;
 function draw() {
   cancelAnimationFrame(frame);
   frame = null;
+  const log = document.getElementById('log');
+  const following = page.scroll || (log && log.scrollHeight - log.scrollTop - log.clientHeight < 48);
   render(html`<${App} />`, document.querySelector('main'));
-  if (page.scroll) document.getElementById('log').scrollTop = document.getElementById('log').scrollHeight;
+  if (following) document.getElementById('log').scrollTop = document.getElementById('log').scrollHeight;
   page.scroll = false;
 }
 const redraw = () => frame ??= requestAnimationFrame(draw);
@@ -635,7 +639,7 @@ async function stop() {
 // log as it is; the page hears it as it follows the session
 async function turn(text) {
   if (!current()) return;
-  page.error = null;
+  [page.error, page.scroll] = [null, true];
   try { await api(`/api/s/${current()}/${text ? 'say' : 'continue'}`, { text }); } catch (err) { fail(err); }
 }
 
@@ -672,7 +676,7 @@ async function follow(name, signal) {
     },
     state: (s) => {
       [state, page.broken] = [s, null];
-      if (caught) [page.messages, caught] = [caught, null];
+      if (caught) [page.messages, caught, page.scroll] = [caught, null, true];
       if (!s.running) page.live = null;
     },
     broken: (why) => { page.broken = why; },
@@ -711,7 +715,6 @@ async function follow(name, signal) {
   };
   const take = (event) => {
     for (const [field, value] of Object.entries(event)) if (value !== '') (on[field] ?? (page.live && turned[field]))?.(value);
-    page.scroll = true;
     redraw();
   };
   try {
