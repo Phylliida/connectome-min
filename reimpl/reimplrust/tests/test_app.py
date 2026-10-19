@@ -47,7 +47,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
-seen = {'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None}
+seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None}
 
 
 class Mock(BaseHTTPRequestHandler):
@@ -299,6 +299,8 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
                 seen['costs'][name] = last['spent']
             if 'prompt' in last:
                 seen['prompts'][name] = last['prompt']
+            if 'fold' in last:
+                seen['folds'].setdefault(name, []).append(last['fold'])
             if 'calling' in last:
                 calls.append([last['calling'], ''])
             if 'input' in last:
@@ -611,6 +613,15 @@ def chatted(turns, tls, ca, baseline) -> str:
         if {c['for'] for c in costs} != {'reply', 'memories'} or any(abs(sums[w][k] - spent[w][k]) > 1e-9 for w in sums for k in sums[w]) or seen['costs']['main'] != spent \
                 or any(c['used']['input'] <= 0 or c['used']['cached'] <= 0 or c['used']['output'] <= 0 for c in costs) or costs[-1]['total'] != {w: spent[w] for w in ('reply', 'memories')}:
             raise SystemExit(f'main used {spent}, its log {sums} in {len(costs)} records, the page last heard {seen["costs"].get("main")}')
+        listed = call(port, '/api/s/main/messages?from=0')              # folds: before replies, as streamed, each the same messages in fewer tokens
+        folds, layers = [m['fold'] for m in listed if 'fold' in m], [call(port, f'/api/s/main/layer/{n}?from=0') for n in range(len(state['layers']))]
+        reach = lambda nodes: (min(layers[l][p]['first'] for l, p in nodes), max(layers[l][p]['last'] for l, p in nodes))
+        if not folds or folds != seen['folds']['main'] or any(m['participant'] != 'assistant' for m in listed if 'fold' in m) or any(reach(f['from']) != reach(f['into']) for f in folds) \
+                or any(f['saved'] <= 0 for f in folds if max(l for l, _ in f['into']) > max(l for l, _ in f['from'])) or {c['message'] for c in costs if c['for'] == 'reply'} - {m['id'] for m in listed if m['participant'] == 'assistant'}:
+            raise SystemExit(f'main folded {len(folds)} times ({folds[:2]}); the page heard {len(seen["folds"].get("main", []))}')
+        start = [m['id'] for m in listed if 'fold' in m][1]                # a view starting at a reply with a fold still shows it
+        if [m.get('fold') for m in call(port, f'/api/s/main/messages?from={start}')] != [m.get('fold') for m in listed if m['id'] >= start]:
+            raise SystemExit(f'the messages from {start} show other folds than all of them do')
         if state['prompt'] != next(c['used']['input'] for c in reversed(costs) if c['for'] == 'reply') or state['prompt'] != seen['prompts']['main']:
             raise SystemExit(f'main\'s last prompt {state["prompt"]}, the page last heard {seen["prompts"].get("main")}')
         if seen['problems']:

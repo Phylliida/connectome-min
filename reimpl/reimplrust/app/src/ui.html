@@ -44,6 +44,8 @@ input[type=checkbox] { width: auto; }
 #chat { display: flex; flex-direction: column; padding: 0; }
 #log { flex: 1; overflow: auto; padding: 16px; }
 .msg { position: relative; margin-top: 12px; }
+.fold { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin: 14px 0 2px; }
+.fold::before, .fold::after { content: ''; flex: 1; border-top: 1px dashed var(--line); }
 .msg .who { margin-bottom: 4px; }
 .msg.more { margin-top: 0; }
 .msg.more > .who { display: none; }
@@ -268,10 +270,19 @@ async function showLog(n) {
     const results = m.content.every((b) => b.type === 'tool_result'), more = m.participant === shownLast()?.dataset.who;
     $('log').insertAdjacentHTML('beforeend', `<div class="msg${results ? ' results' : ''}${more ? ' more' : ''}" data-who="${escape(m.participant)}"><div class="who">${escape(m.participant)}${results ? ' · tool results' : ''}</div><button data-fork="${m.id}">fork here</button></div>`);
     const shown = $('log').lastElementChild;
+    if (m.fold) shown.insertAdjacentHTML('beforebegin', foldLine(m.fold));
     for (const b of m.content) draw(shown, b);
     shown.hidden = results && !shown.querySelector('.tool');
   }
   $('log').scrollTop = $('log').scrollHeight;
+}
+
+// how the context folded before a reply: the nodes it shows instead of which, by layer, and the tokens
+// that saves (or costs, when it unfolds)
+function foldLine({ from, into, saved }) {
+  const noun = (layer, n) => layer == 0 ? (n > 1 ? 'chunks' : 'chunk') : `L${layer} ${n > 1 ? 'memories' : 'memory'}`;
+  const nodes = (list) => Object.entries(Object.groupBy(list, ([layer]) => layer)).map(([layer, all]) => `${all.length} ${noun(layer, all.length)}`).join(', ');
+  return `<div class="fold">Context ${saved >= 0 ? 'folded' : 'unfolded'}: ${nodes(from)} → ${nodes(into)} · ${tokens(Math.abs(saved))} tokens ${saved >= 0 ? 'saved' : 'more'}</div>`;
 }
 
 // the last message the log shows
@@ -444,7 +455,8 @@ function turn(text) {
 }
 
 // a job as it streams, JSON lines: {"logged": n} each time the log grows (the page shows it, then what
-// it doesn't hold yet below it), {"thinking"} or {"text"} for each piece of a reply, {"calling"} as it
+// it doesn't hold yet below it), {"fold"} when the context folded for the reply to come, {"thinking"}
+// or {"text"} for each piece of a reply, {"calling"} as it
 // starts a call and {"input"} for each piece of the call's input, then for each call
 // the logged reply makes {"approve"} when it asks to run, {"answered"} once a page answers and its
 // {"result"}; {"spent"}, what the session's requests have used, after each; {"forming"} as memories start and stop forming; {"ok"} or {"error"} when the turn ends,
@@ -479,6 +491,7 @@ async function follow(response) {
         state.prompt = event.prompt ?? state.prompt;
         drawMemory();
       }
+      if (event.fold) $('reply').insertAdjacentHTML('beforebegin', foldLine(event.fold));   // before the reply it was compiled for
       if (event.calling) draw($('reply'), { type: 'calling', name: event.calling });
       if (event.input) $('reply').lastElementChild.lastElementChild.textContent += event.input;
       if (event.text) {   // the reply's markdown so far, drawn again

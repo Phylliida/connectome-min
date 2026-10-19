@@ -20,7 +20,8 @@ mod tools;
 
 use crate::{llm::{Llm, Usage}, settings::{SessionSettings, Settings}, tools::{bash, edit, mcp, Toolbox}};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Reader}, json::{self, sparse, Json, Value}, obj};
-use connectome::{memory::{Host, Request}, store::Session};
+use connectome::{js::py_round, memory::{Host, Request}, store::Session};
+use itertools::Itertools;
 use serde::{de::DeserializeOwned, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::{io::{BufRead, BufReader, BufWriter, Read, Write}, net::{TcpListener, TcpStream}, panic::{catch_unwind, AssertUnwindSafe}};
@@ -345,8 +346,12 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, par
     let s = Session::open(app.root.join(name));
     match (method, rest) {
         ("GET", []) => Ok(Some(state(app, name, &s))),
-        ("GET", ["messages"]) => send_all(stream, listing(&s, "messages", 200, param).map(|m| shown(&m))),
-        ("GET", ["layer", n]) => send_all(stream, listing(&s, &format!("layer{n}"), u64::MAX, param)),
+        ("GET", ["messages"]) => {
+            let (from, messages) = listing(&s, "messages", 200, param);
+            let folds = folds(&s, from);
+            send_all(stream, messages.map(|m| shown(&m, folds.get(&m.id()))))
+        }
+        ("GET", ["layer", n]) => send_all(stream, listing(&s, &format!("layer{n}"), u64::MAX, param).1),
         ("POST", ["fork"]) => {
             let at = body["at"].as_f64().ok_or("fork at which message?")? as u64;
             let fork = body["name"].as_str().filter(|f| named(f)).ok_or("a fork's name")?;
@@ -376,11 +381,36 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, par
     }
 }
 
-/// Records `from` to `to` of a file (by default, its newest `newest`), as they're read.
-fn listing<'s>(s: &'s Session, file: &str, newest: u64, param: impl Fn(&str) -> Option<u64>) -> Box<dyn Iterator<Item = Value> + 's> {
+/// Records `from` to `to` of a file (by default, its newest `newest`), as they're read, and `from`.
+fn listing<'s>(s: &'s Session, file: &str, newest: u64, param: impl Fn(&str) -> Option<u64>) -> (u64, Box<dyn Iterator<Item = Value> + 's>) {
     let to = param("to").map_or(s.count(file), |to| to.min(s.count(file)));
     let from = param("from").unwrap_or(to.saturating_sub(newest));
-    if from < to { s.span(file, from, to - 1) } else { Box::new(std::iter::empty()) }
+    (from, if from < to { s.span(file, from, to - 1) } else { Box::new(std::iter::empty()) })
+}
+
+/// How the context folded before each reply from message `from` on, by the reply's message: its
+/// compile against the reply's before it (folded). Replies logged without their compile have none.
+fn folds(s: &Session, from: u64) -> HashMap<u64, Value> {
+    let linked: Vec<Value> = replies(s).take_while(|c| c.get("compile").is_some()).take_while_inclusive(|c| c["message"].u64() >= from).collect();
+    let compile = |c: &Value| s.read("compiles", c["compile"].u64());
+    linked.windows(2).filter_map(|w| Some((w[0]["message"].u64(), folded(s, &compile(&w[1]), &compile(&w[0]))?))).collect()
+}
+
+/// What a compile's frontier (`after`) shows differently from an earlier one's (`before`) where both
+/// reach (chunks closed since aren't a change): the nodes it no longer shows ("from") and those it
+/// shows instead ("into"), each [layer, id], and the tokens that saves ("saved", below 0 when it
+/// unfolds), as the planner prices them at `after`'s multiplier; None when it shows the same.
+fn folded(s: &Session, before: &Value, after: &Value) -> Option<Value> {
+    let nodes = |c: &Value| -> Vec<(u64, u64)> { c["frontier"].arr().iter().map(|n| (n[0].u64(), n[1].u64())).collect() };
+    let record = |&(layer, id): &(u64, u64)| s.read(&format!("layer{layer}"), id);
+    let (old, new, m) = (nodes(before), nodes(after), after["multiplier"].as_f64().unwrap_or(1.0));
+    let reach = old.last().map_or(0, |n| record(n)["last"].u64()); // the last message the earlier one shows
+    let from: Vec<_> = old.iter().copied().filter(|n| !new.contains(n)).collect();
+    let into: Vec<_> = new.iter().copied().filter(|n| !old.contains(n) && record(n)["first"].u64() <= reach).collect();
+    let price = |n: &(u64, u64)| if n.0 == 0 { py_round(record(n)["raw"].as_f64().unwrap_or(0.0) * m) } else { record(n)["recall"].as_f64().unwrap_or(0.0) };
+    let json = |nodes: &[(u64, u64)]| Value::from(nodes.iter().map(|&(layer, id)| vec![layer, id]).collect::<Vec<_>>());
+    let saved = from.iter().map(price).sum::<f64>() - into.iter().map(price).sum::<f64>();
+    (!from.is_empty()).then(|| obj! {"from" => json(&from), "into" => json(&into), "saved" => saved})
 }
 
 /// A session's thread: it does its jobs one at a time, in the order they come (a message or fork told
@@ -422,7 +452,7 @@ fn work(app: &App, name: &str, jobs: Receiver<Job>, tell: &dyn Fn(Msg)) {
 /// API continues (a prefill). The turn tells the hub (`tell`) what the pages following it see: the
 /// log's length each time it grows ({"logged"}), the pieces of a reply's reasoning and text
 /// ({"thinking"}, {"text"}), each call's tool as the reply starts it and its input as it comes
-/// ({"calling"}, {"input"}), what the session's requests have used after each ({"spent"}, and a reply's
+/// ({"calling"}, {"input"}), how the context folded before a reply ({"fold"}), what the session's requests have used after each ({"spent"}, and a reply's
 /// prompt as its provider counted it, {"prompt"}), the question whether each call may run ({"approve"}: its id; the answers
 /// come from the pages: {"answered": the id, "answer"}), and each call's result ({"result"}: the
 /// tool_result block, brief). Memories form between steps; the session's thread tells the turn's end
@@ -462,6 +492,10 @@ fn step(app: &App, name: &str, s: &Session, usage: &mut Option<f64>, tell: &dyn 
         compiled = select(s, w, current(s), cfg);
     }
     let turns = compiled.map_err(|r| format!("{}: {} tokens over a budget of {}", r.stage, r.actual, r.budget))?;
+    let compile = |c: Value| s.read("compiles", c["compile"].u64());
+    if let Some(fold) = replies(s).next().filter(|c| c.get("compile").is_some()).and_then(|c| folded(s, &compile(c), &s.last("compiles")?)) {
+        tell(Msg::Event(obj! {"fold" => fold}));
+    }
     let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.settings.system.as_deref(), "tools" => setup.definitions.clone()});
     let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), |kind, piece| tell(Msg::Event(obj! {kind => piece})))?;
     spend(s, &setup, "reply", tell);
@@ -516,15 +550,24 @@ fn spend(s: &Session, setup: &Setup, what: &str, tell: &dyn Fn(Msg)) {
         let mut totals = totals(s);
         let total = totals.entry(what.to_string()).or_default();
         *total = *total + used;
-        s.append("costs", obj! {"for" => what, "used" => used, "total" => serde_json::to_value(&totals).expect("usage is JSON")});
-        tell(Msg::Event(sparse(obj! {"spent" => spent(&totals), "prompt" => (what == "reply").then_some(used.input)})));
+        let reply = what == "reply"; // its record says which message it is, and the compile its request was built from
+        let (message, compile) = (reply.then(|| s.count("messages")), reply.then(|| s.count("compiles").saturating_sub(1)));
+        let logged = obj! {"for" => what, "message" => message, "compile" => compile, "used" => used, "total" => serde_json::to_value(&totals).expect("usage is JSON")};
+        s.append("costs", sparse(logged));
+        tell(Msg::Event(sparse(obj! {"spent" => spent(&totals), "prompt" => reply.then_some(used.input)})));
     }
 }
 
-/// The last reply's prompt in tokens, as its provider counted it: the newest reply's record in the
-/// session's costs log, a few from its end (rounds of memories come between); None before any.
+/// The records of the session's replies in its costs log, newest first, as they're read: each says
+/// the message it is and the compile its request was built from.
+fn replies(s: &Session) -> impl Iterator<Item = Value> + '_ {
+    (0..s.count("costs")).rev().map(|i| s.read("costs", i)).filter(|c| c["for"] == "reply")
+}
+
+/// The last reply's prompt in tokens, as its provider counted it (its record is a few from the costs
+/// log's end: rounds of memories come between); None before any.
 fn prompted(s: &Session) -> Option<f64> {
-    (0..s.count("costs")).rev().map(|i| s.read("costs", i)).find(|c| c["for"] == "reply").and_then(|c| c["used"]["input"].as_f64())
+    replies(s).next().and_then(|c| c["used"]["input"].as_f64())
 }
 
 /// What the session's requests have used, by what they were for ("reply", "memories"): its costs log's
@@ -635,9 +678,9 @@ fn tuned(app: &App, old: &SessionSettings, v: &Value, merged: bool) -> Result<Se
     Ok(new)
 }
 
-/// A message as the page shows it: its blocks brief.
-fn shown(m: &Value) -> Value {
-    obj! {"id" => m.id(), "participant" => m["participant"].clone(), "content" => m["content"].arr().iter().map(brief).collect::<Vec<_>>()}
+/// A message as the page shows it: its blocks brief, and how the context folded before it (folds).
+fn shown(m: &Value, fold: Option<&Value>) -> Value {
+    sparse(obj! {"id" => m.id(), "participant" => m["participant"].clone(), "content" => m["content"].arr().iter().map(brief).collect::<Vec<_>>(), "fold" => fold.cloned()})
 }
 
 /// A block as the page gets it: text and tool calls as they are, reasoning without its signature, a
