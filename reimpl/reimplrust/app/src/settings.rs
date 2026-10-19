@@ -2,7 +2,7 @@
 //! only this user can read, since settings.json holds the keys. README.md describes their fields:
 //! ROOT/settings.json is a Settings, each session's ROOT/NAME/session_settings.json a SessionSettings.
 
-use connectome::config::Config;
+use connectome::{config::Config, json::Value, obj};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use smart_default::SmartDefault;
 use std::{collections::{BTreeMap, BTreeSet}, io::Write, path::{Path, PathBuf}};
@@ -25,6 +25,20 @@ impl Settings {
         let config = Config { summary_participant: "assistant".into(), recent_window_tokens, target_chunk_tokens, compression_max_tokens: Some(8000.0), ..Config::default() };
         let providers = BTreeMap::from([("default".into(), Provider { base, key: String::new() })]);
         Settings { providers, defaults: SessionSettings { config, ..defaults }, sandbox: Sandbox::default() }
+    }
+
+    /// The providers as the page sees them: never a key, only whether there is one.
+    pub fn providers(&self) -> Value {
+        let shown = self.providers.iter().map(|(name, p)| obj! {"name" => name.as_str(), "base" => p.base.as_str(), "key" => !p.key.is_empty()});
+        obj! {"providers" => shown.collect::<Vec<_>>()}
+    }
+
+    /// A provider added, or its base URL or key changed, by what `v` gives that isn't blank.
+    pub fn provide(&mut self, v: &Value) -> Result<(), String> {
+        let given = |k: &str| v[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        let p = self.providers.entry(given("name").ok_or("a provider's name")?).or_default();
+        (p.base, p.key) = (given("base").unwrap_or(std::mem::take(&mut p.base)), given("key").unwrap_or(std::mem::take(&mut p.key)));
+        if p.base.is_empty() { Err("a provider's base URL".into()) } else { Ok(()) }
     }
 }
 
@@ -57,6 +71,36 @@ pub struct SessionSettings {
     pub config: Config,
 }
 
+impl SessionSettings {
+    /// These settings as what `v` gives changes them: any of their fields, and any of config's. The
+    /// provider must be one of `all`'s, a workspace given a directory that exists (absolute, a leading
+    /// ~/ the home directory, no trailing /), and merge_threshold as it was once memories have `merged`.
+    pub fn tuned(&self, v: &Value, merged: bool, all: &Settings) -> Result<SessionSettings, String> {
+        let mut new = serde_json::to_value(self).expect("settings are JSON");
+        for (k, x) in v.as_object().into_iter().flatten() {
+            match (k.as_str(), x) {
+                ("config", Value::Object(fields)) => new["config"].as_object_mut().expect("config").extend(fields.clone()),
+                _ => new[k] = x.clone(),
+            }
+        }
+        let mut new: SessionSettings = serde_json::from_value(new).map_err(|e| e.to_string())?;
+        if let Some(path) = v["workspace"].as_str().map(str::trim) {
+            let dir: PathBuf = std::path::absolute(expand(path)).map_err(|e| format!("{path}: {e}"))?.components().collect();
+            if !dir.is_dir() {
+                return Err(format!("no directory {path}"));
+            }
+            new.workspace = Some(dir);
+        }
+        if !all.providers.contains_key(&new.provider) {
+            return Err(format!("no provider {}", new.provider));
+        }
+        if merged && new.config.merge_threshold != self.config.merge_threshold {
+            return Err("merge_threshold stays as it is once memories have merged".into());
+        }
+        Ok(new)
+    }
+}
+
 /// A path, a leading ~/ the home directory.
 pub fn expand(path: &str) -> PathBuf {
     match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
@@ -68,6 +112,14 @@ pub fn expand(path: &str) -> PathBuf {
 pub fn read<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A settings file as `f` changes it, written if `f` succeeds. The hub changes every settings file
+/// (once whoever made a session wrote its first).
+pub fn change<T: Serialize + DeserializeOwned>(path: &Path, f: impl FnOnce(&mut T) -> Result<(), String>) -> Result<T, String> {
+    let mut settings = read(path)?;
+    f(&mut settings)?;
+    write(path, &settings).map(|()| settings)
 }
 
 /// Writes a settings file whole, through a new file that then takes the old one's place, so no one

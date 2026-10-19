@@ -299,8 +299,8 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
                 seen['costs'][name] = last['spent']
             if 'prompt' in last:
                 seen['prompts'][name] = last['prompt']
-            if 'fold' in last:
-                seen['folds'].setdefault(name, []).append(last['fold'])
+            if 'fold' in last:                                              # before the reply to come: the log's next message
+                seen['folds'].setdefault(name, {})[logged] = last['fold']
             if 'calling' in last:
                 calls.append([last['calling'], ''])
             if 'input' in last:
@@ -616,7 +616,7 @@ def chatted(turns, tls, ca, baseline) -> str:
         listed = call(port, '/api/s/main/messages?from=0')              # folds: before replies, as streamed, each the same messages in fewer tokens
         folds, layers = [m['fold'] for m in listed if 'fold' in m], [call(port, f'/api/s/main/layer/{n}?from=0') for n in range(len(state['layers']))]
         reach = lambda nodes: (min(layers[l][p]['first'] for l, p in nodes), max(layers[l][p]['last'] for l, p in nodes))
-        if not folds or folds != seen['folds']['main'] or any(m['participant'] != 'assistant' for m in listed if 'fold' in m) or any(reach(f['from']) != reach(f['into']) for f in folds) \
+        if not folds or {m['id']: m['fold'] for m in listed if 'fold' in m} != seen['folds']['main'] or any(m['participant'] != 'assistant' for m in listed if 'fold' in m) or any(reach(f['from']) != reach(f['into']) for f in folds) \
                 or any(f['saved'] <= 0 for f in folds if max(l for l, _ in f['into']) > max(l for l, _ in f['from'])) or {c['message'] for c in costs if c['for'] == 'reply'} - {m['id'] for m in listed if m['participant'] == 'assistant'}:
             raise SystemExit(f'main folded {len(folds)} times ({folds[:2]}); the page heard {len(seen["folds"].get("main", []))}')
         start = [m['id'] for m in listed if 'fold' in m][1]                # a view starting at a reply with a fold still shows it
@@ -666,6 +666,16 @@ def chatted(turns, tls, ca, baseline) -> str:
         after = settle(port, 'branch')['spent']                          # mock-2's provider reports no cost, but tokens
         if after['total']['cost'] != before['total']['cost'] or after['total']['input'] <= before['total']['input']:
             raise SystemExit(f'a turn whose provider reports no cost: {before} then {after}')
+        try:
+            say(port, 'branch', 'fail once, then go on')
+            raise SystemExit('a turn whose request failed went through')
+        except SystemExit as failed:
+            if 'Overloaded' not in str(failed):
+                raise
+        say(port, 'branch', None)
+        learnt = [json.loads(line)['multiplier'] for line in Path(root, 'branch', 'compiles.jsonl').read_text().splitlines()][-3:]
+        if learnt[0] == learnt[1] or learnt[1] != learnt[2]:            # the failed request's compile learnt from the reply before it, and nothing since has
+            raise SystemExit(f'around a failed request the price multiplier went {learnt}')
         shown, mode = call(port, '/api/settings')['providers'], os.stat(os.path.join(root, 'settings.json')).st_mode & 0o777
         listed = next((p for p in shown if p['name'] == 'plain'), None)
         kept, own = Path(root, 'settings.json').read_text(), Path(root, 'branch', 'session_settings.json').read_text()

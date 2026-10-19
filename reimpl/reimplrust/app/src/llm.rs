@@ -6,7 +6,7 @@
 
 use connectome::{blocks::Block, emit::Reader, json::{self, sparse, Json, Value}, obj, turns::Turn};
 use serde::{Deserialize, Serialize};
-use std::{cell::Cell, io::{self, BufRead, BufReader, BufWriter, Write}, ops::Add};
+use std::{cell::Cell, io::{self, BufRead, BufReader, BufWriter, Write}, iter::Sum, ops::Add};
 use ureq::tls::{PemItem, TlsConfig};
 
 pub struct Llm {
@@ -35,6 +35,12 @@ impl Add for Usage {
     }
 }
 
+impl Sum for Usage {
+    fn sum<I: Iterator<Item = Usage>>(all: I) -> Usage {
+        all.fold(Usage::default(), Usage::add)
+    }
+}
+
 impl From<Usage> for Value {
     fn from(used: Usage) -> Value {
         serde_json::to_value(used).expect("usage is JSON")
@@ -56,11 +62,11 @@ pub fn agent(ca: Option<&[u8]>) -> Result<ureq::Agent, String> {
 
 impl Llm {
     /// POSTs to {base}/v1/messages (or {base}/messages for a base that ends in /v1) `head`'s fields
-    /// and `turns` as the messages, read through `reader` as they're written out, asking for a stream;
-    /// hands `piece` each piece of the reply's text or reasoning as it arrives ("text" or "thinking",
-    /// and the piece), and each call's tool as it starts and its input as it comes ("calling" and the
-    /// tool's name, "input" and a piece of its JSON), and gives the whole reply as the library takes it: {stopReason, content, usage:
-    /// {inputTokens, outputTokens}}.
+    /// and `turns` as the messages, read through `reader` as they're written out, asking for a stream.
+    /// Hands `piece` each piece of the reply as it arrives: ("text" or "thinking", a piece of it), and
+    /// for each call ("calling", its tool) as it starts and ("input", a piece of its JSON) as it comes.
+    /// Gives the whole reply as the library takes it: {stopReason, content, usage: {inputTokens,
+    /// outputTokens}}.
     pub fn messages(&self, mut head: Value, turns: &[Turn], reader: &mut Reader, mut piece: impl FnMut(&str, &str)) -> Result<Value, String> {
         let base = self.base.trim_end_matches('/');
         let url = if base.ends_with("/v1") { format!("{base}/messages") } else { format!("{base}/v1/messages") };

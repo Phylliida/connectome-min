@@ -1,12 +1,11 @@
 //! Tools the model can call, as plugins. A tool is its definition, as the Messages API takes it
 //! ({name, description, input_schema}), whether a call waits for the user's yes, and a function from
-//! its input to its outcome: Ok(content), or
-//! Err(content) for a failure, the content being a tool result's (a string, or text and image blocks
-//! as the library logs them). A Toolbox is a monoid under `+`: the union of two, a tool on the right
-//! shadowing a same-named one on the left, with the empty toolbox as identity. So tool sources compose
-//! in order: the tools built into the binary (bash.rs, edit.rs), then each MCP server's, in the
-//! config's order (mcp.rs). A tool built in is a Tool whose `run` does the work in-process. A toolbox is made for each
-//! step, from the settings as they are then, and owns its tools.
+//! its input to its outcome: Ok(content), or Err(content) for a failure, the content being a tool
+//! result's (a string, or text and image blocks as the library logs them). A Toolbox is a monoid under
+//! `+`: the union of two, a tool on the right shadowing a same-named one on the left, with the empty
+//! toolbox as identity. So tool sources compose in order: the tools built into the binary (bash.rs,
+//! edit.rs), whose `run` does the work in-process, then each MCP server's, in the config's order
+//! (mcp.rs). A toolbox is made for each step, from the settings as they are then, and owns its tools.
 
 use connectome::{json::{sparse, Value}, obj};
 use std::{ops::Add, panic::{catch_unwind, AssertUnwindSafe}};

@@ -33,83 +33,98 @@ button { background: var(--panel); border: 1px solid var(--line); border-radius:
 button:hover { border-color: var(--accent); }
 input, textarea, select { width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
 input[type=checkbox] { width: auto; }
+.settings { display: flex; flex-direction: column; gap: 6px; padding: 0; border: 0; }
+.settings label, .settings small, .legend, .msg .who { font-size: 12px; color: var(--muted); }
+
+/* the sessions, grouped by workspace, and the providers */
 #sessions a { display: block; padding: 4px 6px; border-radius: 6px; color: inherit; text-decoration: none; }
 #sessions a.on { background: var(--panel); outline: 1px solid var(--line); }
 #sessions small { color: var(--muted); }
 .group { margin: 0 0 6px; }
 .group summary, .provider { cursor: pointer; padding: 4px 0; }
 .group summary small, .provider small { display: block; font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
-.settings { display: flex; flex-direction: column; gap: 6px; padding: 0; border: 0; }
-.settings label, .settings small, .legend, .msg .who { font-size: 12px; color: var(--muted); }
+
+/* the chat: a line where the speaker changes, then each block a bubble, the user's on the right */
 #chat { display: flex; flex-direction: column; padding: 0; }
 #log { flex: 1; overflow: auto; padding: 16px; }
 .msg { position: relative; margin-top: 12px; }
-.fold { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin: 14px 0 2px; }
-.fold::before, .fold::after { content: ''; flex: 1; border-top: 1px dashed var(--line); }
 .msg .who { margin-bottom: 4px; }
 .msg.more { margin-top: 0; }
-.msg.more > .who { display: none; }
+.msg.more > .who, #reply:has(> .who:only-child) { display: none; }
 .msg[data-who="user"]:not(.results) { display: flex; flex-direction: column; align-items: flex-end; }
 .msg[data-who="user"]:not(.results) .bubble { max-width: 85%; }
+.msg > button { position: absolute; top: 0; right: 0; font-size: 12px; padding: 1px 6px; display: none; }
 .msg[data-who="user"] > button { right: auto; left: 0; }
-.bubble, .thinking, .tool { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin: 0 0 6px; }
-.bubble { white-space: pre-wrap; word-wrap: break-word; }
-.thinking { border-style: dashed; color: var(--muted); padding: 6px 10px; }
+.msg:hover > button { display: block; }
+.fold { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin: 14px 0 2px; }
+.fold::before, .fold::after { content: ''; flex: 1; border-top: 1px dashed var(--line); }
+.bubble, .thinking, .tool { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; margin: 0 0 6px; }
+.bubble { white-space: pre-wrap; word-wrap: break-word; padding: 8px 10px; }
+.thinking summary, .tool summary { cursor: pointer; font-size: 12px; list-style: none; }
+.thinking summary::-webkit-details-marker, .tool summary::-webkit-details-marker { display: none; }
+.tool pre, .md pre, .md code, .cmd, #detail { font: 12px/1.4 ui-monospace, monospace; }
+
+/* reasoning, folded to its last line */
+.thinking { border-style: dashed; color: var(--muted); }
 .thinking > div { white-space: pre-wrap; font-style: italic; margin-top: 6px; }
 .thinking .last { display: inline-block; max-width: calc(100% - 90px); vertical-align: bottom; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-style: italic; margin-left: 6px; }
 .thinking[open] .last { display: none; }
+
+/* a call's card, folded to its line, its result joining it */
+.tool summary { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tool[open] summary { white-space: pre-wrap; }
+.tool[open] summary .out { display: none; }
+.tool pre { white-space: pre-wrap; margin: 4px 0; }
+.tool.failed summary, .tool pre.failed { color: var(--warn); }
+.cmd { color: var(--ink); }
+.cmd::before { content: '$ '; color: var(--muted); }
+.ask { display: flex; gap: 6px; margin: 4px 0 6px; }
+
+/* the assistant's text as markdown */
 .md { white-space: normal; }
 .md .tail { display: contents; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
-.md pre, .md code { font: 12px/1.4 ui-monospace, monospace; background: var(--bg); border-radius: 4px; }
+.md pre, .md code { background: var(--bg); border-radius: 4px; }
 .md pre { padding: 8px; overflow: auto; }
 .md :not(pre) > code { padding: 1px 4px; }
 .md table { border-collapse: collapse; }
 .md th, .md td { border: 1px solid var(--line); padding: 2px 8px; }
 .md a[href] { color: var(--accent); }
+.md blockquote { margin: 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
 .md .katex-display { margin: 8px 0; }
+
+/* code as highlight.js colors it, and an edit's diff, its gutter never copied */
 .hljs-keyword, .hljs-built_in, .hljs-selector-tag { color: var(--kw); }
 .hljs-string, .hljs-regexp, .hljs-char { color: var(--str); }
 .hljs-number, .hljs-literal, .hljs-symbol { color: var(--num); }
 .hljs-comment, .hljs-quote { color: var(--muted); font-style: italic; }
 .hljs-title, .hljs-section { color: var(--accent); }
 .hljs-type, .hljs-attr, .hljs-attribute, .hljs-meta, .hljs-variable { color: var(--type); }
-.diff > div::before { content: attr(data-n) " " attr(data-mark); display: inline-block; width: 6ch; margin-right: 1ch; text-align: right; color: var(--muted); white-space: pre; }   /* never copied */
+.diff > div::before { content: attr(data-n) " " attr(data-mark); display: inline-block; width: 6ch; margin-right: 1ch; text-align: right; color: var(--muted); white-space: pre; }
 .diff .add { background: var(--add); }
 .diff .del { background: var(--del); }
-.md blockquote { margin: 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
-.thinking summary { cursor: pointer; font-size: 12px; }
-.thinking summary, .tool summary { list-style: none; }
-.thinking summary::-webkit-details-marker, .tool summary::-webkit-details-marker { display: none; }
-.tool { padding: 6px 10px; }
-.tool summary { cursor: pointer; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tool[open] summary { white-space: pre-wrap; }
-.tool[open] summary .out { display: none; }
-.cmd { font: 12px/1.4 ui-monospace, monospace; color: var(--ink); }
-.cmd::before { content: '$ '; color: var(--muted); }
-.tool pre { white-space: pre-wrap; font: 12px/1.4 ui-monospace, monospace; margin: 4px 0; }
-.tool.failed summary, .tool pre.failed { color: var(--warn); }
-.ask { display: flex; gap: 6px; margin: 4px 0 6px; }
-#reply:has(> .who:only-child) { display: none; }
-.chip { font-size: 12px; padding: 0 6px; margin-left: 4px; color: var(--muted); }
-.chip.on { border-color: var(--tail); color: var(--tail); }
-.msg > button { position: absolute; top: 0; right: 0; font-size: 12px; padding: 1px 6px; display: none; }
-.msg:hover > button { display: block; }
+
+/* the message box */
 form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
 form textarea { resize: vertical; min-height: 42px; }
 #status { color: var(--muted); font-size: 12px; padding: 0 16px 8px; min-height: 18px; }
 #status.warn { color: var(--warn); }
+
+/* the session's numbers, its tools, and its memory pyramid */
+.stat { display: flex; justify-content: space-between; font-size: 13px; padding: 2px 0; }
+.bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 4px 0 12px; }
+.bar div { height: 100%; background: var(--accent); }
+.chip { font-size: 12px; padding: 0 6px; margin-left: 4px; color: var(--muted); }
+.chip.on { border-color: var(--tail); color: var(--tail); }
 .pyramid { display: flex; flex-direction: column; gap: 3px; margin: 8px 0 12px; }
 .row { position: relative; height: 18px; }
 .cell { position: absolute; top: 0; bottom: 0; border-radius: 3px; border: 1px solid transparent; cursor: pointer; min-width: 2px; }
 .cell.shown { border-color: var(--ink); }
 .row.chunks .cell { background: var(--raw); opacity: .5; }
 .row.chunks .cell.shown { opacity: 1; }
-.stat { display: flex; justify-content: space-between; font-size: 13px; padding: 2px 0; }
-.bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 4px 0 12px; }
-.bar div { height: 100%; background: var(--accent); }
-pre#detail { white-space: pre-wrap; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; font: 12px/1.4 ui-monospace, monospace; max-height: 40vh; overflow: auto; }
+pre#detail { white-space: pre-wrap; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; max-height: 40vh; overflow: auto; }
+
 @media (max-width: 900px) {
   main { grid-template-columns: 1fr; height: auto; }
   #chat { height: 80vh; }
@@ -232,7 +247,8 @@ async function listSessions() {
   const all = await api('/api/sessions'), workspace = (s) => s.workspace || '';
   const group = (w) => {
     const members = all.filter((s) => workspace(s) === w), inside = (s) => members.some((m) => m.name === s.parent?.name);
-    const draw = (p, depth) => members.filter((s) => (inside(s) ? s.parent.name : null) === p).map((s) => `<a href="#${s.name}" class="${s.name === current() ? 'on' : ''}" style="padding-left:${6 + depth * 14}px">${escape(s.name)} <small>${s.messages}${s.parent ? ' · from ' + s.parent.at : ''}</small></a>` + draw(s.name, depth + 1)).join('');
+    const link = (s, depth) => `<a href="#${s.name}" class="${s.name === current() ? 'on' : ''}" style="padding-left:${6 + depth * 14}px">${escape(s.name)} <small>${s.messages}${s.parent ? ' · from ' + s.parent.at : ''}</small></a>`;
+    const draw = (p, depth) => members.filter((s) => (inside(s) ? s.parent.name : null) === p).map((s) => link(s, depth) + draw(s.name, depth + 1)).join('');
     const title = w ? `<b>${escape(w.split(/[\\/]/).pop())}</b> · ${members.length}<small>${escape(w)}</small>` : `<b>No workspace</b> · ${members.length}`;
     return `<details class="group" data-workspace="${escape(w)}"${folded.has(w) ? '' : ' open'}><summary>${title}</summary>${draw(null, 0)}</details>`;
   };
@@ -301,15 +317,16 @@ const shownLast = () => [...$('log').querySelectorAll('.msg:not([hidden])')].pop
 // anything else as a note (an image as its size)
 const note = (b) => b.type === 'image' ? `[image, ${b.kb} KB]` : `[${b.type}]`;
 // a streaming reply's text: its markdown up to its last blank line outside code (finished blocks) drawn
-// once, into the part before its tail, and only the rest drawn again as pieces come
+// once, before its tail, and only the tail drawn again as pieces come
 function drawText(part) {
   if (!part.lastElementChild) part.innerHTML = '<div class="tail"></div>';
-  let [open, cut] = [false, part.cut ?? 0];
-  for (const m of part.source.slice(part.cut ?? 0).matchAll(/^(?:```|~~~)|\n\n/gm)) {
-    if (m[0] !== '\n\n') open = !open;
-    else if (!open) cut = (part.cut ?? 0) + m.index + 2;
+  const from = part.cut ??= 0;
+  let [code, cut] = [false, from];
+  for (const m of part.source.slice(from).matchAll(/^(?:```|~~~)|\n\n/gm)) {
+    if (m[0] !== '\n\n') code = !code;
+    else if (!code) cut = from + m.index + 2;
   }
-  if (cut > (part.cut ?? 0)) part.lastElementChild.insertAdjacentHTML('beforebegin', markdown(part.source.slice(part.cut ?? 0, cut)));
+  if (cut > from) part.lastElementChild.insertAdjacentHTML('beforebegin', markdown(part.source.slice(from, cut)));
   part.cut = cut;
   part.lastElementChild.innerHTML = markdown(part.source.slice(cut));
 }
@@ -404,20 +421,26 @@ const tokens = (n) => new Intl.NumberFormat('en', { notation: 'compact', maximum
 const dollars = (used) => !used ? 'none yet' : used.cost == null ? 'not reported' : '$' + used.cost.toFixed(used.cost < 1 ? 4 : 2);
 
 function drawMemory() {
-  const s = state, used = s.prompt ?? s.armed ?? 0, { window = 0, model = '', allow = [], config = {} } = s.settings || {};
-  $('stats').innerHTML = `
-    <div class="stat"><span>Last context</span><span title="${s.prompt == null ? 'The last compile\'s estimate' : 'The last request\'s prompt, as the provider counted it'}">${Math.round(used).toLocaleString()} / ${window.toLocaleString()} tokens${s.prompt == null ? ' (estimated)' : ''}</span></div>
-    <div class="bar"><div style="width:${Math.min(100, 100 * used / window)}%"></div></div>
-    <div class="stat"><span>Messages</span><span>${s.messages}</span></div>
-    <div class="stat"><span>Chunks · memories</span><span>${s.layers[0] || 0} · ${s.layers.slice(1).join(' / ') || 0}</span></div>
-    <div class="stat"><span>Cost of replies</span><span>${dollars(s.spent?.reply)}</span></div>
-    <div class="stat"><span>Cost of memories</span><span title="The summarizer's requests, which form the memories">${dollars(s.spent?.memories)}</span></div>
-    <div class="stat"><span>Total cost</span><span title="What the session's requests cost, as the provider reports it">${dollars(s.spent?.total)}</span></div>
-    <div class="stat"><span>Tokens</span><span title="In all the session's prompts (of them, read from the provider's cache) and its replies">${s.spent ? `in ${tokens(s.spent.total.input)} (${tokens(s.spent.total.cached)} cached) · out ${tokens(s.spent.total.output)}` : 'none yet'}</span></div>
-    <div class="stat"><span>Price multiplier</span><span>${(s.multiplier || 1).toFixed(3)}</span></div>
-    <div class="stat"><span>Model</span><span>${escape(model)}</span></div>
-    <div class="stat"><span>Tools</span><span>${s.tools.map((t) => `<button class="chip ${allow.includes(t) ? 'on' : ''}" data-tool="${escape(t)}" title="${allow.includes(t) ? 'Always allowed. Click to ask first.' : 'Asks first. Click to always allow.'}">${escape(t)}</button>`).join('') || 'none'}</span></div>
-    <div class="stat"><span>Tools and system prompt</span><span>${Math.round(s.overhead).toLocaleString()} tokens</span></div>`;
+  const s = state, used = s.prompt ?? s.armed ?? 0, total = s.spent?.total, { window = 0, model = '', allow = [], config = {} } = s.settings || {};
+  const stat = (label, value, title = '') => `<div class="stat"><span>${label}</span><span title="${title}">${value}</span></div>`;
+  const chip = (tool) => {
+    const on = allow.includes(tool);
+    return `<button class="chip ${on ? 'on' : ''}" data-tool="${escape(tool)}" title="${on ? 'Always allowed. Click to ask first.' : 'Asks first. Click to always allow.'}">${escape(tool)}</button>`;
+  };
+  $('stats').innerHTML = [
+    stat('Last context', `${Math.round(used).toLocaleString()} / ${window.toLocaleString()} tokens${s.prompt == null ? ' (estimated)' : ''}`, s.prompt == null ? 'The last compile\'s estimate' : 'The last request\'s prompt, as the provider counted it'),
+    `<div class="bar"><div style="width:${Math.min(100, 100 * used / window)}%"></div></div>`,
+    stat('Messages', s.messages),
+    stat('Chunks · memories', `${s.layers[0] || 0} · ${s.layers.slice(1).join(' / ') || 0}`),
+    stat('Cost of replies', dollars(s.spent?.reply)),
+    stat('Cost of memories', dollars(s.spent?.memories), 'The summarizer\'s requests, which form the memories'),
+    stat('Total cost', dollars(total), 'What the session\'s requests cost, as the provider reports it'),
+    stat('Tokens', total ? `in ${tokens(total.input)} (${tokens(total.cached)} cached) · out ${tokens(total.output)}` : 'none yet', 'In all the session\'s prompts (of them, read from the provider\'s cache) and its replies'),
+    stat('Price multiplier', (s.multiplier || 1).toFixed(3)),
+    stat('Model', escape(model)),
+    stat('Tools', s.tools.map(chip).join('') || 'none'),
+    stat('Tools and system prompt', `${Math.round(s.overhead).toLocaleString()} tokens`),
+  ].join('');
   // a row per layer, the top one first; a cell spans the chunks it covers
   const width = (n) => 100 * n / Math.max(s.layers[0] || 0, 1), shown = new Set((s.frontier || []).map(([l, p]) => `${l}/${p}`));
   const rows = s.layers.map((count, level) => {
@@ -450,14 +473,18 @@ $('pyramid').onclick = async (e) => {
 
 // a message's fork button forks the session there; a call's buttons answer whether it may run
 $('log').onclick = async (e) => {
-  const { fork: at, answer } = e.target.dataset, card = e.target.closest('.tool');
+  const { fork: at, answer } = e.target.dataset;
   try {
-    const name = at && prompt(`Name for a fork of ${current()} at message #${at}`, `${current()}-${at}`);
-    if (name) { await api(`/api/s/${current()}/fork`, { at: Number(at), name }); location.hash = name; }
-    if (!answer) return;
-    e.target.parentElement.remove();
-    setStatus(answer === 'deny' ? 'Denied.' : 'Running…');
-    await api(`/api/s/${current()}/approve`, { id: card.id.slice('call-'.length), answer });
+    if (at) {
+      const name = prompt(`Name for a fork of ${current()} at message #${at}`, `${current()}-${at}`);
+      if (name) { await api(`/api/s/${current()}/fork`, { at: Number(at), name }); location.hash = name; }
+    }
+    if (answer) {
+      const id = e.target.closest('.tool').id.slice('call-'.length);
+      e.target.parentElement.remove();
+      setStatus(answer === 'deny' ? 'Denied.' : 'Running…');
+      await api(`/api/s/${current()}/approve`, { id, answer });
+    }
   } catch (err) { setStatus(err.message, true); }
 };
 
@@ -477,71 +504,77 @@ function turn(text) {
   follow(fetch(`/api/s/${current()}/${text ? 'say' : 'continue'}`, post({ text }, showing.signal)));
 }
 
-// a job as it streams, JSON lines: {"logged": n} each time the log grows (the page shows it, then what
-// it doesn't hold yet below it), {"fold"} when the context folded for the reply to come, {"thinking"}
-// or {"text"} for each piece of a reply, {"calling"} as it
-// starts a call and {"input"} for each piece of the call's input, then for each call
-// the logged reply makes {"approve"} when it asks to run, {"answered"} once a page answers and its
-// {"result"}; {"spent"}, what the session's requests have used, after each; {"forming"} as memories start and stop forming; {"ok"} or {"error"} when the turn ends,
-// and the stream once its memories have formed; then the session as the job leaves it. Opening a
-// session stops it showing.
+// a job as it streams: a JSON object a line, its fields the events work.rs's Worker::turn lists, each
+// drawn by its handler in `on` (an empty piece draws nothing), until the stream ends once the turn's
+// memories have formed; then the session as the job leaves it. Opening a session stops it showing.
 async function follow(response) {
   setStatus('Waiting for the model…');
   let error = null;
+  // the reply streaming in, below the log; a run of reasoning or of text continues its last part
+  const reply = () => $('reply');
+  const part = (kind) => {
+    if (reply().lastElementChild.dataset.kind !== kind) draw(reply(), { type: kind, [kind]: '' });
+    return reply().lastElementChild;
+  };
+  // the parts pieces grew, drawn at most once a frame however fast pieces come, and the log scrolled
+  // to the end then
+  const grown = new Set();
+  let frame = null;
+  const grow = (part, piece) => {
+    part.source = (part.source ?? '') + piece;
+    grown.add(part);
+  };
+  const paint = () => {
+    frame = null;
+    for (const part of grown) {
+      if (part.dataset.kind === 'text') drawText(part);
+      else part.lastElementChild.textContent = part.source;   // reasoning, a call's input
+      if (part.dataset.kind === 'thinking') part.querySelector('.last').textContent = lastLine(part.source);
+    }
+    grown.clear();
+    $('log').scrollTop = $('log').scrollHeight;
+  };
+  const on = {
+    // the log has grown: it shows it, and below it the reply to come
+    logged: async (n) => {
+      await showLog(n, true);
+      const more = shownLast()?.dataset.who === 'assistant' ? ' more' : '';
+      $('log').insertAdjacentHTML('beforeend', `<div class="msg${more}" id="reply" data-who="assistant"><div class="who">assistant</div></div>`);
+    },
+    // how the context folded for the reply to come, before it until the log has it
+    fold: (fold) => {
+      reply().insertAdjacentHTML('beforebegin', foldLine(fold));
+      reply().previousElementSibling.classList.add('live');
+    },
+    thinking: (piece) => grow(part('thinking'), piece),   // its block showing its last line
+    text: (piece) => grow(part('text'), piece),
+    calling: (name) => draw(reply(), { type: 'calling', name }),
+    input: (piece) => grow(reply().lastElementChild, piece),
+    approve: (id) => $(`call-${id}`).insertAdjacentHTML('beforeend', '<div class="ask"><button data-answer="allow">Allow</button><button data-answer="always">Always allow</button><button data-answer="deny">Deny</button></div>'),
+    answered: (id) => $(`call-${id}`).querySelector('.ask')?.remove(),
+    result: (b) => draw(reply(), b),
+    // what the session's requests have used so far, and the last reply's prompt
+    spent: (spent, { prompt }) => {
+      Object.assign(state, { spent, prompt: prompt ?? state.prompt });
+      drawMemory();
+    },
+    // the turn has ended: the log as it leaves it, while its memories form
+    ok: () => showLog(undefined, true),
+    error: (why) => {
+      error = why;
+      return showLog(undefined, true);
+    },
+  };
+  const take = async (line) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line);
+    for (const [field, value] of Object.entries(event)) if (value !== '') await on[field]?.(value, event);
+    setStatus(event.approve ? 'Waiting for you to allow or deny the call…' : event.forming ? 'Forming memories…' : '');
+    frame ??= requestAnimationFrame(paint);
+  };
   try {
     const reader = (await response).body.pipeThrough(new TextDecoderStream()).getReader();
     let buffered = '';
-    // a run of reasoning or of text continues the streaming reply's last part
-    const part = (kind) => {
-      if ($('reply').lastElementChild.dataset.kind !== kind) draw($('reply'), { type: kind, [kind]: '' });
-      return $('reply').lastElementChild;
-    };
-    // the parts pieces grew, drawn at most once a frame however fast pieces come, and the log scrolled
-    // to the end then, once
-    const grown = new Set();
-    let frame = null;
-    const grow = (part, piece) => grown.add(Object.assign(part, { source: (part.source ?? '') + piece }));
-    const paint = () => {
-      frame = null;
-      for (const part of grown) {
-        if (part.dataset.kind === 'text') drawText(part);
-        else part.lastElementChild.textContent = part.source;   // reasoning, a call's input
-        if (part.dataset.kind === 'thinking') part.querySelector('.last').textContent = lastLine(part.source);
-      }
-      grown.clear();
-      $('log').scrollTop = $('log').scrollHeight;
-    };
-    const take = async (line) => {
-      if (!line.trim()) return;
-      const event = JSON.parse(line);
-      if (event.logged != null) {
-        await showLog(event.logged, true);
-        const more = shownLast()?.dataset.who === 'assistant' ? ' more' : '';
-        $('log').insertAdjacentHTML('beforeend', `<div class="msg${more}" id="reply" data-who="assistant"><div class="who">assistant</div></div>`);
-      }
-      if (event.thinking) grow(part('thinking'), event.thinking);   // its block showing its last line
-      if (event.spent) {   // what the session's requests have used so far, and the last reply's prompt
-        state.spent = event.spent;
-        state.prompt = event.prompt ?? state.prompt;
-        drawMemory();
-      }
-      if (event.fold) {   // before the reply it was compiled for, until the log has it
-        $('reply').insertAdjacentHTML('beforebegin', foldLine(event.fold));
-        $('reply').previousElementSibling.classList.add('live');
-      }
-      if (event.calling) draw($('reply'), { type: 'calling', name: event.calling });
-      if (event.input) grow($('reply').lastElementChild, event.input);
-      if (event.text) grow(part('text'), event.text);
-      if (event.approve) $(`call-${event.approve}`).insertAdjacentHTML('beforeend', '<div class="ask"><button data-answer="allow">Allow</button><button data-answer="always">Always allow</button><button data-answer="deny">Deny</button></div>');
-      if (event.answered) $(`call-${event.answered}`).querySelector('.ask')?.remove();
-      if (event.result) draw($('reply'), event.result);
-      if (event.ok || event.error) {   // the turn has ended: the log as it leaves it, while its memories form
-        error = event.error ?? null;
-        await showLog(undefined, true);
-      }
-      setStatus(event.approve ? 'Waiting for you to allow or deny the call…' : event.forming ? 'Forming memories…' : '');
-      frame ??= requestAnimationFrame(paint);
-    };
     for (let read; !(read = await reader.read()).done;) {
       const lines = (buffered + read.value).split('\n');
       buffered = lines.pop();

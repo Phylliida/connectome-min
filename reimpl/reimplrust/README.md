@@ -3,35 +3,44 @@
 A port of `../reimplclean2` (a clean reimplementation of `@animalabs/context-manager` 0.10.1's
 autobiographical compaction) and a web app around it.
 
-- `connectome/`: the library, over serde_json (with smart-default and itertools). A session is append-only JSONL files on disk
-  (`store.rs`), in the same format the Python port writes, so either can carry on from the other's
-  files. A compile plans the context from prices and block shapes only (`emit::select`), and an
-  `emit::Reader` reads each block from disk as the caller writes the request, so neither a session nor
-  a context is held in memory.
+- `connectome/`: the library, over serde_json (with smart-default and itertools). A session is
+  append-only JSONL files on disk (`store.rs`), in the same format the Python port writes, so either
+  can carry on from the other's files. A compile plans the context from prices and block shapes only
+  (`emit::select`), and an `emit::Reader` reads each block from disk as the caller writes the
+  request, so neither a session nor a context is held in memory.
 - `connectome/src/bin/replay.rs`: replays a scripted session, for the tests.
 - `app/`: `connectome-web`, a chat with a model whose context the library manages, in one web page
   that shows the memory pyramid and what the context shows, and forks a session at any message. It
   speaks the Anthropic Messages API (Anthropic, DeepSeek at `https://api.deepseek.com/anthropic`,
   OpenRouter at `https://openrouter.ai/api/v1`), each request body streaming in chunks straight from
-  the session's files, over ureq with TLS compiled in (rustls, ring, and Mozilla's root certificates),
-  so the binary needs nothing from the system but sockets. The page shows the assistant's text as
-  markdown, through marked and then DOMPurify, which keeps only the HTML markdown makes, so a reply can
-  neither run code on the page nor load anything; its math (`$…$` or `\(…\)` inline, `$$…$$` or
-  `\[…\]` displayed) KaTeX sets in its own fonts, and highlight.js colors its code blocks. These, and
-  jsdiff for edits' diffs, are in `app/vendor/` as published, built in. The page also shows what a
-  session's requests have used, from the session's `costs.jsonl`: a record for each step's reply and
-  each round of memories, `{id, for, used, total}` (a reply's also says which `message` it is and
-  which `compile` its request was built from), where `used` and the running totals by what they
-  were for (`total: {reply, memories}`) are `{cost, input, cached, output}`: dollars as the provider reports them (OpenRouter does, in each reply's
-  usage; null while none has), and the prompts' tokens, of them those read from the cache, and the
-  replies'. The page shows the cost of replies, of memories and in all; it reads the last record, and the newest reply's, a few from the end: its prompt,
-  as the provider counted it, is the context the page shows (the compile's estimate before there is
-  one). A fork's counts only its own requests. Where the context folded before a reply (its compile
-  shows other chunks and memories than the reply's before it did), the page draws a line before it:
-  what it shows instead of what, and the tokens that saves, priced as the planner prices them.
+  the session's files, over ureq with TLS compiled in (rustls, ring, and Mozilla's root
+  certificates), so the binary needs nothing from the system but sockets. Its threads share nothing
+  that changes: each request has one (`api.rs`), the hub owns the settings files and what the pages
+  following a turn see (`hub.rs`), and each session has one, which runs its turns and alone writes
+  its log (`work.rs`).
 
-`.github/workflows/connectome-web.yml` builds standalone binaries on GitHub's runners: Linux (static,
-x86_64 and arm64), Windows (x86_64) and macOS (arm64 and x86_64). Locally, `cargo build --release`.
+The page shows the assistant's text as markdown, through marked and then DOMPurify, which keeps only
+the HTML markdown makes, so a reply can neither run code on the page nor load anything; its math
+(`$…$` or `\(…\)` inline, `$$…$$` or `\[…\]` displayed) KaTeX sets in its own fonts, and
+highlight.js colors its code blocks. These, and jsdiff for edits' diffs, are in `app/vendor/` as
+published, built in.
+
+The page also shows what a session's requests have used, from the session's `costs.jsonl`
+(`costs.rs`): a record for each step's reply and each round of memories, `{id, for, used, total}`.
+`used` is `{cost, input, cached, output}`: dollars as the provider reports them (OpenRouter does, in
+each reply's usage; null while none has), the prompts' tokens, of them those read from the cache,
+and the replies'. `total` is the running totals by what they were for, `{reply, memories}`, each the
+same. A reply's record also says which `message` it is and which `compile` its request was built
+from: its prompt, as the provider counted it, is the context the page shows (the compile's estimate
+before there is one), and calibrates the compile after it. The page shows the cost of replies, of
+memories and in all, from the last record. A fork's costs count only its own requests. Where the
+context folded before a reply (its compile shows other chunks and memories than the reply's before
+it did), the page draws a line before it: what it shows instead of what, and the tokens that saves,
+priced as the planner prices them.
+
+`.github/workflows/connectome-web.yml` builds standalone binaries on GitHub's runners: Linux
+(static, x86_64 and arm64), Windows (x86_64) and macOS (arm64 and x86_64). Locally, `cargo build
+--release`.
 
 ```sh
 ./target/release/connectome-web        # opens http://127.0.0.1:8080; add a provider's key in the page
@@ -41,61 +50,65 @@ Settings are JSON files you can edit by hand, read again at each use, and only y
 since one holds the keys:
 
 - `ROOT/settings.json`: `providers`, each a name with a `base` URL and a `key`; `defaults`, what a
-  new session starts with; and `sandbox`, what a sandboxed command sees. The first run writes it with
-  a provider named `default` for `https://api.anthropic.com` without a key, which the page then asks
-  for, and defaults for a window of 60k tokens.
+  new session starts with; and `sandbox`, what a sandboxed command sees. The first run writes it
+  with a provider named `default` for `https://api.anthropic.com` without a key, which the page then
+  asks for, and defaults for a window of 60k tokens.
 - `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its
   `window`, `reserve` and `system` prompt, and the library's settings (`config`). A new session's
-  file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its parent's;
-  a session without one has none to run with, and the page says so.
-  The page edits the main fields; `config.merge_threshold` can't change once memories have merged.
+  file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its
+  parent's; a session without one has none to run with, and the page says so. The page edits the
+  main fields; `config.merge_threshold` can't change once memories have merged.
 
 Tools (`app/src/tools/`): the model can call `bash` (a command in a new shell in the session's
-workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in the workspace changed by
-replacing text in it, which must occur once unless the call says `all`, or made; its paths can't lead
-out of the workspace, through `..`, an absolute path or a link) and the tools
-of the MCP servers in `ROOT/mcp.json` (or `--mcp FILE`), listed all at once at startup (one whose tools
-can't be listed is stopped), in the usual format:
+workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in the workspace changed
+by replacing text in it, which must occur once unless the call says `all`, or made; its paths can't
+lead out of the workspace, through `..`, an absolute path or a link) and the tools of the MCP
+servers in `ROOT/mcp.json` (or `--mcp FILE`), listed all at once at startup (one whose tools can't
+be listed is stopped), in the usual format:
 
 ```json
 {"mcpServers": {"NAME": {"command": "...", "args": ["..."], "env": {"KEY": "..."}}}}
 ```
 
-A session without a workspace still declares bash and edit, but each call fails at once, without asking, with
-a note to set one: so a session whose history calls them still declares them, as the Messages API
-requires, and the model's calls come back as calls (without the declaration, some providers return
-the model's own tool-call markup as text).
+A session without a workspace still declares bash and edit, but each call fails at once, without
+asking, with a note to set one: so a session whose history calls them still declares them, as the
+Messages API requires, and the model's calls come back as calls (without the declaration, some
+providers return the model's own tool-call markup as text).
 
 In a session's sandbox (Linux's bubblewrap, `bwrap`), a command sees its workspace, read-write, and
 of everything else only the paths `settings.json`'s `sandbox` lists that exist: `ro` read-only, `rw`
 read-write (a leading `~/` is the home directory); a write anywhere else fails (`Read-only file
-system`), so a tool that keeps a cache in the home directory needs that directory in `rw`. It has the
-network if `network`, and a PID namespace of its own, so a timeout still kills everything it started.
+system`), so a tool that keeps a cache in the home directory needs that directory in `rw`. It has
+the network if `network`, and a PID namespace of its own, so a timeout still kills everything it
+started.
 
 Each call asks first: the page shows it with Allow, Always allow and Deny, and a denied call (or one
-left unanswered for ten minutes) gets an error result the model sees. Always allowed tools are kept in
-the session's settings; the page's tool list toggles them. A call has `--tool-timeout` seconds (600 by
-default): bash kills a command still running then, with what it started, and an MCP call that runs out
-is cancelled without holding up the server's next call; a server that stops starts again at its next
-call. A turn takes steps, a model request each, until a reply calls no tools (at most 64), and the page
-shows each call as a card on its reply, its tool and input as the reply writes it, which its result
-then joins; an edit's card shows its change as a diff, colored in the file's language. A turn's log is the session's: a
-page following a turn shows the log as it grows, read from disk, and besides it only what the log
-doesn't hold yet (a reply streaming in, the questions whether its calls may run, their results,
-memories forming), which is all the app keeps of a turn; its stream ends once the turn's memories
-have formed. A page opened while
-a turn runs (after a reload, or on another device) follows it the same way, and answers its questions;
-the turn runs on whether any page follows it or not, on a thread of its session's, and a message sent
-while it runs waits for it. A turn on a log edited into something the library can't read fails, and
-the session goes on once the log is mended. The page's Continue button runs a turn without a message: after an
-interruption (a failed request, the 64 steps, a restart) the model goes on from the log as it is, and
-after a reply cut short it goes on from that reply (the request ends with it, as a prefill). Tool sources compose as a monoid: a later source's tool shadows an earlier
-one of the same name. Every request carries the system prompt and the tool definitions, so their
-tokens come out of the window the context compiles to, and out of the usage that calibrates prices;
-while calibration catches up with a request bigger than its estimate, the next context compiles that
-much smaller. Memory requests declare the same tools with tool choice "none", as the library does, so
-a memory can cover tool calls.
+left unanswered for ten minutes) gets an error result the model sees. Always allowed tools are kept
+in the session's settings; the page's tool list toggles them. A call has `--tool-timeout` seconds
+(600 by default): bash kills a command still running then, with what it started, and an MCP call
+that runs out is cancelled without holding up the server's next call; a server that stops starts
+again at its next call. Tool sources compose as a monoid: a later source's tool shadows an earlier
+one of the same name.
+
+A turn takes steps, a model request each, until a reply calls no tools (at most 64). Every request
+carries the system prompt and the tool definitions, so their tokens come out of the window the
+context compiles to, and out of the usage that calibrates prices; while calibration catches up with
+a request bigger than its estimate, the next context compiles that much smaller. Memory requests
+declare the same tools with tool choice "none", as the library does, so a memory can cover tool
+calls. The page's Continue button runs a turn without a message: after an interruption (a failed
+request, the 64 steps, a restart) the model goes on from the log as it is, and after a reply cut
+short it goes on from that reply (the request ends with it, as a prefill). A turn on a log edited
+into something the library can't read fails, and the session goes on once the log is mended.
+
+A turn's log is the session's: a page following a turn shows the log as it grows, read from disk,
+and besides it only what the log doesn't hold yet (a reply streaming in, the questions whether its
+calls may run, their results, memories forming), which is all the app keeps of a turn; its stream
+ends once the turn's memories have formed. The page shows each call as a card on its reply, its tool
+and input as the reply writes it, which its result then joins; an edit's card shows its change as a
+diff, colored in the file's language. A page opened while a turn runs (after a reload, or on another
+device) follows it the same way, and answers its questions; the turn runs on whether any page
+follows it or not, on its session's thread, and a message sent while it runs waits for it.
 
 Flags: `--root DIR` (sessions and settings; `sessions` by default), `--addr` (`127.0.0.1:8080`),
 `--ca PEM` (root certificates to trust instead of Mozilla's: a company proxy's, a test server's),
@@ -109,9 +122,9 @@ Tests:
 cargo test                  # unit tests of the JavaScript and Python arithmetic the ports share
 python3 tests/test_rust.py  # every compile, request and file record the same as reimplclean2's, handoffs both ways, the planner
 python3 tests/test_app.py   # the app against mock APIs over HTTPS, its parts at once: chat, memories, forks, settings, certificates, bash, its sandbox, approvals, timeouts and tools through fake MCP servers, flat memory
-python3 tests/mutants.py tests/test_app.py app/src/main.rs=mutants.json   # mutation testing, each mutant in a copy of its own, many at once
+python3 tests/mutants.py tests/test_app.py app/src/work.rs=mutants.json   # mutation testing, each mutant in a copy of its own, many at once
 ```
 
 The three take under 30 seconds together. A batch of mutants takes about as long as its slowest one
-(101 of the app's, under a minute): they build without link-time optimization, from a build kept in
+(85 of the app's, under a minute): they build without link-time optimization, from a build kept in
 `target/mutants`.
