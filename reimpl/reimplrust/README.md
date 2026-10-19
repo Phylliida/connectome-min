@@ -19,9 +19,11 @@ autobiographical compaction) and a web app around it.
   neither run code on the page nor load anything; its math (`$…$` or `\(…\)` inline, `$$…$$` or
   `\[…\]` displayed) KaTeX sets in its own fonts, and highlight.js colors its code blocks. These, and
   jsdiff for edits' diffs, are in `app/vendor/` as published, built in. The page also shows what a
-  session's requests have cost, as the provider reports it (OpenRouter does, in each reply's usage),
-  from the session's `costs.jsonl`: a record for each step's reply and each round of memories, `{id,
-  for, cost}` in dollars. A fork's counts only its own requests.
+  session's requests have used, from the session's `costs.jsonl`: a record for each step's reply and
+  each round of memories, `{id, for, used, total}`, where `used` and the running `total` are `{cost,
+  input, cached, output}`: dollars as the provider reports them (OpenRouter does, in each reply's
+  usage; null while none has), and the prompts' tokens, of them those read from the cache, and the
+  replies'. The page reads only the last record. A fork's counts only its own requests.
 
 `.github/workflows/connectome-web.yml` builds standalone binaries on GitHub's runners: Linux (static,
 x86_64 and arm64), Windows (x86_64) and macOS (arm64 and x86_64). Locally, `cargo build --release`.
@@ -106,5 +108,5 @@ python3 tests/mutants.py tests/test_app.py app/src/main.rs=mutants.json   # muta
 ```
 
 The three take under 30 seconds together. A batch of mutants takes about as long as its slowest one
-(87 of the app's, under a minute): they build without link-time optimization, from a build kept in
+(90 of the app's, under a minute): they build without link-time optimization, from a build kept in
 `target/mutants`.

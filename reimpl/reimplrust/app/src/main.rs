@@ -18,7 +18,7 @@ mod llm;
 mod settings;
 mod tools;
 
-use crate::{llm::Llm, settings::{SessionSettings, Settings}, tools::{bash, edit, mcp, Toolbox}};
+use crate::{llm::{Llm, Usage}, settings::{SessionSettings, Settings}, tools::{bash, edit, mcp, Toolbox}};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Reader}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{Host, Request}, store::Session};
 use serde::{de::DeserializeOwned, Serialize, Serializer};
@@ -422,7 +422,7 @@ fn work(app: &App, name: &str, jobs: Receiver<Job>, tell: &dyn Fn(Msg)) {
 /// API continues (a prefill). The turn tells the hub (`tell`) what the pages following it see: the
 /// log's length each time it grows ({"logged"}), the pieces of a reply's reasoning and text
 /// ({"thinking"}, {"text"}), each call's tool as the reply starts it and its input as it comes
-/// ({"calling"}, {"input"}), the session's cost after each request a provider prices ({"cost"}), the question whether each call may run ({"approve"}: its id; the answers
+/// ({"calling"}, {"input"}), what the session's requests have used after each ({"spent"}), the question whether each call may run ({"approve"}: its id; the answers
 /// come from the pages: {"answered": the id, "answer"}), and each call's result ({"result"}: the
 /// tool_result block, brief). Memories form between steps; the session's thread tells the turn's end
 /// ({"ok": true} once it has joined the log, or {"error"}), then forms the memories after it.
@@ -506,19 +506,20 @@ fn form(tell: &dyn Fn(Msg), name: &str, s: &Session, setup: &Setup) {
     tell(Msg::Event(obj! {"forming" => false}));
 }
 
-/// What the step's requests cost since this was last told (Llm::spent), as the provider reports it,
-/// joins the session's costs log, saying what it was `for`, and the pages hear the session's total.
+/// What the step's requests used since this was last told (Llm::spent) joins the session's costs log,
+/// saying what it was `for`, with the session's running total, which the pages hear.
 fn spend(s: &Session, setup: &Setup, what: &str, tell: &dyn Fn(Msg)) {
-    let cost = setup.llm.spent.take();
-    if cost > 0.0 {
-        s.append("costs", obj! {"for" => what, "cost" => cost});
-        tell(Msg::Event(obj! {"cost" => spent(s)}));
+    let used = setup.llm.spent.take();
+    if used.input + used.output > 0.0 {
+        let total = spent(s).unwrap_or_default() + used;
+        s.append("costs", obj! {"for" => what, "used" => used, "total" => total});
+        tell(Msg::Event(obj! {"spent" => total}));
     }
 }
 
-/// Dollars the session's requests cost, by its costs log; None while no provider has reported one.
-fn spent(s: &Session) -> Option<f64> {
-    (s.count("costs") > 0).then(|| s.span("costs", 0, s.count("costs") - 1).map(|c| c["cost"].as_f64().unwrap_or(0.0)).sum())
+/// What the session's requests have used: its costs log's last running total; None before any.
+fn spent(s: &Session) -> Option<Usage> {
+    s.last("costs").and_then(|c| serde_json::from_value(c["total"].clone()).ok())
 }
 
 /// What a session's step runs with, from the settings as they are now.
@@ -655,7 +656,7 @@ fn parent(s: &Session) -> Value {
 /// What the page shows of a session: counts, each layer's size, the last compile, its settings as its
 /// file has them, the tools that ask before they run and the tokens every request carries (or the
 /// problem that keeps it from running), whether a job runs (a turn, then its memories forming), and
-/// what its requests cost.
+/// what its requests have used.
 fn state(app: &App, name: &str, s: &Session) -> Value {
     let layers: Vec<Value> = (0..).map(|n| s.count(&format!("layer{n}"))).take_while(|&c| c > 0).map(Value::from).collect();
     let last = s.last("compiles").unwrap_or(obj! {});
@@ -664,7 +665,7 @@ fn state(app: &App, name: &str, s: &Session) -> Value {
     obj! {
         "messages" => s.count("messages"), "layers" => layers,
         "frontier" => last["frontier"].clone(), "armed" => last["armed"].clone(), "multiplier" => last["multiplier"].clone(), "refused" => refused,
-        "running" => running, "cost" => spent(s),
+        "running" => running, "spent" => spent(s),
         "settings" => profile(app, name).ok().map(|p| serde_json::to_value(p).expect("settings are JSON")),
         "tools" => setup.as_ref().map_or(vec![], |x| x.tools.asking()), "overhead" => setup.as_ref().map_or(0.0, |x| x.overhead),
         "problem" => setup.as_ref().err().map(String::as_str),

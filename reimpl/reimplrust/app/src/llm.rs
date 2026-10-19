@@ -5,14 +5,40 @@
 //! time; the reply streams back as server-sent events.
 
 use connectome::{blocks::Block, emit::Reader, json::{self, sparse, Json, Value}, obj, turns::Turn};
-use std::{cell::Cell, io::{self, BufRead, BufReader, BufWriter, Write}};
+use serde::{Deserialize, Serialize};
+use std::{cell::Cell, io::{self, BufRead, BufReader, BufWriter, Write}, ops::Add};
 use ureq::tls::{PemItem, TlsConfig};
 
 pub struct Llm {
     pub base: String, // e.g. https://api.anthropic.com
     pub key: String,
     pub agent: ureq::Agent,
-    pub spent: Cell<f64>, // dollars its replies cost since it was last taken, as the provider reports them (OpenRouter does)
+    pub spent: Cell<Usage>, // what its replies used since it was last taken
+}
+
+/// What replies used, as their providers report it: dollars, if a provider prices them (OpenRouter
+/// does), and tokens: the prompts', of those the ones read from the provider's cache, and the replies'.
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+pub struct Usage {
+    pub cost: Option<f64>,
+    pub input: f64,
+    pub cached: f64,
+    pub output: f64,
+}
+
+impl Add for Usage {
+    type Output = Usage;
+
+    fn add(self, more: Usage) -> Usage {
+        let cost = self.cost.map_or(more.cost, |cost| Some(cost + more.cost.unwrap_or(0.0)));
+        Usage { cost, input: self.input + more.input, cached: self.cached + more.cached, output: self.output + more.output }
+    }
+}
+
+impl From<Usage> for Value {
+    fn from(used: Usage) -> Value {
+        serde_json::to_value(used).expect("usage is JSON")
+    }
 }
 
 /// An HTTP client that trusts Mozilla's roots, or instead only the certificates in `ca` (PEM): a
@@ -62,7 +88,7 @@ impl Llm {
         let data = lines.filter_map(|line| line.map(|l| l.strip_prefix("data:").map(|d| d.trim().to_string())).transpose());
         let mut events = data.take_while(|d| d.as_deref() != Ok("[DONE]"));
         let reply = events.try_fold(Reply::default(), |reply, d| reply.event(&json::parse(d?.as_bytes())?, &mut piece))?;
-        self.spent.set(self.spent.get() + reply.cost);
+        self.spent.set(self.spent.get() + reply.used);
         reply.done()
     }
 }
@@ -72,20 +98,13 @@ impl Llm {
 struct Reply {
     blocks: Vec<Value>,
     stop: Value,
-    input: f64,
-    output: f64,
-    cost: f64,
+    used: Usage,
 }
 
 impl Reply {
     fn event(mut self, e: &Value, show: &mut impl FnMut(&str, &str)) -> Result<Reply, String> {
-        let tokens = |usage: &Value, k: &str| usage[k].as_f64().unwrap_or(0.0);
         match e.kind() {
-            "message_start" => {
-                let usage = &e["message"]["usage"];
-                self.input = tokens(usage, "input_tokens") + tokens(usage, "cache_read_input_tokens") + tokens(usage, "cache_creation_input_tokens");
-                self.output = tokens(usage, "output_tokens");
-            }
+            "message_start" => self.used(&e["message"]["usage"]),
             "content_block_start" => {
                 if e["content_block"].kind() == "tool_use" {
                     show("calling", e["content_block"]["name"].as_str().unwrap_or(""));
@@ -120,13 +139,22 @@ impl Reply {
             }
             "message_delta" => {
                 self.stop = e["delta"]["stop_reason"].clone();
-                self.output = e["usage"]["output_tokens"].as_f64().unwrap_or(self.output);
-                self.cost = e["usage"]["cost"].as_f64().unwrap_or(self.cost);
+                self.used(&e["usage"]);
             }
             "error" => return Err(format!("{}: {}", e["error"]["type"].as_str().unwrap_or("error"), e["error"]["message"].as_str().unwrap_or(""))),
             _ => {} // ping, message_stop
         }
         Ok(self)
+    }
+
+    /// The usage an event reports. Counts only grow over a stream, which reports them at its start
+    /// (Anthropic), at its end (OpenRouter, 0 at the start), or at both; the cost comes at its end.
+    fn used(&mut self, usage: &Value) {
+        let n = |k: &str| usage[k].as_f64().unwrap_or(0.0);
+        let (prompt, cached) = (n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens"), n("cache_read_input_tokens"));
+        let used = &mut self.used;
+        (used.input, used.cached, used.output) = (used.input.max(prompt), used.cached.max(cached), used.output.max(n("output_tokens")));
+        used.cost = usage["cost"].as_f64().or(used.cost);
     }
 
     /// The reply, once it has stopped: a stream that ends before its stop reason was cut off.
@@ -137,7 +165,7 @@ impl Reply {
         Ok(obj! {
             "stopReason" => self.stop,
             "content" => self.blocks.iter().filter_map(from_api).collect::<Vec<_>>(),
-            "usage" => obj! {"inputTokens" => self.input, "outputTokens" => self.output},
+            "usage" => obj! {"inputTokens" => self.used.input, "outputTokens" => self.used.output},
         })
     }
 }
