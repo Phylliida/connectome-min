@@ -43,10 +43,12 @@ input[type=checkbox] { width: auto; }
 .settings label, .settings small, .legend, .msg .who { font-size: 12px; color: var(--muted); }
 #chat { display: flex; flex-direction: column; padding: 0; }
 #log { flex: 1; overflow: auto; padding: 16px; }
-.msg { position: relative; border-left: 4px solid var(--raw); padding: 0 0 0 10px; margin: 0 0 12px; }
-.msg.tail { border-left-color: var(--tail); }
+.msg { position: relative; margin: 0 0 12px; }
 .msg.recalled { opacity: .55; }
 .msg .who { margin-bottom: 4px; }
+.msg[data-who="user"]:not(.results) { display: flex; flex-direction: column; align-items: flex-end; }
+.msg[data-who="user"]:not(.results) .bubble { max-width: 85%; }
+.msg[data-who="user"] > button { right: auto; left: 0; }
 .bubble, .thinking, .tool { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin: 0 0 6px; }
 .bubble { white-space: pre-wrap; word-wrap: break-word; }
 .thinking { border-style: dashed; color: var(--muted); padding: 6px 10px; }
@@ -248,14 +250,14 @@ async function open() {
   } catch (err) { setStatus(err.message, true); }
 }
 
-// the log's newest messages, up to the nth if given, each as the context shows it (in the raw tail,
-// in a raw chunk, or recalled through a memory), its blocks drawn
+// the log's newest messages, up to the nth if given, its blocks drawn, the user's on the right and a
+// message the context only recalls through a memory faded
 async function showLog(n) {
   const messages = await api(`/api/s/${current()}/messages${n == null ? '' : `?to=${n}`}`);
   $('log').innerHTML = '';
   for (const m of messages) {
-    const results = m.content.every((b) => b.type === 'tool_result') ? ' · tool results, on the calls' : '';
-    $('log').insertAdjacentHTML('beforeend', `<div class="msg ${m.shown}" data-who="${escape(m.participant)}"><div class="who">#${m.id} · ${escape(m.participant)}${results}</div><button data-fork="${m.id}">fork here</button></div>`);
+    const results = m.content.every((b) => b.type === 'tool_result');
+    $('log').insertAdjacentHTML('beforeend', `<div class="msg ${m.shown}${results ? ' results' : ''}" data-who="${escape(m.participant)}"><div class="who">#${m.id} · ${escape(m.participant)}${results ? ' · tool results, on the calls' : ''}</div><button data-fork="${m.id}">fork here</button></div>`);
     for (const b of m.content) draw($('log').lastElementChild, b);
   }
   $('log').scrollTop = $('log').scrollHeight;
