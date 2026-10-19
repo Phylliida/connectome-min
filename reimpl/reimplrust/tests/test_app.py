@@ -47,7 +47,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
-seen = {'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None}
+seen = {'costs': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None}
 
 
 class Mock(BaseHTTPRequestHandler):
@@ -155,7 +155,9 @@ class Mock(BaseHTTPRequestHandler):
             event('content_block_stop', index=i)
         if cut:
             return self.wfile.write(b'0\r\n\r\n' if chunked else b'')
-        event('message_delta', delta={'stop_reason': stop}, usage={'output_tokens': sum(len(b.get('text', '')) for b in blocks) // 4})
+        out = sum(len(b.get('text', '')) for b in blocks) // 4
+        priced = {} if seen['model'] == 'mock-2' else {'cost': (input_tokens * 3 + out * 15) / 1e6}   # as OpenRouter reports it; mock-2's provider doesn't
+        event('message_delta', delta={'stop_reason': stop}, usage={'output_tokens': out, **priced})
         event('message_stop')
         if seen['chat'] % 3 == 0:                          # as OpenRouter ends its streams
             data = b'event: data\ndata: [DONE]\n\n'
@@ -292,6 +294,8 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
                 times.append(time.monotonic())
             if 'result' in last:
                 seen['events'].append(last)
+            if 'cost' in last:
+                seen['costs'][name] = last['cost']
             if 'calling' in last:
                 calls.append([last['calling'], ''])
             if 'input' in last:
@@ -430,6 +434,8 @@ def tooled(tls, ca, baseline) -> str:
         call(port, '/api/sessions', {'name': 'tools', 'workspace': work + '/'})   # kept without the slash
         if (names := call(port, '/api/sessions', {'name': 'bare'})['tools']) != ['fail', 'picture', 'hang', 'die', 'add']:
             raise SystemExit(f'a session without a workspace has tools {names}')
+        if call(port, '/api/s/bare')['cost'] is not None:
+            raise SystemExit('a session no request has priced has a cost')
         if (spaces := {s['name']: s['workspace'] for s in call(port, '/api/sessions')}) != {'tools': work, 'bare': None}:
             raise SystemExit(f'the sessions\' workspaces: {spaces}')
         state = call(port, '/api/s/tools')
@@ -534,7 +540,7 @@ def tooled(tls, ca, baseline) -> str:
         # gets what the first page gets from there on, but the reply's pieces, which a page a moment behind when the log
         # grows reads from the log
         outline = lambda events: [e for e in events if not {'text', 'thinking'} & set(e)]
-        kinds = [next(iter(e)) for e in outline(late) if not {'logged', 'forming'} & set(e)]
+        kinds = [next(iter(e)) for e in outline(late) if not {'logged', 'forming', 'cost'} & set(e)]
         if outline(first)[-len(outline(late)):] != outline(late) or late[0] != {'logged': state['messages'] + 2} or 'approve' not in late[1] \
                 or kinds != ['approve', 'answered', 'result', 'ok'] or call(port, '/api/s/tools')['running']:
             raise SystemExit(f'a page that came in during the turn got {kinds} from {late[:2]}; the page that started it {len(first)} events, it {len(late)}')
@@ -593,6 +599,9 @@ def chatted(turns, tls, ca, baseline) -> str:
         if abs(state['multiplier'] - 1) < 0.01:
             raise SystemExit(f'the price multiplier ({state["multiplier"]}) never calibrated to the prompt sizes the API reports')
         baseline.put(state['multiplier'])
+        costs = [json.loads(line) for line in Path(root, 'main', 'costs.jsonl').read_text().splitlines()]   # each step's, each memory round's
+        if {c['for'] for c in costs} != {'reply', 'memories'} or abs(sum(c['cost'] for c in costs) - state['cost']) > 1e-9 or seen['costs']['main'] != state['cost']:
+            raise SystemExit(f'main cost {state["cost"]}, its log {sum(c["cost"] for c in costs)} in {len(costs)} records, the page last heard {seen["costs"].get("main")}')
         if seen['problems']:
             raise SystemExit(f'the API would reject a request: {seen["problems"][0]}')
         if not seen['thought']:
@@ -630,8 +639,10 @@ def chatted(turns, tls, ca, baseline) -> str:
                 raise SystemExit('the app does not serve the math its stylesheet and fonts')
         call(port, '/api/settings', {'name': 'plain', 'key': 'k-123', 'base': f'http://127.0.0.1:{plain_port}/v1'})   # a base with /v1, as OpenRouter's
         call(port, '/api/s/branch/settings', {'provider': 'plain', 'model': 'mock-2'})
+        priced = call(port, '/api/s/branch')['cost']
         say(port, 'branch', 'with the saved key, over plain HTTP')
-        settle(port, 'branch')
+        if settle(port, 'branch')['cost'] != priced:                     # mock-2's provider reports no cost
+            raise SystemExit('a turn whose provider reports no cost added to the cost')
         shown, mode = call(port, '/api/settings')['providers'], os.stat(os.path.join(root, 'settings.json')).st_mode & 0o777
         listed = next((p for p in shown if p['name'] == 'plain'), None)
         kept, own = Path(root, 'settings.json').read_text(), Path(root, 'branch', 'session_settings.json').read_text()

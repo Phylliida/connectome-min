@@ -5,13 +5,14 @@
 //! time; the reply streams back as server-sent events.
 
 use connectome::{blocks::Block, emit::Reader, json::{self, sparse, Json, Value}, obj, turns::Turn};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::{cell::Cell, io::{self, BufRead, BufReader, BufWriter, Write}};
 use ureq::tls::{PemItem, TlsConfig};
 
 pub struct Llm {
     pub base: String, // e.g. https://api.anthropic.com
     pub key: String,
     pub agent: ureq::Agent,
+    pub spent: Cell<f64>, // dollars its replies cost since it was last taken, as the provider reports them (OpenRouter does)
 }
 
 /// An HTTP client that trusts Mozilla's roots, or instead only the certificates in `ca` (PEM): a
@@ -60,7 +61,9 @@ impl Llm {
         let lines = BufReader::new(body.into_reader()).lines().map(|line| line.map_err(|e| e.to_string()));
         let data = lines.filter_map(|line| line.map(|l| l.strip_prefix("data:").map(|d| d.trim().to_string())).transpose());
         let mut events = data.take_while(|d| d.as_deref() != Ok("[DONE]"));
-        events.try_fold(Reply::default(), |reply, d| reply.event(&json::parse(d?.as_bytes())?, &mut piece)).and_then(Reply::done)
+        let reply = events.try_fold(Reply::default(), |reply, d| reply.event(&json::parse(d?.as_bytes())?, &mut piece))?;
+        self.spent.set(self.spent.get() + reply.cost);
+        reply.done()
     }
 }
 
@@ -71,6 +74,7 @@ struct Reply {
     stop: Value,
     input: f64,
     output: f64,
+    cost: f64,
 }
 
 impl Reply {
@@ -117,6 +121,7 @@ impl Reply {
             "message_delta" => {
                 self.stop = e["delta"]["stop_reason"].clone();
                 self.output = e["usage"]["output_tokens"].as_f64().unwrap_or(self.output);
+                self.cost = e["usage"]["cost"].as_f64().unwrap_or(self.cost);
             }
             "error" => return Err(format!("{}: {}", e["error"]["type"].as_str().unwrap_or("error"), e["error"]["message"].as_str().unwrap_or(""))),
             _ => {} // ping, message_stop

@@ -422,7 +422,7 @@ fn work(app: &App, name: &str, jobs: Receiver<Job>, tell: &dyn Fn(Msg)) {
 /// API continues (a prefill). The turn tells the hub (`tell`) what the pages following it see: the
 /// log's length each time it grows ({"logged"}), the pieces of a reply's reasoning and text
 /// ({"thinking"}, {"text"}), each call's tool as the reply starts it and its input as it comes
-/// ({"calling"}, {"input"}), the question whether each call may run ({"approve"}: its id; the answers
+/// ({"calling"}, {"input"}), the session's cost after each request a provider prices ({"cost"}), the question whether each call may run ({"approve"}: its id; the answers
 /// come from the pages: {"answered": the id, "answer"}), and each call's result ({"result"}: the
 /// tool_result block, brief). Memories form between steps; the session's thread tells the turn's end
 /// ({"ok": true} once it has joined the log, or {"error"}), then forms the memories after it.
@@ -463,6 +463,7 @@ fn step(app: &App, name: &str, s: &Session, usage: &mut Option<f64>, tell: &dyn 
     let turns = compiled.map_err(|r| format!("{}: {} tokens over a budget of {}", r.stage, r.actual, r.budget))?;
     let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.settings.system.as_deref(), "tools" => setup.definitions.clone()});
     let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), |kind, piece| tell(Msg::Event(obj! {kind => piece})))?;
+    spend(s, &setup, "reply", tell);
     *usage = Some(reply["usage"]["inputTokens"].as_f64().unwrap_or(0.0) - setup.overhead);
     append(s, &obj! {"participant" => "assistant", "content" => reply["content"].clone()}, cfg);
     tell(Msg::Logged(s.count("messages")));
@@ -501,14 +502,30 @@ fn form(tell: &dyn Fn(Msg), name: &str, s: &Session, setup: &Setup) {
     if let Some(error) = drive(s, &mut &*setup, &setup.settings.config) {
         eprintln!("{name}: forming a memory: {error}");
     }
+    spend(s, setup, "memories", tell);
     tell(Msg::Event(obj! {"forming" => false}));
+}
+
+/// What the step's requests cost since this was last told (Llm::spent), as the provider reports it,
+/// joins the session's costs log, saying what it was `for`, and the pages hear the session's total.
+fn spend(s: &Session, setup: &Setup, what: &str, tell: &dyn Fn(Msg)) {
+    let cost = setup.llm.spent.take();
+    if cost > 0.0 {
+        s.append("costs", obj! {"for" => what, "cost" => cost});
+        tell(Msg::Event(obj! {"cost" => spent(s)}));
+    }
+}
+
+/// Dollars the session's requests cost, by its costs log; None while no provider has reported one.
+fn spent(s: &Session) -> Option<f64> {
+    (s.count("costs") > 0).then(|| s.span("costs", 0, s.count("costs") - 1).map(|c| c["cost"].as_f64().unwrap_or(0.0)).sum())
 }
 
 /// What a session's step runs with, from the settings as they are now.
 fn setup(app: &App, name: &str) -> Result<Setup, String> {
     let (all, s) = (global(app)?, profile(app, name)?);
     let p = all.providers.get(&s.provider).ok_or_else(|| format!("no provider {} in settings.json", s.provider))?;
-    let llm = Llm { base: p.base.clone(), key: p.key.clone(), agent: app.agent.clone() };
+    let llm = Llm { base: p.base.clone(), key: p.key.clone(), agent: app.agent.clone(), spent: Default::default() };
     let no_workspace = "it has no workspace; the user can set one in the session's settings";
     let (bash, edit) = match &s.workspace {
         Some(dir) => (bash::tool(dir.clone(), app.limit, s.sandbox.then_some(all.sandbox)), edit::tool(dir.clone())),
@@ -637,7 +654,8 @@ fn parent(s: &Session) -> Value {
 
 /// What the page shows of a session: counts, each layer's size, the last compile, its settings as its
 /// file has them, the tools that ask before they run and the tokens every request carries (or the
-/// problem that keeps it from running), and whether a job runs (a turn, then its memories forming).
+/// problem that keeps it from running), whether a job runs (a turn, then its memories forming), and
+/// what its requests cost.
 fn state(app: &App, name: &str, s: &Session) -> Value {
     let layers: Vec<Value> = (0..).map(|n| s.count(&format!("layer{n}"))).take_while(|&c| c > 0).map(Value::from).collect();
     let last = s.last("compiles").unwrap_or(obj! {});
@@ -646,7 +664,7 @@ fn state(app: &App, name: &str, s: &Session) -> Value {
     obj! {
         "messages" => s.count("messages"), "layers" => layers,
         "frontier" => last["frontier"].clone(), "armed" => last["armed"].clone(), "multiplier" => last["multiplier"].clone(), "refused" => refused,
-        "running" => running,
+        "running" => running, "cost" => spent(s),
         "settings" => profile(app, name).ok().map(|p| serde_json::to_value(p).expect("settings are JSON")),
         "tools" => setup.as_ref().map_or(vec![], |x| x.tools.asking()), "overhead" => setup.as_ref().map_or(0.0, |x| x.overhead),
         "problem" => setup.as_ref().err().map(String::as_str),
