@@ -30,9 +30,12 @@ use std::{path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender}, time::
 
 const PAGE: &str = include_str!("ui.html");
 
-/// The page's libraries, as published: marked, which turns the assistant's markdown into HTML, and
-/// DOMPurify, which cleans that HTML (vendor/).
-const LIBS: &str = concat!(include_str!("../vendor/marked.umd.js"), "\n;", include_str!("../vendor/purify.min.js"));
+/// The page's libraries, as published (vendor/): marked, which turns the assistant's markdown into
+/// HTML, DOMPurify, which cleans that HTML, and KaTeX, which sets its math, with KaTeX's stylesheet
+/// and the fonts it names (fonts/NAME.woff2).
+const LIBS: &str = concat!(include_str!("../vendor/marked.umd.js"), "\n;", include_str!("../vendor/purify.min.js"), "\n;", include_str!("../vendor/katex/katex.min.js"));
+const KATEX_CSS: &str = include_str!("../vendor/katex/katex.min.css");
+static FONTS: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/vendor/katex/fonts");
 
 /// What every thread reads, set once at the start and never changed.
 struct App {
@@ -279,6 +282,11 @@ fn handle(app: &App, mut stream: TcpStream) -> std::io::Result<()> {
     let reply = match (method.as_str(), parts.as_slice()) {
         ("GET", []) => return send(&mut stream, "200 OK", "text/html; charset=utf-8", PAGE.as_bytes()),
         ("GET", ["libs.js"]) => return send(&mut stream, "200 OK", "text/javascript; charset=utf-8", LIBS.as_bytes()),
+        ("GET", ["katex.css"]) => return send(&mut stream, "200 OK", "text/css; charset=utf-8", KATEX_CSS.as_bytes()),
+        ("GET", ["fonts", font]) => match FONTS.get_file(font) {
+            Some(file) => return send(&mut stream, "200 OK", "font/woff2", file.contents()),
+            None => Err("not found".into()),
+        },
         ("GET", ["api", "sessions"]) => Ok(Some(sessions(app))),
         ("GET", ["api", "settings"]) => global(app).map(|all| Some(providers(&all))),
         ("POST", ["api", "settings"]) => ask(app, |reply| Routed::Provide(body.clone(), reply)).map(|all| Some(providers(&all))),

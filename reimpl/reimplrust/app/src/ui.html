@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Connectome</title>
 <script src="/libs.js"></script>
+<link rel="stylesheet" href="/katex.css">
 <style>
 :root {
   --bg: #f7f6f3; --panel: #ffffff; --ink: #1d1c1a; --muted: #6b6862; --line: #e3e0da;
@@ -53,6 +54,7 @@ input[type=checkbox] { width: auto; }
 .md table { border-collapse: collapse; }
 .md th, .md td { border: 1px solid var(--line); padding: 2px 8px; }
 .md a[href] { color: var(--accent); }
+.md .katex-display { margin: 8px 0; }
 .md blockquote { margin: 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
 .thinking summary { cursor: pointer; font-style: normal; font-size: 12px; }
 .tool { border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; margin: 4px 0; }
@@ -153,11 +155,35 @@ const saves = (form, note, save) => $(form).onsubmit = async (e) => {
 
 // an assistant's text as markdown, its line breaks kept. The HTML keeps only what markdown makes, so
 // the model's text can't run code on the page or load anything (an image would tell its server what
-// the page shows); its links open in a new tab.
-const markdown = (text) => DOMPurify.sanitize(marked.parse(text, { breaks: true }), {
-  ALLOWED_TAGS: ['p', 'br', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'strong', 'em', 'del', 'code', 'pre', 'blockquote', 'ul', 'ol', 'li', 'a', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'input'],
-  ALLOWED_ATTR: ['href', 'title', 'start', 'align', 'type', 'checked', 'disabled'],
-});
+// the page shows); its links open in a new tab. Its math goes in after, as KaTeX wrote it.
+let maths = [];
+const markdown = (text) => {
+  maths = [];
+  const html = DOMPurify.sanitize(marked.parse(text, { breaks: true }), {
+    ALLOWED_TAGS: ['p', 'br', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'strong', 'em', 'del', 'code', 'pre', 'blockquote', 'ul', 'ol', 'li', 'a', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'input'],
+    ALLOWED_ATTR: ['href', 'title', 'start', 'align', 'type', 'checked', 'disabled'],
+  });
+  return html.replace(/\uE000(\d+)\uE001/g, (_, n) => maths[n] ?? '');
+};
+
+// math in an assistant's text: $…$ or \(…\) inline, $$…$$ or \[…\] displayed (on lines of their own,
+// or within a paragraph). A $ counts only against text, and a closing one only when no digit follows
+// and no backtick comes between, so prices and code stay text. KaTeX sets it in its own fonts, the same
+// on every device, and can't make it run or load anything (its \href and \includegraphics are off);
+// markdown() puts it in after cleaning.
+const MATH = /^(?:\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\$(?=\S)((?:\\.|[^$\\\n`])+?)(?<=\S)\$(?!\d)|\\\(([\s\S]+?)\\\))/;
+function tex(src) {
+  const m = MATH.exec(src);
+  return m ? { type: 'math', raw: m[0], tex: m[1] ?? m[2] ?? m[3] ?? m[4], display: (m[1] ?? m[2]) !== undefined } : undefined;
+}
+const math = (t) => `\uE000${maths.push(katex.renderToString(t.tex, { displayMode: t.display, throwOnError: false, strict: false, errorColor: 'var(--warn)' })) - 1}\uE001`;
+marked.use({ extensions: [
+  // displayed math on lines of its own, a paragraph ending before it, so no line of it starts a list
+  { name: 'math', level: 'block', renderer: math,
+    start: (src) => { const i = src.search(/\n(?:\$\$|\\\[)/); return i < 0 ? undefined : i + 1; },
+    tokenizer: (src) => { const t = tex(src); return t?.display && /^[^\S\n]*(\n|$)/.test(src.slice(t.raw.length)) ? t : undefined; } },
+  { name: 'math', level: 'inline', renderer: math, start: (src) => src.search(/\$|\\[[(]/), tokenizer: tex },
+] });
 DOMPurify.addHook('afterSanitizeAttributes', (node) => node.tagName === 'A' && node.setAttribute('target', '_blank'));
 
 function escape(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }

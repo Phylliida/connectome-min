@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 connectome = { version = "0.1.0", path = "../connectome" }
+include_dir = "0.7.4"
 libc = "0.2.191"
 open = "5.4.4"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -600,8 +600,11 @@ def chatted(turns, tls, ca, baseline) -> str:
                 if error.code != 403:
                     raise
         with urllib.request.urlopen(f'http://127.0.0.1:{port}/libs.js', timeout=10) as r:        # the page's markdown, and what cleans it
-            if b'marked v16' not in (libs := r.read()) or b'DOMPurify' not in libs:
+            if b'marked v16' not in (libs := r.read()) or b'DOMPurify' not in libs or b'katex' not in libs:
                 raise SystemExit('the app does not serve the page its libraries')
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/katex.css', timeout=10) as css, urllib.request.urlopen(f'http://127.0.0.1:{port}/fonts/KaTeX_Main-Regular.woff2', timeout=10) as font:
+            if b'KaTeX_Main' not in css.read() or font.read(4) != b'wOF2':
+                raise SystemExit('the app does not serve the math its stylesheet and fonts')
         call(port, '/api/settings', {'name': 'plain', 'key': 'k-123', 'base': f'http://127.0.0.1:{plain_port}/v1'})   # a base with /v1, as OpenRouter's
         call(port, '/api/s/branch/settings', {'provider': 'plain', 'model': 'mock-2'})
         say(port, 'branch', 'with the saved key, over plain HTTP')
