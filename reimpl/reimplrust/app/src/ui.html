@@ -50,7 +50,7 @@ input[type=checkbox] { width: auto; }
 .msg { position: relative; margin-top: 12px; }
 .msg .who { margin-bottom: 4px; }
 .msg.more { margin-top: 0; }
-.msg.more > .who, #reply:has(> .who:only-child) { display: none; }
+.msg.more > .who, #reply.empty { display: none; }
 .msg[data-who="user"]:not(.results) { display: flex; flex-direction: column; align-items: flex-end; }
 .msg[data-who="user"]:not(.results) .bubble { max-width: 85%; }
 .msg > button { position: absolute; top: 0; right: 0; font-size: 12px; padding: 1px 6px; display: none; }
@@ -64,11 +64,13 @@ input[type=checkbox] { width: auto; }
 .thinking summary::-webkit-details-marker, .tool summary::-webkit-details-marker { display: none; }
 .tool pre, .md pre, .md code, .cmd, #detail { font: 12px/1.4 ui-monospace, monospace; }
 
-/* reasoning, folded to its last line */
+/* reasoning, folded to its last line; while it streams in, its newest lines */
 .thinking { border-style: dashed; color: var(--muted); }
 .thinking > div { white-space: pre-wrap; font-style: italic; margin-top: 6px; }
 .thinking .last { display: inline-block; max-width: calc(100% - 90px); vertical-align: bottom; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-style: italic; margin-left: 6px; }
 .thinking[open] .last { display: none; }
+.thinking.live > span { font-size: 12px; }
+.thinking.live > div { max-height: 7.3em; overflow: hidden; display: flex; flex-direction: column-reverse; }   /* its bottom in view */
 
 /* a call's card, folded to its line, its result joining it */
 .tool summary { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -393,17 +395,20 @@ class Message extends Component {
 }
 
 // the reply streaming in: its parts, each a run of reasoning or of text, or a call as the reply writes
-// it; and results whose calls aren't on the page
-const Reply = ({ reply, more, strays }) => html`<div class=${'msg' + (more ? ' more' : '')} id="reply" data-who="assistant">
+// it; and results whose calls aren't on the page. Without any it's hidden, by a class: Firefox doesn't
+// draw again a rule like :has(> .who:only-child) as children come, and left the reply hidden.
+const Reply = ({ reply, more, strays }) => html`<div class=${'msg' + (more ? ' more' : '') + (reply.parts.length || strays.length ? '' : ' empty')} id="reply" data-who="assistant">
   <div class="who">assistant</div>
-  ${reply.parts.map((part, i) => part.kind === 'thinking' ? html`<${Thinking} key=${i} text=${part.source} />`
+  ${reply.parts.map((part, i) => part.kind === 'thinking' ? html`<${Thinking} key=${i} text=${part.source} live=${i === reply.parts.length - 1} />`
     : part.kind === 'text' ? html`<div key=${i} class="bubble md" data-kind="text">${part.done.map((done, k) => html`<div class="done" key=${k} dangerouslySetInnerHTML=${{ __html: done }} />`)}<div class="tail" dangerouslySetInnerHTML=${{ __html: markdown(part.source.slice(part.cut)) }} /></div>`
     : html`<details key=${i} class="tool" open data-kind="calling"><summary>${part.name} …</summary><pre>${part.source}</pre></details>`)}
   ${strays.map((b) => html`<${Card} key=${b.toolUseId} result=${b} />`)}
 </div>`;
 
-// reasoning, folded to its last line (the end of it, when long)
-function Thinking({ text }) {
+// reasoning, folded to its last line (the end of it, when long); while it streams in (`live`), open
+// to its newest lines, so each piece shows as it comes
+function Thinking({ text, live }) {
+  if (live) return html`<div class="thinking live" data-kind="thinking"><span>Thinking…</span><div><div>${text}</div></div></div>`;
   const line = text.trimEnd().split('\n').pop();
   return html`<details class="thinking" data-kind="thinking"><summary>Thinking<span class="last">${line.length > 200 ? '…' + line.slice(-200) : line}</span></summary><div>${text}</div></details>`;
 }
