@@ -27,7 +27,7 @@ struct Cost {
 }
 
 /// What the session's requests have used, as the page shows it: by what they were for, and in all.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Spent { #[serde(flatten)] by: BTreeMap<For, Usage>, total: Usage }
 
 impl Spent {
@@ -51,7 +51,7 @@ struct Covering { first: u64, last: u64, #[serde(default)] raw: f64, #[serde(def
 
 /// How the context folded between two compiles: the nodes it no longer shows (`from`) and those it
 /// shows instead (`into`), and the tokens that saves (below 0 when it unfolds).
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Fold { from: Vec<Node>, into: Vec<Node>, saved: f64 }
 
 /// Record `i` of a file, if the app can read it.

@@ -4,10 +4,11 @@
 //! carry an x-connectome header (another site's page can't send one without a CORS preflight, which
 //! this server never approves), since a POST can change where the key goes.
 
-use crate::{costs::{self, Compile, Fold, Spent}, hub::{Job, Msg, Routed}, settings::{self, SessionSettings}, work::Setup, App};
+use crate::{costs::{self, Compile, Fold, Spent}, hub::{Event, Job, Msg, Routed}, settings::{self, SessionSettings}, work::Setup, App};
 use connectome::{json::{self, sparse, Json, Value}, obj, store::Session};
 use serde::{Serialize, Serializer};
-use std::{collections::{BTreeSet, HashMap}, net::TcpStream, path::Path, sync::mpsc::{channel, Sender}, time::Duration};
+use std::{collections::{BTreeSet, HashMap}, net::TcpStream, path::Path, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
+use std::{any::Any, panic::{catch_unwind, AssertUnwindSafe}};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
 const PAGE: &str = include_str!("ui.html");
@@ -29,6 +30,10 @@ const BODY_LIMIT: u64 = 32 << 20;
 
 /// How long a page may keep a write waiting before it's left behind.
 const PAGE_WAIT: Duration = Duration::from_secs(30);
+
+/// How long a page following a session goes without a line before it gets a blank one, which keeps
+/// the connection open and finds a page that has gone.
+const HEARTBEAT: Duration = Duration::from_secs(5);
 
 /// A route's answer: the JSON to answer with, or None once the route has answered, streaming.
 type Route = Result<Option<Value>, String>;
@@ -96,7 +101,7 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
         ("GET", ["messages"]) => {
             let (from, messages) = listing(&s, "messages", 200, query);
             let folds = costs::folds(&s, from);
-            send_all(stream, messages.map(|mut m| Shown { id: m.id(), content: m["content"].arr().iter().map(brief).collect(), fold: folds.get(&m.id()), participant: m["participant"].take() }))
+            send_all(stream, messages.map(|m| Shown::of(m, &folds)))
         }
         ("GET", ["layer", n]) => send_all(stream, listing(&s, &format!("layer{n}"), u64::MAX, query).1),
         ("POST", ["fork"]) => {
@@ -105,7 +110,9 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
             if at >= s.count("messages") {
                 return Err(format!("can't fork {name} at {at}: it has {} messages", s.count("messages")));
             }
-            app.ask_session(name, |reply| Msg::Job(Job::Fork { at, name: fork.into(), reply })).map(|()| Some(state(app, fork, &app.session(fork))))
+            let (reply, made) = channel();
+            app.ask_session(name, |job| Msg::Job(Job::Fork { at, name: fork.into(), reply }, job));
+            made.recv().expect("the session's thread answers").map(|()| Some(state(app, fork, &app.session(fork))))
         }
         ("POST", ["settings"]) => {
             let merged = s.count("layer2") > 0;
@@ -117,9 +124,9 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
                 return Err("say something".into());
             }
             app.profile(name)?;
-            show(stream, |page| app.tell(name, Msg::Job(Job::Say { text, page })))
+            Ok(Some(obj! {"job" => app.ask_session(name, |job| Msg::Job(Job::Say { text }, job))}))
         }
-        ("GET", ["live"]) => show(stream, |page| app.tell(name, Msg::Follow(page))),
+        ("GET", ["stream"]) => follow(app, name, query, stream),
         ("POST", ["approve"]) => {
             let (id, answer) = (body["id"].as_str().unwrap_or("").into(), body["answer"].as_str().unwrap_or("deny").into());
             app.ask_session(name, |reply| Msg::Approve { id, answer, reply }).map(|()| Some(obj! {}))
@@ -204,23 +211,35 @@ fn listing<'s>(s: &'s Session, file: &str, newest: u64, query: &Query) -> (u64, 
 }
 
 /// A message as the page shows it: its blocks brief, and how the context folded before it (costs::folds).
-#[derive(Serialize)]
-struct Shown<'a> {
+#[derive(Clone, Serialize)]
+pub struct Shown {
     id: u64,
     participant: Value,
     content: Vec<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")] fold: Option<&'a Fold>,
+    #[serde(skip_serializing_if = "Option::is_none")] fold: Option<Fold>,
 }
 
-/// A block as the page gets it: text and tool calls as they are, reasoning without its signature, a
-/// tool result with its content's blocks brief, an image as its size, and anything else as its type.
-pub fn brief(b: &Value) -> Value {
-    match b.kind() {
-        "text" | "tool_use" => b.clone(),
-        "thinking" => obj! {"type" => "thinking", "thinking" => b["thinking"].clone()},
+impl Shown {
+    /// Message `m`, its content moved, not copied.
+    fn of(mut m: Value, folds: &HashMap<u64, Fold>) -> Shown {
+        let content = m["content"].as_array_mut().map_or(vec![], |blocks| blocks.drain(..).map(brief).collect());
+        Shown { id: m.id(), participant: m["participant"].take(), content, fold: folds.get(&m.id()).cloned() }
+    }
+}
+
+/// A block as the page gets it, moved: text and tool calls as they are, reasoning without its
+/// signature, a tool result with its content's blocks brief, an image as its size, and anything else
+/// as its type.
+pub fn brief(mut b: Value) -> Value {
+    match b.kind().to_string().as_str() {
+        "text" | "tool_use" => b,
+        "thinking" => obj! {"type" => "thinking", "thinking" => b["thinking"].take()},
         "tool_result" => {
-            let content = b["content"].as_array().map_or_else(|| b["content"].clone(), |blocks| blocks.iter().map(brief).collect());
-            sparse(obj! {"type" => "tool_result", "toolUseId" => b["toolUseId"].clone(), "content" => content, "isError" => b["isError"].clone()})
+            let content = match b["content"].take() {
+                Value::Array(blocks) => blocks.into_iter().map(brief).collect(),
+                content => content,
+            };
+            sparse(obj! {"type" => "tool_result", "toolUseId" => b["toolUseId"].take(), "content" => content, "isError" => b["isError"].take()})
         }
         "image" => obj! {"type" => "image", "kb" => b["source"]["data"].as_str().map_or(0, str::len) / 1024},
         kind => obj! {"type" => kind},
@@ -257,12 +276,63 @@ fn send_all(stream: &mut TcpStream, items: impl Iterator<Item = impl Serialize>)
     Ok(None)
 }
 
-/// A job to a page as it happens, a JSON line each (hub's Live), until the hub stops sending to the
-/// channel `follow` gives it.
-fn show(page: &mut TcpStream, follow: impl FnOnce(Sender<String>)) -> Route {
-    let (sender, lines) = channel();
-    follow(sender);
-    let _ = page.set_write_timeout(Some(PAGE_WAIT));
-    let _ = std::iter::once(head("200 OK", "application/x-ndjson", None)).chain(lines).try_for_each(|line| page.write_all(line.as_bytes()));
+/// A session as it goes on, to a page that follows it until it goes, a JSON line each (hub's Event):
+/// the log's messages from the query's `from` (by default its newest 200), the session, then what the
+/// hub tells the page: as the log grows, the messages it gains, read from disk, and after each job the
+/// session again. The page follows the session before its messages are read, so it misses none: one
+/// the log gains meanwhile it reads, or hears of, or both, and a page takes a message once and a turn's
+/// events only for messages it doesn't have. Files the library can't read (a hand edit) the page hears
+/// of ({"broken"}), and they're read again at the next event, as they may have been mended.
+fn follow(app: &App, name: &str, query: &Query, page: &mut TcpStream) -> Route {
+    let (sender, events) = channel();
+    app.ask_session(name, |followed| Msg::Follow(sender, followed));
+    let s = app.session(name);
+    let _ = (page.set_write_timeout(Some(PAGE_WAIT)), page.set_nodelay(true)); // each batch of events out at once
+    let mut out = BufWriter::new(page);
+    let mut sent = None; // the messages the page has
+    let mut catch_up = |out: &mut BufWriter<&mut TcpStream>, with_state: bool| {
+        let read = catch_unwind(AssertUnwindSafe(|| -> io::Result<()> {
+            let to = s.count("messages");
+            messages(&s, sent.unwrap_or_else(|| query.get("from").copied().unwrap_or(to.saturating_sub(200))), to, &mut *out)?;
+            sent = Some(to);
+            if with_state { line(&Event::State(state(app, name, &s)), &mut *out)? }
+            Ok(())
+        }));
+        read.unwrap_or_else(|why| line(&Event::Broken(format!("the session's files can't be read as they are: {}", said(why))), out))
+    };
+    let _ = (|| -> io::Result<()> {
+        out.write_all(head("200 OK", "application/x-ndjson", None).as_bytes())?;
+        catch_up(&mut out, true)?;
+        loop {
+            out.flush()?;
+            let event = match events.recv_timeout(HEARTBEAT) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => { out.write_all(b"\n")?; continue }
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            };
+            for event in std::iter::once(event).chain(events.try_iter()) {
+                if let Event::Logged(_) = event { catch_up(&mut out, false)? }
+                line(&event, &mut out)?;
+                if let Event::Done(_) = event { catch_up(&mut out, true)? }
+            }
+        }
+    })();
     Ok(None)
+}
+
+/// What a panic said.
+fn said(panic: Box<dyn Any + Send>) -> String {
+    panic.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_default()
+}
+
+/// The log's messages `from` up to `to`, each a line.
+fn messages(s: &Session, from: u64, to: u64, out: &mut impl Write) -> io::Result<()> {
+    if from >= to { return Ok(()) }
+    let folds = costs::folds(s, from);
+    s.span("messages", from, to - 1).try_for_each(|m| line(&Event::Message(Shown::of(m, &folds)), &mut *out))
+}
+
+/// An event as a line of JSON.
+fn line(event: &Event, out: &mut impl Write) -> io::Result<()> {
+    json::write(event, &mut *out).and_then(|()| out.write_all(b"\n"))
 }

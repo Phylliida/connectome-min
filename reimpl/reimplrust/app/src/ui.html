@@ -145,8 +145,9 @@ let state = null;   // the session as the server has it (a global the browser te
 const page = {
   sessions: [], providers: [],
   messages: [],                           // the log's messages the page has, oldest first
-  live: null,                             // the turn the page follows (follow), from its request until its stream ends
+  live: null,                             // the turn running, as the page hears it (follow)
   error: null,                            // why what the page last did failed
+  broken: null,                           // why the session's files can't be read as they are
   notes: { session: '', provider: '' },   // under each form: saved, or why not
   editing: { name: '', base: '', n: 0 },  // the provider form's fields, which it starts from again when n changes
   tuned: 0,                               // the session form's saves, after each of which it starts again
@@ -154,7 +155,7 @@ const page = {
   folded: new Set(),                      // the workspaces whose groups are folded, kept in this browser
   scroll: false,                          // whether the log scrolls to its end once drawn
 };
-let showing = null;   // aborts the request the turn the page follows streams on
+let stream = null;   // aborts the stream the page follows its session on
 
 // the page drawn again from what it shows: at once (draw, after what the user does), or at most once a
 // frame however fast it changes (redraw, as a turn streams)
@@ -220,9 +221,9 @@ function escape(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;',
 
 // the line under the chat: what the turn the page follows waits for (its phase), else what failed or
 // keeps the session from running
-const PHASES = { waiting: 'Waiting for the model…', streaming: '', asking: 'Waiting for you to allow or deny the call…', running: 'Running…', denied: 'Denied.', forming: 'Forming memories…' };
+const PHASES = { waiting: 'Waiting for the model…', streaming: '', asking: 'Waiting for you to allow or deny the call…', running: 'Running…', denied: 'Denied.', forming: 'Forming memories…', ended: '' };
 function status() {
-  if (page.error) return [page.error, true];
+  if (page.error || page.broken) return [page.error || page.broken, true];
   if (page.live) return [PHASES[page.live.phase], false];
   if (state?.problem) return [state.problem, true];
   return state?.refused ? ['The summarizer refused; memory formation is stopped until surgery.', true] : ['', false];
@@ -350,7 +351,7 @@ function Log() {
       html`<${Message} key=${m.id} m=${m} more=${more} hidden=${hidden} results=${own.map((id) => results.get(id))} asked=${own.map((id) => !!live?.asked.has(id))}
         joined=${m.content.map((b) => b.type === 'tool_result' && calls.has(b.toolUseId))} />`];
   });
-  return html`<div id="log">${rows}${reply && [
+  return html`<div id="log">${rows}${reply && reply.key > (messages.at(-1)?.id ?? -1) && [
     reply.fold && html`<${FoldLine} key="fold-live" fold=${reply.fold} live />`,
     html`<${Reply} key=${'reply-' + reply.key} reply=${reply} more=${who === 'assistant'} strays=${live.results.filter((b) => !calls.has(b.toolUseId))} />`,
   ]}</div>`;
@@ -428,7 +429,7 @@ function Card({ call, result, asking }) {
   return html`<details class=${'tool' + failed} id=${call && 'call-' + call.id} data-kind=${call ? 'tool_use' : 'tool_result'} open=${!result || view === views.edit}>
     <summary>${head}${result && html`<span class="out"> → ${text.split('\n')[0].slice(0, 100)}</span>`}</summary>
     ${body}
-    ${asking && html`<div class="ask">${answer('allow', 'Allow')}${answer('always', 'Always allow')}${answer('deny', 'Deny')}</div>`}
+    ${asking && !result && html`<div class="ask">${answer('allow', 'Allow')}${answer('always', 'Always allow')}${answer('deny', 'Deny')}</div>`}
     ${result && html`<pre class=${'result' + failed}>${text}</pre>`}
   </details>`;
 }
@@ -583,101 +584,101 @@ async function approve(id, answer) {
   try { await api(`/api/s/${current()}/approve`, { id, answer }); } catch (err) { fail(err); }
 }
 
-// the log's messages the page doesn't have yet, after those it has (with `more`; else its newest, in
-// place of them), up to the nth if given
-async function readLog(n, more) {
-  const last = more ? page.messages.at(-1)?.id : undefined;
-  const range = [last == null ? '' : `from=${last + 1}`, n == null ? '' : `to=${n}`].filter(Boolean).join('&');
-  const messages = await api(`/api/s/${current()}/messages?${range}`);
-  return last == null ? messages : [...page.messages, ...messages];
-}
-
-// the session the page shows, and the turn running in it as it goes on; with `more`, its log read on
-// from where the page has it
-async function open(more = false) {
-  showing?.abort();
-  [page.live, page.error] = [null, null];
-  try {
-    state = await api(`/api/s/${current()}`);
-    page.messages = await readLog(undefined, more);
-    page.scroll = true;
-    listSessions();
-    if (state.running) follow(fetch(`/api/s/${current()}/live`, { signal: (showing = new AbortController()).signal }));
-  } catch (err) { page.error = err.message; }
-  redraw();
-}
-
-// a turn: `text` joins the log and the model answers it, or without text the model goes on from the log as it is
-function turn(text) {
+// a turn: `text` joins the log and the model answers it, or without text the model goes on from the
+// log as it is; the page hears it as it follows the session
+async function turn(text) {
   if (!current()) return;
-  showing?.abort();
-  showing = new AbortController();
   page.error = null;
-  follow(fetch(`/api/s/${current()}/${text ? 'say' : 'continue'}`, post({ text }, showing.signal)));
+  try { await api(`/api/s/${current()}/${text ? 'say' : 'continue'}`, { text }); } catch (err) { fail(err); }
 }
 
-// a turn as it streams: a JSON object a line, its fields the events hub.rs's Event lists, each handled
-// by its handler in `on` (an empty piece draws nothing), until the stream ends once the turn's memories
-// have formed; then the session as the turn leaves it. The turn (page.live) goes through phases, which
-// the line under the chat shows: waiting for the model, streaming, asking whether a call may run (then
-// running or denied, once answered), forming memories. Its reply streams in below the log; the log
-// takes its place once it has it. Opening a session stops it showing.
-async function follow(response) {
-  const live = page.live = { phase: 'waiting', reply: null, asked: new Set(), results: [] };
-  let error = null;
-  redraw();
+// the session the page shows, followed while the page is in view: out of view it lets go of it (a
+// browser keeps few connections to a server open at once), and back in view follows it again
+function subscribe() {
+  stream?.abort();
+  stream = null;
+  if (current() && !document.hidden) follow(current(), (stream = new AbortController()).signal);
+}
+
+// a session as it goes on (Event in hub.rs): a JSON object a line, each field handled by its handler in
+// `on` (an empty piece draws nothing). First the log's newest messages, then the session ({"state"}),
+// at which the page shows them in place of what it had; then each message as it joins the log, and each
+// turn from its start ({"turn"}) to its job's end ({"done"}). A turn (page.live) goes through phases,
+// which the line under the chat shows: waiting for the model, streaming, asking whether a call may run
+// (then running or denied, once answered), forming memories, ended. Its reply streams in below the log
+// until the log has it. A stream that ends unasked (the server restarted) is followed again shortly.
+async function follow(name, signal) {
+  let caught = [];   // the log's newest messages, until the page has caught up
   // a run of reasoning or of text continues the reply's last part
   const part = (kind) => {
-    if (live.reply.parts.at(-1)?.kind !== kind) live.reply.parts.push({ kind, source: '', cut: 0, done: [] });
-    return live.reply.parts.at(-1);
+    if (page.live.reply.parts.at(-1)?.kind !== kind) page.live.reply.parts.push({ kind, source: '', cut: 0, done: [] });
+    return page.live.reply.parts.at(-1);
+  };
+  const piece = (grown) => (piece) => {
+    page.live.phase = 'streaming';
+    grow(grown(), piece);
   };
   const on = {
-    // the log has grown: the page has it, and the reply to come starts below it
-    logged: async (n) => {
-      const messages = await readLog(n, true);
-      if (page.live !== live) return;
-      [page.messages, live.reply, live.results] = [messages, { key: n, fold: null, parts: [] }, []];
+    message: (m) => {
+      if (caught) caught.push(m);
+      else if (m.id > (page.messages.at(-1)?.id ?? -1)) page.messages = [...page.messages, m];
     },
-    fold: (fold) => { live.reply.fold = fold; },
-    thinking: (piece) => grow(part('thinking'), piece),
-    text: (piece) => grow(part('text'), piece),
-    calling: (name) => { live.reply.parts.push({ kind: 'calling', name, source: '' }); },
-    input: (piece) => grow(live.reply.parts.at(-1), piece),
-    approve: (id) => { live.asked.add(id); },
-    answered: (id) => { live.asked.delete(id); },
-    result: (b) => { live.results.push(b); },
+    state: (s) => {
+      [state, page.broken] = [s, null];
+      if (caught) [page.messages, caught] = [caught, null];
+      if (!s.running) page.live = null;
+    },
+    broken: (why) => { page.broken = why; },
+    turn: (job) => { [page.live, page.error] = [{ job, phase: 'waiting', reply: null, asked: new Set(), results: [], ended: false }, null]; },
+    done: () => {
+      page.live = null;
+      listSessions();
+    },
     spent: (spent) => { state.spent = spent; },
     prompt: (prompt) => { state.prompt = prompt; },
-    // the turn has ended (`why` it failed, if it did): the log as it leaves it, while its memories form
-    end: async (why) => {
-      error = why;
-      const messages = await readLog(undefined, true);
-      if (page.live === live) [page.messages, live.reply] = [messages, null];
+  };
+  // what happens in a turn
+  const turned = {
+    // the log has grown: the reply to come starts below it
+    logged: (n) => { Object.assign(page.live, { phase: 'waiting', reply: { key: n, fold: null, parts: [] }, results: [] }); },
+    fold: (fold) => { page.live.reply.fold = fold; },
+    thinking: piece(() => part('thinking')),
+    text: piece(() => part('text')),
+    calling: (name) => { page.live.reply.parts.push({ kind: 'calling', name, source: '' }); },
+    input: piece(() => page.live.reply.parts.at(-1)),
+    approve: (id) => {
+      page.live.asked.add(id);
+      page.live.phase = 'asking';
+    },
+    answered: (id) => {
+      page.live.asked.delete(id);
+      if (page.live.phase === 'asking') page.live.phase = 'streaming';
+    },
+    result: (b) => { page.live.results.push(b); },
+    forming: (forming) => { page.live.phase = forming ? 'forming' : page.live.ended ? 'ended' : 'waiting'; },
+    // the turn has ended (`why` it failed, if it did); its memories form after it
+    end: (why) => {
+      Object.assign(page.live, { phase: 'ended', reply: null, ended: true });
+      page.error = why;
     },
   };
-  const take = async (line) => {
-    if (!line.trim()) return;
-    const event = JSON.parse(line);
-    for (const [field, value] of Object.entries(event)) if (value !== '') await on[field]?.(value);
-    live.phase = event.approve ? 'asking' : event.forming ? 'forming' : 'streaming';
+  const take = (event) => {
+    for (const [field, value] of Object.entries(event)) if (value !== '') (on[field] ?? (page.live && turned[field]))?.(value);
     page.scroll = true;
     redraw();
   };
   try {
-    const reader = (await response).body.pipeThrough(new TextDecoderStream()).getReader();
+    const reader = (await fetch(`/api/s/${name}/stream`, { signal })).body.pipeThrough(new TextDecoderStream()).getReader();
     let buffered = '';
     for (let read; !(read = await reader.read()).done;) {
       const lines = (buffered + read.value).split('\n');
       buffered = lines.pop();
-      for (const line of lines) await take(line);
+      lines.filter((line) => line.trim()).forEach((line) => take(JSON.parse(line)));
     }
-    await take(buffered);
   } catch (err) {
     if (err.name === 'AbortError') return;
-    error = err.message;
   }
-  await open(true);
-  if (error) fail({ message: error });
+  setTimeout(() => stream?.signal === signal && subscribe(), 2000);
 }
 
 // a piece onto a part of the reply. A text's finished blocks (its markdown up to its last blank line
@@ -696,12 +697,15 @@ function grow(part, piece) {
 
 try { page.folded = new Set(JSON.parse(localStorage.getItem('folded')) || []); } catch { /* no storage here: groups start open */ }
 window.onhashchange = () => {
-  page.notes.session = '';
-  if (current()) open();
+  [page.notes.session, page.live, page.error] = ['', null, null];
+  listSessions();
+  subscribe();
 };
+document.onvisibilitychange = subscribe;
 redraw();
 loadProviders();
-listSessions().then(() => window.onhashchange());
+listSessions();
+subscribe();
 </script>
 </body>
 </html>

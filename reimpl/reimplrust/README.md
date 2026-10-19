@@ -16,8 +16,8 @@ autobiographical compaction) and a web app around it.
   the session's files, over ureq with TLS compiled in (rustls, ring, and Mozilla's root
   certificates), so the binary needs nothing from the system but sockets. Its threads share nothing
   that changes: each request has one (`api.rs`), the hub owns the settings files and what the pages
-  following a turn see (`hub.rs`), and each session has one, which runs its turns and alone writes
-  its log (`work.rs`).
+  following a session hear (`hub.rs`), and each session has one, which runs its turns and alone
+  writes its log (`work.rs`).
 
 The page draws itself with Preact, its templates written with htm, as a function of what it shows:
 the session as the server has it, its log's messages, and the turn it follows, which only the page's
@@ -105,14 +105,22 @@ request, the 64 steps, a restart) the model goes on from the log as it is, and a
 short it goes on from that reply (the request ends with it, as a prefill). A turn on a log edited
 into something the library can't read fails, and the session goes on once the log is mended.
 
-A turn's log is the session's: a page following a turn shows the log as it grows, read from disk,
-and besides it only what the log doesn't hold yet (a reply streaming in, the questions whether its
-calls may run, their results, memories forming), which is all the app keeps of a turn; its stream
-ends once the turn's memories have formed. The page shows each call as a card on its reply, its tool
-and input as the reply writes it, which its result then joins; an edit's card shows its change as a
-diff, colored in the file's language. A page opened while a turn runs (after a reload, or on another
-device) follows it the same way, and answers its questions; the turn runs on whether any page
-follows it or not, on its session's thread, and a message sent while it runs waits for it.
+A page follows its session on one stream (`GET /api/s/NAME/stream`, JSON lines; `hub::Event` lists
+them): the log's newest messages, read from disk, then the session, then whatever happens in it,
+turn after turn: each message as it joins the log, and of each turn (numbered: sending a message, or
+Continue, answers with its job's number, and the turn's events start with `{"turn": n}` and end with
+`{"done": n}`) only what the log doesn't hold yet (a reply streaming in, the questions whether its
+calls may run, their results, memories forming), which is all the app keeps of a turn. The page
+shows each call as a card on its reply, its tool and input as the reply writes it, which its result
+then joins; an edit's card shows its change as a diff, colored in the file's language. A turn runs
+on its session's thread whether any page follows it or not, and a message sent while it runs waits
+for it. Any number of pages can follow a session, each hearing everything, and any of them can
+answer a call's question; a page that comes in during a turn (after a reload, or on another device)
+hears the turn so far. A page out of view lets go of its stream (a browser keeps only a few
+connections to a server open) and catches up once back in view, and a page whose server restarted
+follows its session again on its own. If a session's files are
+edited into something the library can't read, its stream says so, and reads them again at the next
+event.
 
 Flags: `--root DIR` (sessions and settings; `sessions` by default), `--addr` (`127.0.0.1:8080`),
 `--ca PEM` (root certificates to trust instead of Mozilla's: a company proxy's, a test server's),

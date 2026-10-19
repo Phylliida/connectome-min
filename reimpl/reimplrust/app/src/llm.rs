@@ -94,7 +94,7 @@ impl Llm {
 
 /// A piece of a reply as it streams in: of its reasoning or its text, a call's tool as the call starts,
 /// or a piece of the call's input (JSON). Serialized as {"thinking": piece} and so on.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Piece { Thinking(String), Text(String), Calling(String), Input(String) }
 

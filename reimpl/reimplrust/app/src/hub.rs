@@ -1,9 +1,9 @@
 //! The hub's thread. It owns what changes quickly, so each is told one thing at a time: settings.json
 //! and the sessions' settings files, which sessions have a thread (started the first time one is told
-//! something), and what the pages following each session's turn see (Live).
+//! something), and each session's pages and what they hear (Live).
 
-use crate::{costs::{Fold, Spent}, llm::Piece, settings::{self, SessionSettings, Settings}, work::{work, DENIED}, App};
-use connectome::json::{self, Value};
+use crate::{api::Shown, costs::{Fold, Spent}, llm::Piece, settings::{self, SessionSettings, Settings}, work::{work, DENIED}, App};
+use connectome::json::Value;
 use serde::Serialize;
 use std::{collections::HashMap, sync::mpsc::{channel, Receiver, Sender}};
 
@@ -11,43 +11,54 @@ use std::{collections::HashMap, sync::mpsc::{channel, Receiver, Sender}};
 /// settings it leaves.
 pub enum Routed { To(String, Msg), Provide(Value, Sender<Result<Settings, String>>) }
 
-/// A job for a session's thread: a turn with a message, or without (None) one that continues the log,
-/// which `page` follows; or a fork at message `at` as `name`.
+/// A job for a session's thread: a turn with a message, or without (None) one that continues the log;
+/// or a fork at message `at` as `name`.
 pub enum Job {
-    Say { text: Option<String>, page: Sender<String> },
+    Say { text: Option<String> },
     Fork { at: u64, name: String, reply: Sender<Result<(), String>> },
 }
 
 /// What the hub is told about a session, by requests' threads and by the session's.
 pub enum Msg {
-    /// A job for the session's thread, which does them in the order they come.
-    Job(Job),
-    /// A page that follows the job running; with none, its stream ends at once.
-    Follow(Sender<String>),
+    /// A job for the session's thread, which does them in the order they come, numbered from 1 (the
+    /// number answered) for as long as the server runs.
+    Job(Job, Sender<u64>),
+    /// A page that follows the session from now on, answered once it does: it hears the turn running
+    /// so far first.
+    Follow(Sender<Event>, Sender<()>),
     /// A page's answer whether call `id` may run: allow, always (its tool, from then on) or deny.
     Approve { id: String, answer: String, reply: Sender<Result<(), String>> },
     /// Whether a job runs.
     Status(Sender<bool>),
     /// A change to the session's settings (SessionSettings::tuned), and whether its memories have merged.
     Tune(Value, bool, Sender<Result<(), String>>),
-    /// From the session's thread: a turn starts, which `page` follows.
-    Start(Sender<String>),
+    /// From the session's thread: job `id`'s turn starts.
+    Start(u64),
     /// From the session's thread: the log has grown to this many messages.
     Logged(u64),
-    /// From the session's thread: an event for the pages following its turn.
+    /// From the session's thread: an event for the pages.
     Event(Event),
     /// From the session's thread: a call's question, and where to answer it (Ok: it runs).
     Ask { id: String, tool: String, answer: Sender<Result<(), String>> },
-    /// From the session's thread: the job is done, its memories formed; no call waits any more.
-    Done,
+    /// From the session's thread: job `id` is done, its memories formed; no call waits any more.
+    Done(u64),
 }
 
-/// What the pages following a turn hear, a JSON object a line, its one field the event's name: the
-/// log's length each time it grows ({"logged": n}), then what the log doesn't hold yet.
-#[derive(Serialize)]
+/// What a page following a session hears, a JSON object a line, its one field the event's name. Its
+/// own thread (api::follow) tells it the log's messages and the session; the hub tells it each turn as
+/// it goes: its start, the log's length each time it grows, what the log doesn't hold yet, its end.
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Event {
-    /// The log has grown to this many messages; the page reads them from disk.
+    /// A message of the log: the newest when the page starts following, then each as it joins.
+    Message(Shown),
+    /// The session (api's State): once the page has the log's newest messages, and after each job.
+    State(Value),
+    /// Why the session's files can't be read as they are (a hand edit the library can't read).
+    Broken(String),
+    /// Job `id`'s turn starts.
+    Turn(u64),
+    /// The log has grown to this many messages: the reply to come is the nth.
     Logged(u64),
     /// How the context folded for the reply to come (costs::fold).
     Fold(Fold),
@@ -64,8 +75,10 @@ pub enum Event {
     /// Memories start or stop forming.
     Forming(bool),
     /// The turn has ended: null once its reply has joined the log, else why it failed. Its memories
-    /// form after it, and the stream ends once they have.
+    /// form after it.
     End(Option<String>),
+    /// Job `id` is done, its memories formed.
+    Done(u64),
     /// A piece of the reply streaming in: {"thinking"}, {"text"}, {"calling"} or {"input"}.
     #[serde(untagged)] Piece(Piece),
 }
@@ -99,16 +112,19 @@ impl App {
     }
 }
 
-/// A session as the hub knows it: where its thread takes jobs, and its turn, while one runs (with its
-/// memories forming after it).
-struct Live { jobs: Sender<Job>, turn: Option<Turn> }
+/// A session as the hub knows it: where its thread takes jobs and how many it has had, the pages
+/// following it, and its turn while one runs (with its memories forming after it).
+struct Live {
+    jobs: Sender<(u64, Job)>,
+    numbered: u64,
+    pages: Vec<Sender<Event>>,
+    turn: Option<Turn>,
+}
 
-/// A turn as the pages following it see it: the events since the log last grew (the first its length),
-/// the pages, and the calls waiting for an answer. What the log holds it drops, so it holds a step at
-/// most.
+/// A turn as a page that comes in during it hears it first: its start, then the events since the log
+/// last grew (what the log holds, the page reads from it); and the calls waiting for an answer.
 struct Turn {
-    events: Vec<String>, // JSON lines
-    pages: Vec<Sender<String>>,
+    events: Vec<Event>,
     asked: HashMap<String, (String, Sender<Result<(), String>>)>, // by call id: its tool, where to answer
 }
 
@@ -118,55 +134,69 @@ impl Live {
         let (jobs, queue) = channel();
         let name = name.to_string();
         std::thread::spawn(move || work(app, &name, queue));
-        Live { jobs, turn: None }
+        Live { jobs, numbered: 0, pages: vec![], turn: None }
     }
 
     fn handle(&mut self, app: &App, name: &str, msg: Msg) {
-        match (msg, &mut self.turn) {
-            (Msg::Job(job), _) => drop(self.jobs.send(job)),
-            (Msg::Status(reply), turn) => drop(reply.send(turn.is_some())),
-            (Msg::Tune(v, merged, reply), _) => {
+        match msg {
+            Msg::Job(job, reply) => {
+                self.numbered += 1;
+                let _ = self.jobs.send((self.numbered, job));
+                let _ = reply.send(self.numbered);
+            }
+            Msg::Follow(page, followed) => {
+                if self.turn.iter().flat_map(|t| &t.events).all(|e| page.send(e.clone()).is_ok()) {
+                    self.pages.push(page);
+                }
+                let _ = followed.send(());
+            }
+            Msg::Status(reply) => drop(reply.send(self.turn.is_some())),
+            Msg::Tune(v, merged, reply) => {
                 let tune = |all: Settings| settings::change(&app.profile_path(name), |old: &mut SessionSettings| old.tuned(&v, merged, &all).map(|new| *old = new));
                 let _ = reply.send(app.settings().and_then(tune).map(drop));
             }
-            (Msg::Start(page), turn) => *turn = Some(Turn { events: vec![], pages: vec![page], asked: HashMap::new() }),
-            (Msg::Done, turn) => *turn = None,
-            (Msg::Follow(page), Some(turn)) => {
-                if turn.events.iter().all(|line| page.send(line.clone()).is_ok()) {
-                    turn.pages.push(page);
+            Msg::Start(id) => {
+                self.turn = Some(Turn { events: vec![], asked: HashMap::new() });
+                self.send(Event::Turn(id));
+            }
+            Msg::Done(id) => {
+                self.turn = None;
+                self.send(Event::Done(id));
+            }
+            Msg::Approve { id, answer, reply } => match self.turn.as_mut().and_then(|t| t.asked.remove(&id)) {
+                Some((tool, waiting)) => {
+                    let decided = match answer.as_str() {
+                        "always" => settings::change(&app.profile_path(name), |s: &mut SessionSettings| { s.allow.insert(tool); Ok(()) }).map(drop),
+                        "allow" => Ok(()),
+                        _ => Err(DENIED.into()),
+                    };
+                    let _ = waiting.send(decided);
+                    self.send(Event::Answered(id));
+                    let _ = reply.send(Ok(()));
                 }
+                None => drop(reply.send(Err("no call waits for that answer".into()))),
+            },
+            Msg::Logged(n) => {
+                if let Some(turn) = &mut self.turn {
+                    turn.events.truncate(1); // its start
+                }
+                self.send(Event::Logged(n));
             }
-            (Msg::Approve { id, answer, reply }, Some(turn)) if turn.asked.contains_key(&id) => {
-                let (tool, waiting) = turn.asked.remove(&id).expect("asked");
-                let decided = match answer.as_str() {
-                    "always" => settings::change(&app.profile_path(name), |s: &mut SessionSettings| { s.allow.insert(tool); Ok(()) }).map(drop),
-                    "allow" => Ok(()),
-                    _ => Err(DENIED.into()),
-                };
-                let _ = waiting.send(decided);
-                turn.send(&Event::Answered(id));
-                let _ = reply.send(Ok(()));
+            Msg::Event(event) => self.send(event),
+            Msg::Ask { id, tool, answer } => {
+                if let Some(turn) = &mut self.turn {
+                    turn.asked.insert(id.clone(), (tool, answer));
+                    self.send(Event::Approve(id));
+                } // without a turn the answer's sender goes, which denies the call
             }
-            (Msg::Logged(n), Some(turn)) => {
-                turn.events.clear();
-                turn.send(&Event::Logged(n));
-            }
-            (Msg::Event(event), Some(turn)) => turn.send(&event),
-            (Msg::Ask { id, tool, answer }, Some(turn)) => {
-                turn.send(&Event::Approve(id.clone()));
-                turn.asked.insert(id, (tool, answer));
-            }
-            (Msg::Approve { reply, .. }, _) => drop(reply.send(Err("no call waits for that answer".into()))),
-            (Msg::Follow(_) | Msg::Logged(_) | Msg::Event(_) | Msg::Ask { .. }, None) => {} // no turn: a page's stream ends at once, a call is denied
         }
     }
-}
 
-impl Turn {
-    /// An event to the pages following the turn, kept for those that come later.
-    fn send(&mut self, event: &Event) {
-        let line = format!("{}\n", json::to_string(event));
-        self.pages.retain(|page| page.send(line.clone()).is_ok());
-        self.events.push(line);
+    /// An event to the pages, kept for those that come later while a turn runs.
+    fn send(&mut self, event: Event) {
+        self.pages.retain(|page| page.send(event.clone()).is_ok());
+        if let Some(turn) = &mut self.turn {
+            turn.events.push(event);
+        }
     }
 }

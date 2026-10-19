@@ -8,7 +8,7 @@
 //! sharing nothing that changes:
 //! - each request's thread (api.rs) reads files and tells the hub what it wants of a session;
 //! - the hub (hub.rs) owns what changes quickly: the settings files, which sessions have a thread, and
-//!   what the pages following each session's turn see;
+//!   the pages following each session and what they hear;
 //! - each session's thread (work.rs) does its jobs one at a time, the only one to write its log.
 //!
 //! A session's files are its only record, what its requests used among them (costs.rs): the hub keeps

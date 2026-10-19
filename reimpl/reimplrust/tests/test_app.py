@@ -27,6 +27,7 @@ own, each with its own mock; the first to fail stops the rest.
     python3 tests/test_app.py [turns]
 """
 import datetime
+import itertools
 import json
 import multiprocessing
 import os
@@ -281,16 +282,41 @@ def words(message, kind='text'):
     return ''.join(b[kind] for b in message['content'] if b['type'] == kind)
 
 
-def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
-    """A chat turn as the page has it, or without text one that continues the log, followed until its
-    memories have formed: the reply's text and reasoning, and when each piece of text arrived. A call
-    that asks to run gets the answer `answers` has for its tool, else allow. The calls as the replies
-    stream them in, each its tool and its input's JSON, go to seen['calls']."""
-    request = urllib.request.Request(f'http://127.0.0.1:{port}/api/s/{name}/{"continue" if text is None else "say"}', data=json.dumps({'text': text}).encode(), headers={'x-connectome': '1'})
-    pieces, thoughts, times, last, end, logged, calls = [], [], [], {}, {}, 0, []
-    with urllib.request.urlopen(request, timeout=15) as r:                   # no turn here goes 15 s without an event
+def following(port, name, start=2 ** 62, timeout=10):
+    """A page following a session from message `start` (by default the log's end; None, the stream's
+    default): the response, and its events as they come, failing once `timeout` seconds pass with none
+    (heartbeats aside)."""
+    r = urllib.request.urlopen(f'http://127.0.0.1:{port}/api/s/{name}/stream' + ('' if start is None else f'?from={start}'), timeout=timeout)
+
+    def events():
+        heard = time.monotonic()
         for line in r:
-            last = json.loads(line)
+            if line.strip():
+                heard = time.monotonic()
+                yield json.loads(line)
+            elif time.monotonic() - heard > timeout:
+                raise TimeoutError(f'{name}: {timeout} s of heartbeats alone')
+    return r, events()
+
+
+def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
+    """A chat turn as a page following the session has it, or without text one that continues the log,
+    until its memories have formed: the reply's text and reasoning, and when each piece of text arrived.
+    A call that asks to run gets the answer `answers` has for its tool, else allow. The calls as the
+    replies stream them in, each its tool and its input's JSON, go to seen['calls']."""
+    pieces, thoughts, times, last, end, logged, calls, heard, after = [], [], [], {}, {}, 0, [], [], {}
+    r, events = following(port, name)                                   # no turn here goes 10 s without an event
+    with r:
+        start, mine = next(events).get('state', {}).get('messages'), False   # the session and its log's length (none if it can't be read)
+        job = call(port, f'/api/s/{name}/{"continue" if text is None else "say"}', {'text': text})['job']
+        for last in events:
+            heard += [last['message']['id']] if 'message' in last else []
+            mine |= last.get('turn') == job
+            if not mine:                                                # the end of a turn this one waits for
+                continue
+            if last.get('done') == job:
+                after = next(events)                                    # the session as the job leaves it
+                break
             logged = last.get('logged', logged)
             if 'text' in last:
                 pieces.append(last['text'])
@@ -318,6 +344,8 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
     seen['calls'] = calls
     if end.get('end', 'never ended') is not None:
         raise SystemExit(f'{name}: "{(text or "(continue)")[:40]}" got {end or last}')
+    if start is not None and heard != list(range(start, start + len(heard))) or 'state' not in after or not after['state']['running'] and start + len(heard) != after['state']['messages']:
+        raise SystemExit(f'{name}: a page following the session heard the messages {heard} after {start}, then {str(after)[:80]}')   # each once, as they joined the log
     return ''.join(pieces), ''.join(thoughts), times
 
 
@@ -377,6 +405,11 @@ def streamed_large(tls, ca) -> str:
                 time.sleep(0.05)
         configure(root, f'https://localhost:{mock_port}', 20000000, 30000, 3000)
         call(port, '/api/sessions', {'name': 'large', 'workspace': tempfile.mkdtemp()})
+        r, _ = following(port, 'large')                                  # an idle page hears a blank line every few seconds
+        with r:
+            waited = (r.readline(), time.monotonic())[1]
+            if r.readline() != b'\n' or time.monotonic() - waited > 6:
+                raise SystemExit('a page following a session no turn runs in heard no heartbeat')
         if (tools := call(port, '/api/s/large')['tools']) != ['edit']:
             raise SystemExit(f'without bash, a session with a workspace has tools {tools}, not only edit')
         peaks, contexts = [], []
@@ -526,12 +559,17 @@ def tooled(tls, ca, baseline) -> str:
         got = results('call [["die", {}], ["picture", {}]]', asked=['die'])
         if got['0']['content'] != 'MCP server first: the server stopped' or got['1'].get('is_error'):
             raise SystemExit(f'a server that stops, then a call that starts it again: {got}')
-        first, asking, state = [], 'call ' + json.dumps([['add', {'a': 1, 'b': 2}]]), call(port, '/api/s/tools')
+        first, job, asking, state = [], [], 'call ' + json.dumps([['add', {'a': 1, 'b': 2}]]), call(port, '/api/s/tools')
 
-        def started():
-            request = urllib.request.Request(f'http://127.0.0.1:{port}/api/s/tools/say', data=json.dumps({'text': asking}).encode(), headers={'x-connectome': '1'})
-            with urllib.request.urlopen(request, timeout=60) as r:
-                first.extend(json.loads(line) for line in r)
+        def started():                                                  # a page that sends a message, following the session until its turn is done
+            r, events = following(port, 'tools', timeout=60)
+            with r:
+                first.append(next(events))
+                job.append(call(port, '/api/s/tools/say', {'text': asking})['job'])
+                for e in events:
+                    first.append(e)
+                    if e.get('done') == job[0]:
+                        break
         starter = threading.Thread(target=started)
         starter.start()
         for _ in range(500):                                            # until the turn waits for an answer, which it does until one comes
@@ -551,27 +589,36 @@ def tooled(tls, ca, baseline) -> str:
         waiter.start()
         time.sleep(0.2)                                                 # it reaches the session's thread before the answer
         late = []
-        with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/s/tools/live', timeout=15) as r:
-            for line in r:
-                late.append(json.loads(line))
-                if 'approve' in late[-1]:
-                    call(port, '/api/s/tools/approve', {'id': late[-1]['approve'], 'answer': 'allow'})
+        r, events = following(port, 'tools')
+        with r:
+            for e in events:
+                late.append(e)
+                if 'approve' in e:
+                    call(port, '/api/s/tools/approve', {'id': e['approve'], 'answer': 'allow'})
+                if e.get('done') == job[0]:
+                    break
         starter.join()
         waiter.join()
-        # it starts where the log stands (the message and the reply that calls logged, none of the reply's pieces), then
-        # gets what the first page gets from there on, but the reply's pieces, which a page a moment behind when the log
-        # grows reads from the log
-        outline = lambda events: [e for e in events if not {'text', 'thinking'} & set(e)]
+        # it hears the session (the turn running), then the turn's start and where the log stands (the message and the
+        # reply that calls logged, none of the reply's pieces), then what the first page hears from there on, but the
+        # messages, which each page reads from the log from where it started
+        outline = lambda events: [e for e in events if not {'text', 'thinking', 'message', 'state'} & set(e)]
         kinds = [next(iter(e)) for e in outline(late) if not {'logged', 'forming', 'spent', 'prompt'} & set(e)]
-        if outline(first)[-len(outline(late)):] != outline(late) or late[0] != {'logged': state['messages'] + 2} or 'approve' not in late[1] \
-                or kinds != ['approve', 'answered', 'result', 'end'] or call(port, '/api/s/tools')['running']:
-            raise SystemExit(f'a page that came in during the turn got {kinds} from {late[:2]}; the page that started it {len(first)} events, it {len(late)}')
+        if outline(first)[-len(outline(late)) + 1:] != outline(late)[1:] or not late[0]['state']['running'] or outline(late)[:2] != [{'turn': job[0]}, {'logged': state['messages'] + 2}] \
+                or 'approve' not in outline(late)[2] or kinds != ['turn', 'approve', 'answered', 'result', 'end', 'done'] or call(port, '/api/s/tools')['running']:
+            raise SystemExit(f'a page that came in during the turn got {kinds} from {late[:3]}; the page that started it {len(first)} events, it {len(late)}')
         told = call(port, f'/api/s/tools/messages?from={state["messages"]}')
         if [m['participant'] for m in told] != ['user', 'assistant', 'user', 'assistant', 'user', 'assistant'] or words(told[4]) != queued:
             raise SystemExit(f'a message sent while a turn ran joined the log as {[(m["participant"], words(m)[:20]) for m in told]}')
-        with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/s/tools/live', timeout=5) as r:
-            if r.read():
-                raise SystemExit('a page following no turn got events')
+        r, events = following(port, 'tools', timeout=1)                 # a page following a session no turn runs in hears the session, and no more
+        with r:
+            heard = [next(events)]
+            try:
+                heard.append(next(events))
+            except TimeoutError:
+                pass
+        if len(heard) != 1 or heard[0]['state']['running']:
+            raise SystemExit(f'a page following a session no turn runs in heard {heard}')
         try:
             say(port, 'tools', 'use tools forever', {'add': 'always'})
             raise SystemExit('a turn that never stops calling tools ended')
@@ -597,6 +644,11 @@ def tooled(tls, ca, baseline) -> str:
             raise SystemExit(f'after a restart the tools always allowed are {allowed}, not bash, as the page set them')
         if (ids := [m['id'] for m in call(port, '/api/s/tools/messages?to=100')]) != list(range(100)):   # the newest 200 up to 100
             raise SystemExit(f'the messages up to 100 listed as {ids[:3]}…{ids[-3:]}')
+        r, events = following(port, 'tools', start=None)                # by default a page hears the log's newest 200 messages, then the session
+        with r:
+            told = [e['message']['id'] for e in itertools.takewhile(lambda e: 'state' not in e, events)]
+        if told != list(range(state['messages'] - 200, state['messages'])):
+            raise SystemExit(f'a page following a session of {state["messages"]} messages heard {told[:3]}…{told[-3:]} first')
         return f'{len(seen["results"])} tool steps, {len(seen["asked"])} calls asked to run, {seen["tool memories"]} memory requests with tool calls, {state["messages"]} messages, multiplier {state["multiplier"]:.3f}'
     finally:
         app.terminate()

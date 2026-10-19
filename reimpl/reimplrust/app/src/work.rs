@@ -74,14 +74,14 @@ pub fn overhead(system: Option<&str>, definitions: &Option<Value>) -> f64 {
 
 /// A session's thread, which does its `jobs` (Worker). A job that panics (a file edited into something
 /// the library can't read) fails, and the next runs.
-pub fn work(app: &App, name: &str, jobs: Receiver<Job>) {
-    for job in jobs {
-        let done = catch_unwind(AssertUnwindSafe(|| Worker { app, name, s: app.session(name) }.run(job)));
+pub fn work(app: &App, name: &str, jobs: Receiver<(u64, Job)>) {
+    for (id, job) in jobs {
+        let done = catch_unwind(AssertUnwindSafe(|| Worker { app, name, s: app.session(name) }.run(id, job)));
         if done.is_err() {
             app.tell(name, Msg::Event(Event::Forming(false)));
             app.tell(name, Msg::Event(Event::End(Some("the session's thread failed; the server's output says why".into()))));
         }
-        app.tell(name, Msg::Done);
+        app.tell(name, Msg::Done(id));
     }
 }
 
@@ -101,10 +101,11 @@ impl Worker<'_> {
     /// The pages told that the log has grown, and to what length.
     fn logged(&self) { self.tell(Msg::Logged(self.s.count("messages"))) }
 
-    fn run(&self, job: Job) {
+    /// Job `id`.
+    fn run(&self, id: u64, job: Job) {
         match job {
-            Job::Say { text, page } => {
-                self.tell(Msg::Start(page));
+            Job::Say { text } => {
+                self.tell(Msg::Start(id));
                 self.event(Event::End(self.turn(text.as_deref()).err()));
                 if let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup) } // the turn's memories
             }
@@ -165,7 +166,7 @@ impl Worker<'_> {
         self.logged();
         let calls = reply["content"].arr().iter().filter(|b| b.kind() == "tool_use");
         let results = calls.map(|call| self.approve(&setup, call).map_or_else(|why| tools::result(call, Err(why.into())), |()| setup.tools.call(call)));
-        let results: Vec<Value> = results.inspect(|result| self.event(Event::Result(brief(result)))).collect();
+        let results: Vec<Value> = results.inspect(|result| self.event(Event::Result(brief(result.clone())))).collect();
         if results.is_empty() { return Ok(false) }
         append(s, &obj! {"participant" => "user", "content" => results}, cfg);
         self.logged();
