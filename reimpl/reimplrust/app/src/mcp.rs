@@ -15,7 +15,7 @@ use connectome::json::{self, sparse, Json, Value};
 use connectome::obj;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -34,23 +34,36 @@ struct Link {
     told: Sender<Told>,
 }
 
-/// What a server's thread is told: a request (its method and params, and where to answer), or what the
-/// thread reading the nth process started reads from its stdout: a message, or that it closed.
+/// What a server's thread is told: a request (its method and params, and where to answer); what the
+/// thread reading the nth process started reads from its stdout: a message, or that it closed; or to
+/// stop its process and itself.
 enum Told {
     Request(String, Value, Sender<Answer>),
     Read(u64, Value),
     Stopped(u64),
+    Quit,
 }
 
-/// The servers the config names, each with its tools listed; one that can't start is reported and left
-/// out.
+/// The servers the config names, each with its tools listed, all at once; one whose tools can't be
+/// listed is reported and stopped.
 pub fn servers(config: &Value, timeout: Duration) -> Vec<Server> {
-    config["mcpServers"].as_object().into_iter().flatten().filter_map(|(name, spec)| {
+    let links: Vec<Link> = config["mcpServers"].as_object().into_iter().flatten().map(|(name, spec)| {
         let (told, inbox) = channel();
-        let mut owner = Owner { spec: spec.clone(), timeout, me: told.clone(), stdin: None, started: 0, ids: 0, waiting: HashMap::new() };
-        std::thread::spawn(move || owner.run(&inbox));
-        let link = Link { name: name.clone(), told };
-        link.tools().inspect_err(|e| eprintln!("{e}")).ok().map(|tools| Server { link, tools })
+        let owner = Owner { spec: spec.clone(), timeout, me: told.clone(), running: None, started: 0, ids: 0, waiting: HashMap::new() };
+        std::thread::spawn(move || owner.run(inbox));
+        Link { name: name.clone(), told }
+    }).collect();
+    let listed: Vec<Result<Vec<Value>, String>> = std::thread::scope(|scope| {
+        let listing: Vec<_> = links.iter().map(|link| scope.spawn(|| link.tools())).collect();
+        listing.into_iter().map(|listing| listing.join().expect("a listing")).collect()
+    });
+    links.into_iter().zip(listed).filter_map(|(link, listed)| match listed {
+        Ok(tools) => Some(Server { link, tools }),
+        Err(e) => {
+            eprintln!("{e}");
+            let _ = link.told.send(Told::Quit);
+            None
+        }
     }).collect()
 }
 
@@ -92,46 +105,44 @@ impl Link {
     }
 }
 
-/// A server's thread: it owns the server's process (started at the first request, and again at the
-/// first after it stops; requests told meanwhile wait in its channel), its stdin, and the requests
+/// A server's thread: it owns the server's process and its stdin (started at the first request, and
+/// again at the first after it stops; requests told meanwhile wait in its channel), and the requests
 /// waiting for an answer, each with its deadline.
 struct Owner {
     spec: Value,
     timeout: Duration,
     me: Sender<Told>,
-    stdin: Option<ChildStdin>,
+    running: Option<(Child, ChildStdin)>,
     started: u64, // processes started, the last the one running
     ids: u64,
     waiting: HashMap<u64, (Sender<Answer>, Instant, String)>, // by id (from 1): where to answer, by when, the method
 }
 
 impl Owner {
-    fn run(&mut self, inbox: &Receiver<Told>) {
+    fn run(mut self, inbox: Receiver<Told>) {
         loop {
-            if let Some(told) = self.next(inbox) {
-                self.handle(told);
+            let soonest = self.waiting.values().map(|(_, by, _)| *by).min();
+            match inbox.recv_timeout(soonest.map_or(Duration::MAX, |by| by.saturating_duration_since(Instant::now()))) {
+                Ok(Told::Quit) => return self.stop(),
+                Ok(told) => self.handle(told),
+                Err(_) => self.expire(), // a deadline passed (the channel never closes: it holds `me`)
             }
         }
     }
 
-    /// The next thing told, or None once a deadline passes, failing the requests it passes.
-    fn next(&mut self, inbox: &Receiver<Told>) -> Option<Told> {
-        let soonest = self.waiting.values().map(|(_, by, _)| *by).min();
-        if let Ok(told) = inbox.recv_timeout(soonest.map_or(Duration::MAX, |by| by.saturating_duration_since(Instant::now()))) {
-            return Some(told);
-        }
+    /// The requests past their deadline failed, the server told to cancel each.
+    fn expire(&mut self) {
         let now = Instant::now();
         for (id, (answer, _, method)) in self.waiting.extract_if(|_, (_, by, _)| *by <= now).collect::<Vec<_>>() {
             let _ = self.send(&obj! {"jsonrpc" => "2.0", "method" => "notifications/cancelled", "params" => obj! {"requestId" => id, "reason" => "timed out"}});
             let _ = answer.send(Err(format!("{method} timed out after {} s", self.timeout.as_secs_f64())));
         }
-        None
     }
 
     fn handle(&mut self, told: Told) {
         match told {
             Told::Request(method, params, answer) => {
-                if self.stdin.is_none() && let Err(e) = self.start() {
+                if self.running.is_none() && let Err(e) = self.start() {
                     return drop(answer.send(Err(e)));
                 }
                 self.ids += 1;
@@ -154,17 +165,25 @@ impl Owner {
                 }
             }
             Told::Stopped(n) if n == self.started => {
-                self.stdin = None;
+                self.stop();
                 for (_, (answer, ..)) in self.waiting.drain() {
                     let _ = answer.send(Err("the server stopped".into()));
                 }
             }
-            Told::Read(..) | Told::Stopped(_) => {} // from a process that has gone
+            Told::Read(..) | Told::Stopped(_) | Told::Quit => {} // from a process that has gone (Quit: run's)
+        }
+    }
+
+    /// The server's process killed, if it runs, and waited for.
+    fn stop(&mut self) {
+        if let Some((mut child, _)) = self.running.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
     /// The server's process started and initialized (initialize, id 0). The thread that reads its
-    /// stdout hands over the answer, then tells the messages after it, and those before, to this one.
+    /// stdout tells this one the messages before the answer, hands over the answer, then tells the rest.
     fn start(&mut self) -> Result<(), String> {
         let mut command = Command::new(self.spec["command"].as_str().ok_or("no command")?);
         command.args(self.spec["args"].arr().iter().filter_map(Value::as_str));
@@ -172,31 +191,35 @@ impl Owner {
         let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
         self.started += 1;
         let (n, me, (hello, helloed)) = (self.started, self.me.clone(), channel());
-        let mut messages = BufReader::new(child.stdout.take().expect("piped")).lines().map_while(Result::ok).filter_map(|line| json::parse(line.as_bytes()).ok()); // a line that isn't JSON-RPC passed over
-        self.stdin = child.stdin.take();
+        let messages = BufReader::new(child.stdout.take().expect("piped")).lines().map_while(Result::ok).filter_map(|line| json::parse(line.as_bytes()).ok()); // a line that isn't JSON-RPC passed over
+        let stdin = child.stdin.take().expect("piped");
+        self.running = Some((child, stdin));
         std::thread::spawn(move || {
-            let answer = |m: &Value| m["id"] == 0 && m.get("method").is_none();
-            let _ = hello.send(messages.by_ref().find(|m| answer(m) || me.send(Told::Read(n, m.clone())).is_err()));
-            messages.for_each(|message| drop(me.send(Told::Read(n, message))));
+            let mut hello = Some(hello);
+            for message in messages {
+                match hello.take_if(|_| message["id"] == 0 && message.get("method").is_none()) {
+                    Some(hello) => drop(hello.send(message)),
+                    None => drop(me.send(Told::Read(n, message))),
+                }
+            }
             let _ = me.send(Told::Stopped(n));
-            let _ = child.wait();
         });
         let hello = obj! {"name" => "connectome-web", "version" => env!("CARGO_PKG_VERSION")};
         let initialize = obj! {"protocolVersion" => "2025-06-18", "capabilities" => obj! {}, "clientInfo" => hello};
         let ready = self.send(&obj! {"jsonrpc" => "2.0", "id" => 0, "method" => "initialize", "params" => initialize}).and_then(|()| match helloed.recv_timeout(self.timeout) {
-            Ok(Some(m)) => m.get("error").map_or(Ok(()), |e| Err(e["message"].as_str().unwrap_or("failed").into())),
+            Ok(m) => m.get("error").map_or(Ok(()), |e| Err(e["message"].as_str().unwrap_or("failed").into())),
             Err(RecvTimeoutError::Timeout) => Err(format!("initialize timed out after {} s", self.timeout.as_secs_f64())),
-            _ => Err("the server stopped".into()),
+            Err(RecvTimeoutError::Disconnected) => Err("the server stopped".into()),
         });
         let ready = ready.and_then(|()| self.send(&obj! {"jsonrpc" => "2.0", "method" => "notifications/initialized"}));
         if ready.is_err() {
-            self.stdin = None;
+            self.stop();
         }
         ready
     }
 
     fn send(&mut self, message: &Value) -> Result<(), String> {
-        let stdin = self.stdin.as_mut().ok_or("the server stopped")?;
+        let (_, stdin) = self.running.as_mut().ok_or("the server stopped")?;
         stdin.write_all(format!("{}\n", json::to_string(message)).as_bytes()).and_then(|()| stdin.flush()).map_err(|e| e.to_string())
     }
 }

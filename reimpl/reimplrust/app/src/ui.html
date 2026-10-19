@@ -73,7 +73,6 @@ form textarea { resize: vertical; min-height: 42px; }
 pre#detail { white-space: pre-wrap; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; font: 12px/1.4 ui-monospace, monospace; max-height: 40vh; overflow: auto; }
 @media (max-width: 900px) {
   main { grid-template-columns: 1fr; height: auto; }
-  aside, section { padding: 16px; }
   #chat { height: 80vh; }
 }
 </style>
@@ -126,11 +125,14 @@ pre#detail { white-space: pre-wrap; background: var(--panel); border: 1px solid 
 </main>
 <script>
 const $ = (id) => document.getElementById(id);
-let state = null, poll = null, providers = [], showing = null;   // showing: the turn this page follows
+let state = null, providers = [], showing = null;   // showing: the job this page follows
 const current = () => decodeURIComponent(location.hash.slice(1));   // the session the page shows
 
+// a POST as this server takes it: only its own page sends the header
+const post = (body, signal) => ({ method: 'POST', headers: { 'x-connectome': '1' }, body: JSON.stringify(body), signal });
+
 async function api(path, body) {
-  const r = await fetch(path, body ? { method: 'POST', headers: { 'x-connectome': '1' }, body: JSON.stringify(body) } : {});
+  const r = await fetch(path, body ? post(body) : {});
   const v = await r.json();
   if (v && v.error) throw new Error(v.error);
   return v;
@@ -162,15 +164,18 @@ $('sessions').addEventListener('toggle', (e) => {
   try { localStorage.setItem('folded', JSON.stringify([...folded])); } catch { /* no storage here: kept until the page reloads */ }
 }, true);
 
+// the session the page shows, and the job running in it as it goes on
 async function open() {
   showing?.abort();
-  state = await api(`/api/s/${current()}`);
-  await showLog();
-  drawMemory();
-  fill();
-  listSessions();
-  setStatus();
-  if (state.running) follow(fetch(`/api/s/${current()}/live`, { signal: (showing = new AbortController()).signal }));
+  try {
+    state = await api(`/api/s/${current()}`);
+    await showLog();
+    drawMemory();
+    fill();
+    listSessions();
+    setStatus();
+    if (state.running) follow(fetch(`/api/s/${current()}/live`, { signal: (showing = new AbortController()).signal }));
+  } catch (err) { setStatus(err.message, true); }
 }
 
 // the log's newest messages, up to the nth if given, each as the context shows it (in the raw tail,
@@ -232,7 +237,7 @@ $('session').onsubmit = async (e) => {
 function setStatus(text, warn) {
   const s = $('status');
   s.className = warn || (state && (state.refused || state.problem)) ? 'warn' : '';
-  s.textContent = text || (state && (state.problem || (state.refused ? 'The summarizer refused; memory formation is stopped until surgery.' : state.forming ? 'Forming memories…' : '')));
+  s.textContent = text || (state && (state.problem || (state.refused ? 'The summarizer refused; memory formation is stopped until surgery.' : '')));
 }
 
 function drawMemory() {
@@ -308,14 +313,15 @@ function turn(text) {
   if (!current()) return;
   showing?.abort();
   showing = new AbortController();
-  follow(fetch(`/api/s/${current()}/${text ? 'say' : 'continue'}`, { method: 'POST', headers: { 'x-connectome': '1' }, body: JSON.stringify({ text }), signal: showing.signal }));
+  follow(fetch(`/api/s/${current()}/${text ? 'say' : 'continue'}`, post({ text }, showing.signal)));
 }
 
-// a turn as it streams, JSON lines: {"logged": n} each time the log grows (the page shows it, then what
+// a job as it streams, JSON lines: {"logged": n} each time the log grows (the page shows it, then what
 // it doesn't hold yet below it), {"thinking"} or {"text"} for each piece of a reply, then for each call
 // the logged reply makes {"approve"} when it asks to run, {"answered"} once a page answers and its
-// {"result"}; then {"ok"} or {"error"}; then the session as the turn leaves it. Opening a session
-// stops it showing.
+// {"result"}; {"forming"} as memories start and stop forming; {"ok"} or {"error"} when the turn ends,
+// and the stream once its memories have formed; then the session as the job leaves it. Opening a
+// session stops it showing.
 async function follow(response) {
   setStatus('Waiting for the model…');
   let error = null;
@@ -339,8 +345,11 @@ async function follow(response) {
       if (event.approve) $(`call-${event.approve}`).insertAdjacentHTML('beforeend', '<div class="ask"><button data-answer="allow">Allow</button><button data-answer="always">Always allow</button><button data-answer="deny">Deny</button></div>');
       if (event.answered) $(`call-${event.answered}`).querySelector('.ask')?.remove();
       if (event.result) draw($('reply'), event.result);
-      if (event.error) error = event.error;
-      setStatus(event.approve ? 'Waiting for you to allow or deny the call…' : '');
+      if (event.ok || event.error) {   // the turn has ended: the log as it leaves it, while its memories form
+        error = event.error ?? null;
+        await showLog();
+      }
+      setStatus(event.approve ? 'Waiting for you to allow or deny the call…' : event.forming ? 'Forming memories…' : '');
       $('log').scrollTop = $('log').scrollHeight;
     };
     for (;;) {
@@ -355,7 +364,7 @@ async function follow(response) {
     error = err.message;
   }
   await open();
-  if (error) setStatus(error, true); else watch();
+  if (error) setStatus(error, true);
 }
 
 // the providers sessions choose from, each a base URL and a key the page never sees; a click on one edits it
@@ -393,16 +402,6 @@ $('create').onsubmit = async (e) => {
   } catch (err) { alert(err.message); }
 };
 
-// While memories form, the page checks back for them.
-function watch() {
-  clearInterval(poll);
-  poll = setInterval(async () => {
-    state = await api(`/api/s/${current()}`);
-    drawMemory();
-    setStatus();
-    if (!state.forming) { clearInterval(poll); open(); }
-  }, 1500);
-}
 
 window.onhashchange = () => current() && open();
 loadProviders();

@@ -17,14 +17,20 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use wait_timeout::ChildExt;
 
 const KEPT: u64 = 12_000; // bytes of output kept from each end
 const DEFAULT_TIMEOUT: f64 = 120.0;
 const SHELL: [&str; 2] = if cfg!(windows) { ["cmd", "/C"] } else { ["bash", "-c"] };
 
+/// bash in `dir`, a call's command killed past `limit`, in `sandbox` if given (bubblewrap, so Linux
+/// only: elsewhere bash is unavailable).
 pub fn tool(dir: PathBuf, limit: Duration, sandbox: Option<Sandbox>) -> Toolbox {
-    let mut description = format!("Run a command in {} in {} and get its output (stdout and stderr together; the middle is cut out past {} characters) \
+    if sandbox.is_some() && !cfg!(target_os = "linux") {
+        return unavailable("its sandbox is bubblewrap, which runs only on Linux");
+    }
+    let mut description = format!("Run a command in {} in {} and get its output (stdout and stderr together; the middle is cut out past {} bytes) \
         and exit code. Each call starts a new shell, so cd and variables don't carry over. Background processes keep running.", SHELL[0], dir.display(), 2 * KEPT);
     if let Some(b) = &sandbox {
         let network = if b.network { "" } else { ", and has no network" };
@@ -53,22 +59,13 @@ fn run(dir: &Path, input: &Value, limit: Duration, sandbox: Option<&Sandbox>) ->
     let out = File::create(&path).map_err(|e| format!("bash: {e}"))?;
     let mut shell = Command::new(if sandbox.is_some() { "bwrap" } else { SHELL[0] });
     if let Some(b) = sandbox {
-        if !cfg!(target_os = "linux") {
-            return Err("the sandbox is bubblewrap, which runs only on Linux".into());
-        }
         shell.args(bwrap(dir, b)).arg(SHELL[0]);
     }
     shell.args([SHELL[1], command]).current_dir(dir).stdin(Stdio::null()).stderr(out.try_clone().map_err(|e| format!("bash: {e}"))?).stdout(out);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut shell, 0);
     let mut child = shell.spawn().map_err(|e| format!("{}: {e}", shell.get_program().to_string_lossy()))?;
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            done => break done.ok().flatten(),
-        }
-    };
+    let status = child.wait_timeout(timeout).ok().flatten();
     if status.is_none() {
         #[cfg(unix)]
         unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) }; // its process group: the command and what it started

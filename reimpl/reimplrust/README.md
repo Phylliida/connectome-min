@@ -39,7 +39,8 @@ since one holds the keys:
 
 Tools: the model can call `bash` (built in: a command in a new shell in the session's workspace, or
 `cmd` on Windows; `--no-bash` leaves it out) and the tools
-of the MCP servers in `ROOT/mcp.json` (or `--mcp FILE`), in the usual format:
+of the MCP servers in `ROOT/mcp.json` (or `--mcp FILE`), listed all at once at startup (one whose tools
+can't be listed is stopped), in the usual format:
 
 ```json
 {"mcpServers": {"NAME": {"command": "...", "args": ["..."], "env": {"KEY": "..."}}}}
@@ -63,11 +64,13 @@ is cancelled without holding up the server's next call; a server that stops star
 call. A turn takes steps, a model request each, until a reply calls no tools (at most 64), and the page
 shows each call as a card on its reply, which its result then joins. A turn's log is the session's: a
 page following a turn shows the log as it grows, read from disk, and besides it only what the log
-doesn't hold yet (a reply streaming in, the questions whether its calls may run, their results),
-which is all the app keeps of a turn. A page opened while
+doesn't hold yet (a reply streaming in, the questions whether its calls may run, their results,
+memories forming), which is all the app keeps of a turn; its stream ends once the turn's memories
+have formed. A page opened while
 a turn runs (after a reload, or on another device) follows it the same way, and answers its questions;
 the turn runs on whether any page follows it or not, on a thread of its session's, and a message sent
-while it runs waits for it. The page's Continue button runs a turn without a message: after an
+while it runs waits for it. A turn on a log edited into something the library can't read fails, and
+the session goes on once the log is mended. The page's Continue button runs a turn without a message: after an
 interruption (a failed request, the 64 steps, a restart) the model goes on from the log as it is, and
 after a reply cut short it goes on from that reply (the request ends with it, as a prefill). Tool sources compose as a monoid: a later source's tool shadows an earlier
 one of the same name. Every request carries the system prompt and the tool definitions, so their
@@ -80,7 +83,7 @@ Flags: `--root DIR` (sessions and settings; `sessions` by default), `--addr` (`1
 `--ca PEM` (root certificates to trust instead of Mozilla's: a company proxy's, a test server's),
 `--mcp FILE`, `--tool-timeout SECONDS`, `--no-bash`, and `--no-open` (else the page opens in the
 browser). The server answers only its own page: requests must name it as their Host, and POSTs must
-carry its `x-connectome` header.
+carry its `x-connectome` header. A request's body takes 32 MiB at most.
 
 Tests:
 
@@ -92,5 +95,5 @@ python3 tests/mutants.py tests/test_app.py app/src/main.rs=mutants.json   # muta
 ```
 
 The three take under 30 seconds together. A batch of mutants takes about as long as its slowest one
-(55 of them, under 40 seconds): they build without link-time optimization, from a build kept in
+(66 of them, under a minute): they build without link-time optimization, from a build kept in
 `target/mutants`.

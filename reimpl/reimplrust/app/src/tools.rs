@@ -18,7 +18,7 @@ pub type Outcome = Result<Value, Value>;
 pub struct Tool {
     pub definition: Value,
     pub asks: bool,
-    pub run: Box<dyn Fn(&Value) -> Outcome + Send + Sync>,
+    pub run: Box<dyn Fn(&Value) -> Outcome>,
 }
 
 impl Tool {

@@ -12,7 +12,6 @@ use connectome::turns::Turn;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use ureq::tls::{PemItem, TlsConfig};
 
-#[derive(Clone)]
 pub struct Llm {
     pub base: String, // e.g. https://api.anthropic.com
     pub key: String,
@@ -71,7 +70,7 @@ impl Llm {
             Err(e) => Some(Err(e.to_string())),
         });
         let mut events = data.take_while(|d| d.as_deref() != Ok("[DONE]"));
-        events.try_fold(Reply::default(), |reply, d| reply.event(&json::parse(d?.as_bytes())?, &mut piece)).map(Reply::done)
+        events.try_fold(Reply::default(), |reply, d| reply.event(&json::parse(d?.as_bytes())?, &mut piece)).and_then(Reply::done)
     }
 }
 
@@ -128,12 +127,16 @@ impl Reply {
         Ok(self)
     }
 
-    fn done(self) -> Value {
-        obj! {
+    /// The reply, once it has stopped: a stream that ends before its stop reason was cut off.
+    fn done(self) -> Result<Value, String> {
+        if self.stop.is_null() {
+            return Err("the reply's stream ended before the reply did".into());
+        }
+        Ok(obj! {
             "stopReason" => self.stop,
             "content" => self.blocks.iter().filter_map(from_api).collect::<Vec<_>>(),
             "usage" => obj! {"inputTokens" => self.input, "outputTokens" => self.output},
-        }
+        })
     }
 }
 
@@ -182,7 +185,7 @@ fn write_body(out: &mut impl Write, head: &Value, turns: &[Turn], reader: &mut R
     let sent = turns.iter().map(|t| (t, t.content.iter().filter(|b| SENT.contains(&b.kind.as_str()) && !b.blank).collect::<Vec<_>>()));
     let turns: Vec<(&Turn, Vec<&Block>)> = sent.filter(|(_, blocks)| !blocks.is_empty()).collect();
     let head = json::to_string(head);
-    write!(out, "{},\"messages\":[", &head[..head.len() - 1])?;
+    write!(out, "{},\"messages\":[", &head[..head.len() - 1])?; // the head's fields without its closing brace
     for (i, run) in turns.chunk_by(|(a, _), (b, _)| (a.participant == "assistant") == (b.participant == "assistant")).enumerate() {
         let role = if run[0].0.participant == "assistant" { "assistant" } else { "user" };
         write!(out, "{}{{\"role\":\"{role}\",\"content\":[", if i > 0 { "," } else { "" })?;

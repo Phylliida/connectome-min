@@ -21,13 +21,11 @@ mod settings;
 mod tools;
 
 use connectome::blocks::density_tokens;
-use connectome::drive::{append, compile, current, drive};
-use connectome::emit::Reader;
-use connectome::estimate::Calibration;
+use connectome::drive::{append, current, drive};
+use connectome::emit::{select, Reader};
 use connectome::json::{self, sparse, Json, Value};
 use connectome::memory::{Host, Request};
 use connectome::obj;
-use connectome::planner::{chunks, Node};
 use connectome::store::Session;
 use llm::Llm;
 use serde::de::DeserializeOwned;
@@ -37,6 +35,7 @@ use tools::Toolbox;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
@@ -62,9 +61,9 @@ enum Routed {
 }
 
 /// A job for a session's thread: a turn with a message, or without (None) one that continues the log,
-/// which `page` follows, `started` once it starts or why it can't; or a fork at message `at` as `name`.
+/// which `page` follows; or a fork at message `at` as `name`.
 enum Job {
-    Say { text: Option<String>, page: Sender<String>, started: Sender<Result<(), String>> },
+    Say { text: Option<String>, page: Sender<String> },
     Fork { at: u64, name: String, reply: Sender<Result<(), String>> },
 }
 
@@ -72,22 +71,28 @@ enum Job {
 enum Msg {
     /// A job for the session's thread, which does them in the order they come.
     Job(Job),
-    /// A page that follows the turn running; with none, its stream ends at once.
+    /// A page that follows the job running; with none, its stream ends at once.
     Follow(Sender<String>),
     /// A page's answer whether call `id` may run: allow, always (its tool, from then on) or deny.
     Approve { id: String, answer: String, reply: Sender<Result<(), String>> },
-    /// Whether a turn runs, and whether memories are forming.
-    Status(Sender<(bool, bool)>),
-    /// A change to the session's settings (tune).
-    Tune(Value, Sender<Result<(), String>>),
-    // from the session's thread: a turn starts, which `page` follows; an event for the pages ({"logged"}
-    // when the log grows); a call's question and where to answer it (Ok: it runs); whether memories
-    // are forming; the turn's end
+    /// Whether a job runs.
+    Status(Sender<bool>),
+    /// A change to the session's settings (tune), and whether its memories have merged.
+    Tune(Value, bool, Sender<Result<(), String>>),
+    /// From the session's thread: a turn starts, which `page` follows.
     Start(Sender<String>),
+    /// From the session's thread: the log has grown to this many messages.
+    Logged(u64),
+    /// From the session's thread: an event for the pages.
     Event(Value),
+    /// From the session's thread: a call's question, and where to answer it (Ok: it runs).
     Ask { id: String, tool: String, answer: Sender<Result<(), String>> },
+    /// From the session's thread: whether memories are forming.
     Forming(bool),
+    /// From the session's thread: the turn's end, {"ok"} or {"error"}.
     End(Value),
+    /// From the session's thread: the job is done, its memories formed.
+    Done,
 }
 
 /// The hub's thread. It owns what changes quickly, so each is told one thing at a time: settings.json
@@ -115,15 +120,18 @@ fn ask_session<T>(app: &App, name: &str, msg: impl FnOnce(Sender<T>) -> Msg) -> 
     ask(app, |reply| Routed::To(name.into(), msg(reply)))
 }
 
-/// A session as the hub knows it: where its thread takes jobs, and what the pages following its turn
-/// see: whether one runs and memories are forming, the events since the log last grew (the first its
-/// length; then a reply streaming in, the questions whether the step's calls may run, the answers, the
-/// calls' results), the pages, and the calls waiting for an answer. What the log holds it drops, so it
-/// holds a step at most.
+/// Tells the hub something about a session that wants no answer.
+fn tell_session(app: &App, name: &str, msg: Msg) {
+    app.hub.send(Routed::To(name.into(), msg)).expect("the hub runs");
+}
+
+/// A session as the hub knows it: where its thread takes jobs, and what the pages following its job see:
+/// whether one runs (a turn, then its memories forming), the events since the log last grew (the first its length; then a reply streaming in, the questions whether the step's
+/// calls may run, the answers, the calls' results, the memories forming, the turn's end), the pages,
+/// and the calls waiting for an answer. What the log holds it drops, so it holds a step at most.
 struct Live {
     jobs: Sender<Job>,
     running: bool,
-    forming: bool,
     events: Vec<String>, // JSON lines
     pages: Vec<Sender<String>>,
     asked: HashMap<String, (String, Sender<Result<(), String>>)>, // by call id: its tool, where to answer
@@ -135,7 +143,7 @@ impl Live {
         let (jobs, queue) = channel();
         let (name, hub) = (name.to_string(), app.hub.clone());
         std::thread::spawn(move || work(app, &name, queue, &|msg| drop(hub.send(Routed::To(name.clone(), msg)))));
-        Live { jobs, running: false, forming: false, events: vec![], pages: vec![], asked: HashMap::new() }
+        Live { jobs, running: false, events: vec![], pages: vec![], asked: HashMap::new() }
     }
 
     fn handle(&mut self, app: &App, name: &str, msg: Msg) {
@@ -157,36 +165,36 @@ impl Live {
                 self.send(&obj! {"answered" => id, "answer" => answer});
                 let _ = reply.send(Ok(()));
             }
-            Msg::Status(reply) => drop(reply.send((self.running, self.forming))),
-            Msg::Tune(v, reply) => drop(reply.send(tune(app, name, &v))),
+            Msg::Status(reply) => drop(reply.send(self.running)),
+            Msg::Tune(v, merged, reply) => drop(reply.send(tune(app, name, &v, merged))),
             Msg::Start(page) => (self.running, self.events, self.pages) = (true, vec![], vec![page]),
+            Msg::Logged(n) => {
+                self.events.clear();
+                self.send(&obj! {"logged" => n});
+            }
             Msg::Event(event) => self.send(&event),
             Msg::Ask { id, tool, answer } => {
                 self.send(&obj! {"approve" => id.as_str()});
                 self.asked.insert(id, (tool, answer));
             }
-            Msg::Forming(on) => self.forming = on,
+            Msg::Forming(on) => self.send(&obj! {"forming" => on}),
             Msg::End(end) => {
                 self.send(&end);
-                (self.running, self.pages) = (false, vec![]);
                 self.asked.clear();
             }
+            Msg::Done => (self.running, self.pages) = (false, vec![]),
         }
     }
 
-    /// An event to the pages following the turn, kept for those that come later; the log's length
-    /// starts the events afresh.
+    /// An event to the pages following the job, kept for those that come later.
     fn send(&mut self, event: &Value) {
         let line = format!("{}\n", json::to_string(event));
         self.pages.retain(|page| page.send(line.clone()).is_ok());
-        if event.get("logged").is_some() {
-            self.events.clear();
-        }
         self.events.push(line);
     }
 }
 
-/// A turn to a page as it happens, a JSON line each (Live), until the hub stops sending.
+/// A job to a page as it happens, a JSON line each (Live), until the hub stops sending.
 fn show(page: &mut TcpStream, lines: Receiver<String>) {
     let _ = page.set_write_timeout(Some(PAGE_WAIT));
     let _ = std::iter::once(head("200 OK", "application/x-ndjson", None)).chain(lines).try_for_each(|line| page.write_all(line.as_bytes()));
@@ -195,28 +203,27 @@ fn show(page: &mut TcpStream, lines: Receiver<String>) {
 /// How long a page may keep a write waiting before it's left behind.
 const PAGE_WAIT: Duration = Duration::from_secs(30);
 
-/// What a session's step runs with: its settings, the model client and tools they give, and the
-/// tokens the system prompt and tool definitions take, which every request carries.
+/// What a session's step runs with: its settings, the model client and tools they give, the tools'
+/// definitions, and the tokens the system prompt and those take, which every request carries.
 struct Setup {
     settings: SessionSettings,
     llm: Llm,
     tools: Toolbox,
+    definitions: Option<Value>,
     overhead: f64,
 }
 
 /// The summarizer's host: the session's model unless the library names one, and the agent's tools,
 /// which the library sends with tool choice "none" so a memory's request can carry tool blocks; no
 /// system prompt.
-struct Summarizer<'a>(&'a Setup, Option<Value>);
-
-impl Host for Summarizer<'_> {
-    fn tools(&self) -> Option<&Value> { self.1.as_ref() }
+impl Host for &Setup {
+    fn tools(&self) -> Option<&Value> { self.definitions.as_ref() }
 
     fn complete(&mut self, request: &Request, reader: &mut Reader) -> Result<Value, String> {
-        let model = if request.model.is_empty() { &self.0.settings.model } else { &request.model };
+        let model = if request.model.is_empty() { &self.settings.model } else { &request.model };
         let none = request.tools.as_ref().map(|_| obj! {"type" => "none"});
         let head = sparse(obj! {"model" => model.as_str(), "max_tokens" => request.max_tokens, "tools" => request.tools.clone(), "tool_choice" => none});
-        self.0.llm.messages(head, &request.messages, reader, |_, _| {})
+        self.llm.messages(head, &request.messages, reader, |_, _| {})
     }
 }
 
@@ -247,7 +254,7 @@ fn main() {
     }));
     if !global_path(app).exists() {
         let tools = if app.bash { bash::tool(PathBuf::new(), limit, None) } else { Toolbox::default() } + mcp::toolbox(&app.mcp);
-        settings::write(&global_path(app), &Settings::first(overhead(None, &tools))).expect("settings.json");
+        settings::write(&global_path(app), &Settings::first(overhead(None, &tools.definitions()))).expect("settings.json");
     }
     std::thread::spawn(move || hub(app, inbox));
     let listener = TcpListener::bind(&app.addr).expect("--addr");
@@ -274,17 +281,23 @@ fn handle(app: &App, mut stream: TcpStream) -> std::io::Result<()> {
     let field = |h: String| h.split_once(':').map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()));
     let headers: Vec<(String, String)> = lines.take_while(|h| !h.is_empty()).filter_map(field).collect();
     let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
-    let length = header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0usize).min(1 << 20);
-    let body = {
-        let mut raw = vec![0; length];
-        reader.read_exact(&mut raw)?;
-        json::parse(&raw).unwrap_or(Value::Null)
-    };
-    // read first even when refused: a socket closed with a request unread resets, and the refusal can be lost
+    let length = header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0u64);
+    let mut raw = vec![];
+    (&mut reader).take(length.min(BODY_LIMIT)).read_to_end(&mut raw)?;
+    // read whole even when refused: a socket closed with a request unread resets, and the refusal can be lost
+    std::io::copy(&mut (&mut reader).take(length.saturating_sub(BODY_LIMIT)), &mut std::io::sink())?;
     let port = app.addr.rsplit(':').next().unwrap_or("");
     if ![app.addr.as_str(), &format!("localhost:{port}")].contains(&header("host").unwrap_or("")) || method == "POST" && header("x-connectome").is_none() {
-        return send(&mut stream, "403 Forbidden", "text/plain", b"this server answers only its own page");
+        return fail(&mut stream, "403 Forbidden", "this server answers only its own page");
     }
+    if length > BODY_LIMIT {
+        return fail(&mut stream, "413 Content Too Large", &format!("a request's body takes {} MiB at most", BODY_LIMIT >> 20));
+    }
+    let body = match json::parse(&raw) {
+        Ok(body) => body,
+        Err(_) if raw.is_empty() => Value::Null,
+        Err(e) => return fail(&mut stream, "400 Bad Request", &format!("the request's body: {e}")),
+    };
     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
     let param = |name: &str| query.split('&').find_map(|kv| kv.strip_prefix(name)?.strip_prefix('=')?.parse::<u64>().ok());
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
@@ -301,9 +314,12 @@ fn handle(app: &App, mut stream: TcpStream) -> std::io::Result<()> {
     match reply {
         Ok(None) => Ok(()),
         Ok(Some(v)) => send(&mut stream, "200 OK", "application/json", json::to_string(&v).as_bytes()),
-        Err(e) => send(&mut stream, "400 Bad Request", "application/json", json::to_string(&obj! {"error" => e}).as_bytes()),
+        Err(e) => fail(&mut stream, "400 Bad Request", &e),
     }
 }
+
+/// The largest request body: a message pasted whole.
+const BODY_LIMIT: u64 = 32 << 20;
 
 /// A session's name: letters, digits, - and _.
 fn named(name: &str) -> bool {
@@ -321,11 +337,17 @@ fn send(stream: &mut TcpStream, status: &str, kind: &str, body: &[u8]) -> std::i
     stream.write_all(body)
 }
 
-/// A JSON array to the page as its items are read, never held whole.
-fn send_all(stream: &mut TcpStream, items: impl Iterator<Item = Value>) -> Result<Option<Value>, String> {
-    stream.write_all(head("200 OK", "application/json", None).as_bytes()).map_err(|e| e.to_string())?;
-    let mut out = serde_json::Serializer::with_formatter(BufWriter::new(stream), json::Js);
-    out.collect_seq(items).map(|()| None).map_err(|e| e.to_string())
+/// A refusal the page shows: {"error": why}.
+fn fail(stream: &mut TcpStream, status: &str, why: &str) -> std::io::Result<()> {
+    send(stream, status, "application/json", json::to_string(&obj! {"error" => why}).as_bytes())
+}
+
+/// A JSON array to the page as its items are read, never held whole; past the head, a failure can only
+/// end it early.
+fn send_all(stream: &mut TcpStream, items: impl Iterator<Item = Value>) {
+    if stream.write_all(head("200 OK", "application/json", None).as_bytes()).is_ok() {
+        let _ = serde_json::Serializer::with_formatter(BufWriter::new(stream), json::Js).collect_seq(items);
+    }
 }
 
 /// A session's routes: the JSON to answer with, or None once the route has answered, streaming.
@@ -336,32 +358,46 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, par
         ("GET", []) => Ok(Some(state(app, name, &s))),
         ("GET", ["messages"]) => {
             let (from, messages) = listing(&s, "messages", 200, param);
-            let class = shown_as(&s, profile(app, name)?.config.merge_threshold, from);
-            send_all(stream, messages.map(|m| shown(&m, class(m.id()))))
+            let class = shown_as(&s, from);
+            send_all(stream, messages.map(|m| shown(&m, class(m.id()))));
+            Ok(None)
         }
-        ("GET", ["layer", n]) => send_all(stream, listing(&s, &format!("layer{n}"), u64::MAX, param).1),
+        ("GET", ["layer", n]) => {
+            send_all(stream, listing(&s, &format!("layer{n}"), u64::MAX, param).1);
+            Ok(None)
+        }
         ("POST", ["fork"]) => {
             let at = body["at"].as_f64().ok_or("fork at which message?")? as u64;
             let fork = body["name"].as_str().filter(|f| named(f)).ok_or("a fork's name")?;
-            if app.root.join(fork).exists() || at >= s.count("messages") {
-                return Err(format!("can't fork {name} at {at} as {fork}"));
+            if at >= s.count("messages") {
+                return Err(format!("can't fork {name} at {at}: it has {} messages", s.count("messages")));
             }
             ask_session(app, name, |reply| Msg::Job(Job::Fork { at, name: fork.into(), reply }))?;
             Ok(Some(state(app, fork, &Session::open(app.root.join(fork)))))
         }
         ("POST", ["settings"]) => {
-            ask_session(app, name, |reply| Msg::Tune(body.clone(), reply))?;
+            let merged = s.count("layer2") > 0;
+            ask_session(app, name, |reply| Msg::Tune(body.clone(), merged, reply))?;
             Ok(Some(state(app, name, &s)))
         }
         ("POST", [said @ ("say" | "continue")]) => {
-            let (text, (page, lines)) = ((*said == "say").then(|| body["text"].as_str().unwrap_or("").to_string()), channel());
-            ask_session(app, name, |started| Msg::Job(Job::Say { text, page, started }))?;
+            let text = (*said == "say").then(|| body["text"].as_str().unwrap_or("").to_string());
+            let empty = match &text {
+                Some(text) => text.trim().is_empty(),
+                None => s.count("messages") == 0,
+            };
+            if empty {
+                return Err("say something".into());
+            }
+            profile(app, name)?;
+            let (page, lines) = channel();
+            tell_session(app, name, Msg::Job(Job::Say { text, page }));
             show(stream, lines);
             Ok(None)
         }
         ("GET", ["live"]) => {
             let (page, lines) = channel();
-            app.hub.send(Routed::To(name.into(), Msg::Follow(page))).expect("the hub runs");
+            tell_session(app, name, Msg::Follow(page));
             show(stream, lines);
             Ok(None)
         }
@@ -376,50 +412,51 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, par
 
 /// Records `from` to `to` of a file (by default, its newest `newest`), as they're read, and `from`.
 fn listing<'s>(s: &'s Session, file: &str, newest: u64, param: impl Fn(&str) -> Option<u64>) -> (u64, Box<dyn Iterator<Item = Value> + 's>) {
-    let n = s.count(file);
-    let (from, to) = (param("from").unwrap_or(n.saturating_sub(newest)), param("to").unwrap_or(n).min(n));
+    let to = param("to").map_or(s.count(file), |to| to.min(s.count(file)));
+    let from = param("from").unwrap_or(to.saturating_sub(newest));
     (from, if from < to { s.span(file, from, to - 1) } else { Box::new(std::iter::empty()) })
 }
 
-/// How the last compile's context shows each message from `from` on: in the raw tail ("tail"), in a
-/// chunk shown raw ("raw"), or through a memory ("recalled"). Only the chunks that end at `from` or
-/// later are read, from the end.
-fn shown_as(s: &Session, k: u64, from: u64) -> impl Fn(u64) -> &'static str {
-    let frontier: Vec<Node> = s.last("compiles").map_or(vec![], |c| c["frontier"].arr().iter().map(|n| (n.arr()[0].u64(), n.arr()[1].u64())).collect());
-    let near: Vec<(u64, Value)> = (0..s.count("layer0")).rev().map(|j| (j, s.read("layer0", j))).take_while(|(_, c)| c["last"].u64() >= from).collect();
-    move |i| match near.iter().find(|(_, c)| c["first"].u64() <= i && i <= c["last"].u64()) {
-        None => "tail",
-        Some((j, _)) if frontier.iter().any(|&(level, p)| level > 0 && chunks((level, p), k).contains(j)) => "recalled",
-        Some(_) => "raw",
-    }
+/// How the last compile's context shows each message from `from` on: in the raw tail, past the chunks
+/// ("tail"), through a memory the context shows ("recalled"), or in a raw chunk ("raw"). Only the
+/// memories that reach `from` are read, from the end.
+fn shown_as(s: &Session, from: u64) -> impl Fn(u64) -> &'static str {
+    let chunked = s.last("layer0").map_or(0, |c| c["last"].u64() + 1);
+    let frontier = s.last("compiles").map_or(vec![], |c| c["frontier"].arr().iter().map(|n| (n[0].u64(), n[1].u64())).collect());
+    let memories = frontier.into_iter().rev().filter(|&(level, _)| level > 0).map(|(level, p)| s.read(&format!("layer{level}"), p));
+    let recalled: Vec<(u64, u64)> = memories.map(|m| (m["first"].u64(), m["last"].u64())).take_while(|&(_, last)| last >= from).collect();
+    move |i| if i >= chunked { "tail" } else if recalled.iter().any(|&(first, last)| (first..=last).contains(&i)) { "recalled" } else { "raw" }
 }
 
 /// A session's thread: it does its jobs one at a time, in the order they come (a message or fork told
 /// during a turn waits for it), the only one to write the session's log, and keeps the last request's
-/// prompt size, which calibrates the next compile.
+/// prompt size, which calibrates the next compile. A job that panics (a file edited into something the
+/// library can't read) fails, and the next runs.
 fn work(app: &App, name: &str, jobs: Receiver<Job>, tell: &dyn Fn(Msg)) {
     let mut usage = None;
     for job in jobs {
-        let s = Session::open(app.root.join(name));
-        match job {
-            Job::Say { text, page, started } => {
-                let ready = match &text {
-                    Some(text) if text.trim().is_empty() => Err("say something".into()),
-                    None if s.count("messages") == 0 => Err("say something".into()),
-                    _ => profile(app, name).map(drop),
-                };
-                let go = ready.is_ok();
-                let _ = started.send(ready);
-                if go {
+        let done = catch_unwind(AssertUnwindSafe(|| {
+            let s = Session::open(app.root.join(name));
+            match job {
+                Job::Say { text, page } => {
                     tell(Msg::Start(page));
                     turn(app, name, &s, text.as_deref(), &mut usage, tell);
                 }
+                Job::Fork { at, name: fork, reply } => {
+                    let path = app.root.join(&fork); // claimed here, when the fork is made
+                    let made = std::fs::create_dir(&path).map_err(|e| format!("can't fork {name} as {fork}: {e}"));
+                    let _ = reply.send(made.and_then(|()| {
+                        Session::fork(&s, at, path);
+                        settings::write(&profile_path(app, &fork), &profile(app, name)?)
+                    }));
+                }
             }
-            Job::Fork { at, name: fork, reply } => {
-                Session::fork(&s, at, app.root.join(&fork));
-                let _ = reply.send(profile(app, name).and_then(|p| settings::write(&profile_path(app, &fork), &p)));
-            }
+        }));
+        if done.is_err() {
+            tell(Msg::Forming(false));
+            tell(Msg::End(obj! {"error" => "the session's thread failed; the server's output says why"}));
         }
+        tell(Msg::Done);
     }
 }
 
@@ -440,11 +477,6 @@ fn turn(app: &App, name: &str, s: &Session, text: Option<&str>, usage: &mut Opti
     }
 }
 
-/// The log's length, for the pages, which read the log up to it.
-fn logged(s: &Session) -> Msg {
-    Msg::Event(obj! {"logged" => s.count("messages")})
-}
-
 /// Steps a turn may take, a model request each, before it stops.
 const MAX_STEPS: usize = 64;
 
@@ -453,7 +485,7 @@ fn steps(app: &App, name: &str, s: &Session, text: Option<&str>, usage: &mut Opt
     if let Some(text) = text {
         append(s, &obj! {"participant" => "user", "content" => vec![obj! {"type" => "text", "text" => text}]}, &profile(app, name)?.config);
     }
-    tell(logged(s));
+    tell(Msg::Logged(s.count("messages")));
     for _ in 0..MAX_STEPS {
         if !step(app, name, s, usage, tell)? {
             return Ok(());
@@ -469,22 +501,27 @@ fn step(app: &App, name: &str, s: &Session, usage: &mut Option<f64>, tell: &dyn 
     let setup = setup(app, name)?;
     let (cfg, reserve) = (&setup.settings.config, setup.settings.reserve);
     let (reported, last) = (usage.take(), current(s));
-    let calibration = reported.into_iter().fold(last, Calibration::observe);
     // how much bigger the last request's context was than its compile thought, in a sample calibration
     // learns from: calibration takes steps to catch up, and the context compiles that much smaller meanwhile
     let lag = reported.map(|u| u / last.armed).filter(|r| (1.0..=1.8).contains(r)).unwrap_or(1.0);
-    // what the context compiles to: the window less what every request carries, smaller by the lag, so
-    // the request and its answer fit even at the library's grace over budget
-    let budget = (setup.settings.window - setup.overhead - reserve) / lag / (1.0 + cfg.over_budget_grace) + reserve;
-    let attempt = |calibration| compile(s, budget, reserve, budget, calibration, cfg);
+    // what the context compiles to: the window less what every request carries and the reply, smaller by
+    // the lag, so the request and its answer fit even at the library's grace over budget
+    let w = (setup.settings.window - setup.overhead - reserve) / lag / (1.0 + cfg.over_budget_grace);
+    let mut compiled = select(s, w, reported.map_or(last, |u| last.observe(u)), cfg);
     // a refusal escalates the session, so the memory the context waits for forms at once; then it compiles again, up to 3 times
-    let compiled = (0..3).fold(attempt(calibration), |compiled, _| compiled.or_else(|_| { form(tell, name, s, &setup); attempt(current(s)) }));
+    for _ in 0..3 {
+        if compiled.is_ok() {
+            break;
+        }
+        form(tell, name, s, &setup);
+        compiled = select(s, w, current(s), cfg);
+    }
     let turns = compiled.map_err(|r| format!("{}: {} tokens over a budget of {}", r.stage, r.actual, r.budget))?;
-    let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.settings.system.as_deref(), "tools" => setup.tools.definitions()});
+    let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.settings.system.as_deref(), "tools" => setup.definitions.clone()});
     let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), |kind, piece| tell(Msg::Event(obj! {kind => piece})))?;
     *usage = Some(reply["usage"]["inputTokens"].as_f64().unwrap_or(0.0) - setup.overhead);
     append(s, &obj! {"participant" => "assistant", "content" => reply["content"].clone()}, cfg);
-    tell(logged(s));
+    tell(Msg::Logged(s.count("messages")));
     let calls = reply["content"].arr().iter().filter(|b| b.kind() == "tool_use");
     let results: Vec<Value> = calls.map(|call| {
         let result = approve(app, name, &setup, tell, call).map_or_else(|why| tools::result(call, Err(why.into())), |()| setup.tools.call(call));
@@ -495,7 +532,7 @@ fn step(app: &App, name: &str, s: &Session, usage: &mut Option<f64>, tell: &dyn 
         return Ok(false);
     }
     append(s, &obj! {"participant" => "user", "content" => results}, cfg);
-    tell(logged(s));
+    tell(Msg::Logged(s.count("messages")));
     form(tell, name, s, &setup);
     Ok(true)
 }
@@ -507,8 +544,8 @@ const APPROVAL_WAIT: Duration = Duration::from_secs(600);
 const DENIED: &str = "the user didn't allow this call";
 
 /// Whether the user lets a call run. A tool that doesn't ask, or that the session always allows, runs
-/// at once (and a call to no tool fails at once); otherwise the turn asks its session's thread, which
-/// asks the pages and decides by a page's answer (Owner). No answer within APPROVAL_WAIT is a denial.
+/// at once (and a call to no tool fails at once); otherwise the turn asks the hub, which asks the pages
+/// and decides by a page's answer (Live). No answer within APPROVAL_WAIT is a denial.
 fn approve(app: &App, name: &str, setup: &Setup, tell: &dyn Fn(Msg), call: &Value) -> Result<(), String> {
     let (id, tool) = (call["id"].as_str().unwrap_or(""), call["name"].as_str().unwrap_or(""));
     if !setup.tools.asking().contains(&tool) || profile(app, name)?.allow.contains(tool) {
@@ -522,7 +559,7 @@ fn approve(app: &App, name: &str, setup: &Setup, tell: &dyn Fn(Msg), call: &Valu
 /// Memories form (memory::drive), the session's thread told while they do.
 fn form(tell: &dyn Fn(Msg), name: &str, s: &Session, setup: &Setup) {
     tell(Msg::Forming(true));
-    if let Some(error) = drive(s, &mut Summarizer(setup, setup.tools.definitions()), &setup.settings.config) {
+    if let Some(error) = drive(s, &mut &*setup, &setup.settings.config) {
         eprintln!("{name}: forming a memory: {error}");
     }
     tell(Msg::Forming(false));
@@ -539,12 +576,13 @@ fn setup(app: &App, name: &str) -> Result<Setup, String> {
         _ => Toolbox::default(),
     };
     let tools = bash + mcp::toolbox(&app.mcp);
-    Ok(Setup { overhead: overhead(s.system.as_deref(), &tools), settings: s, llm, tools })
+    let definitions = tools.definitions();
+    Ok(Setup { overhead: overhead(s.system.as_deref(), &definitions), settings: s, llm, tools, definitions })
 }
 
 /// The tokens a system prompt and tool definitions take.
-fn overhead(system: Option<&str>, tools: &Toolbox) -> f64 {
-    density_tokens(system.unwrap_or("")) + tools.definitions().map_or(0.0, |d| density_tokens(&json::to_string(&d)))
+fn overhead(system: Option<&str>, definitions: &Option<Value>) -> f64 {
+    density_tokens(system.unwrap_or("")) + definitions.as_ref().map_or(0.0, |d| density_tokens(&json::to_string(d)))
 }
 
 fn global_path(app: &App) -> PathBuf {
@@ -601,8 +639,7 @@ fn create(app: &App, v: &Value) -> Result<Value, String> {
 }
 
 /// A session's settings changed by what `v` gives (tuned).
-fn tune(app: &App, name: &str, v: &Value) -> Result<(), String> {
-    let merged = Session::open(app.root.join(name)).count("layer2") > 0;
+fn tune(app: &App, name: &str, v: &Value, merged: bool) -> Result<(), String> {
     change(&profile_path(app, name), |old: &mut SessionSettings| tuned(app, old, v, merged).map(|new| *old = new)).map(drop)
 }
 
@@ -621,7 +658,10 @@ fn tuned(app: &App, old: &SessionSettings, v: &Value, merged: bool) -> Result<Se
     let mut new: SessionSettings = serde_json::from_value(new).map_err(|e| e.to_string())?;
     if let Some(path) = v["workspace"].as_str().map(str::trim) {
         let dir: PathBuf = std::path::absolute(settings::expand(path)).map_err(|e| format!("{path}: {e}"))?.components().collect();
-        new.workspace = Some(dir).filter(|dir| dir.is_dir()).ok_or_else(|| format!("no directory {path}"))?.into();
+        if !dir.is_dir() {
+            return Err(format!("no directory {path}"));
+        }
+        new.workspace = Some(dir);
     }
     if !global(app)?.providers.contains_key(&new.provider) {
         return Err(format!("no provider {}", new.provider));
@@ -668,22 +708,22 @@ fn sessions(app: &App) -> Value {
 
 /// The session a fork was made from, and at which message.
 fn parent(s: &Session) -> Value {
-    let name = |path: &str| std::path::Path::new(path).file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+    let name = |path: &str| Path::new(path).file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
     s.fork["parent"].as_str().map_or(Value::Null, |path| obj! {"name" => name(path), "at" => s.fork["at"].clone()})
 }
 
 /// What the page shows of a session: counts, each layer's size, the last compile, its settings as its
 /// file has them, the tools that ask before they run and the tokens every request carries (or the
-/// problem that keeps it from running), and whether memories are forming or a turn runs.
+/// problem that keeps it from running), and whether a job runs (a turn, then its memories forming).
 fn state(app: &App, name: &str, s: &Session) -> Value {
     let layers: Vec<Value> = (0..).map(|n| s.count(&format!("layer{n}"))).take_while(|&c| c > 0).map(Value::from).collect();
     let last = s.last("compiles").unwrap_or(obj! {});
     let refused = s.last("attempts").is_some_and(|a| a["outcome"].as_str() == Some("refusal"));
-    let (setup, (running, forming)) = (setup(app, name), ask_session(app, name, Msg::Status));
+    let (setup, running) = (setup(app, name), ask_session(app, name, Msg::Status));
     obj! {
         "messages" => s.count("messages"), "layers" => layers,
         "frontier" => last["frontier"].clone(), "armed" => last["armed"].clone(), "multiplier" => last["multiplier"].clone(), "refused" => refused,
-        "forming" => forming, "running" => running,
+        "running" => running,
         "settings" => profile(app, name).ok().map(|p| serde_json::to_value(p).expect("settings are JSON")),
         "tools" => setup.as_ref().map_or(vec![], |x| x.tools.asking()), "overhead" => setup.as_ref().map_or(0.0, |x| x.overhead),
         "problem" => setup.as_ref().err().map(String::as_str),
