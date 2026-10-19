@@ -1,7 +1,7 @@
 """Mutation testing: each mutant, an exact edit of a source file, is built and tested in a copy of the
-project of its own, many at once. A mutant is CAUGHT if the test fails, MISSED if it passes (the tests
-can't tell it from the code: a gap in them, or a simplification), TIMEOUT if the test runs past its
-time, and NOBUILD if it doesn't compile. Mutants are JSON, {label: [text, replacement]}, per file:
+project of its own, as many at once as there are cores and room on the disk. A mutant is CAUGHT if
+the test fails, MISSED if it passes (the tests can't tell it from the code: a gap in them, or a
+simplification), TIMEOUT if the test runs past its time, and NOBUILD if it doesn't compile. Mutants are JSON, {label: [text, replacement]}, per file:
 
     python3 tests/mutants.py tests/test_app.py app/src/main.rs=main.json [app/src/bash.rs=bash.json ...]
 
@@ -67,8 +67,11 @@ def main(test: str, *specs: str) -> int:
                 print(f'{label}: its text is in {file} {source.count(text)} times, not once')
                 return 1
             mutants.append((file, label, text, replacement))
-    workers, started = min(len(mutants), os.cpu_count() or 4), time.monotonic()
+    started = time.monotonic()
     subprocess.run(['cargo', 'build', '--release', '--quiet'], cwd=ROOT, env={**FAST, 'CARGO_TARGET_DIR': str(ROOT / 'target' / 'mutants')}, check=True)
+    # a copy per core, as many as the disk has room for, each taken as twice its build once its mutant has built
+    build = sum(f.stat().st_size for f in (ROOT / 'target' / 'mutants' / 'release').rglob('*') if f.is_file())
+    workers = max(1, min(len(mutants), os.cpu_count() or 4, shutil.disk_usage(tempfile.gettempdir()).free // (2 * build)))
     with tempfile.TemporaryDirectory() as scratch, ThreadPoolExecutor(workers) as pool:
         trees = queue.Queue()
         for tree in pool.map(lambda i: copy(Path(scratch, str(i))), range(workers)):

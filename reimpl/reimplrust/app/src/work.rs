@@ -5,7 +5,7 @@
 //! it calls run, each once the user allows it, their results joining the log. Memories form between
 //! steps and after the turn. The thread tells the hub what the pages following the job see (Msg).
 
-use crate::{api::brief, costs, hub::{Job, Msg}, llm::Llm, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, Toolbox}, App};
+use crate::{api::brief, costs::{self, For}, hub::{Event, Job, Msg}, llm::Llm, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Reader}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{Host, Request}, store::Session};
 use std::{panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver}, time::Duration};
@@ -51,7 +51,7 @@ impl Host for &Setup {
         let model = if request.model.is_empty() { &self.settings.model } else { &request.model };
         let none = request.tools.as_ref().map(|_| obj! {"type" => "none"});
         let head = sparse(obj! {"model" => model.as_str(), "max_tokens" => request.max_tokens, "tools" => request.tools.clone(), "tool_choice" => none});
-        self.llm.messages(head, &request.messages, reader, |_, _| {})
+        self.llm.messages(head, &request.messages, reader, |_| {})
     }
 }
 
@@ -78,8 +78,8 @@ pub fn work(app: &App, name: &str, jobs: Receiver<Job>) {
     for job in jobs {
         let done = catch_unwind(AssertUnwindSafe(|| Worker { app, name, s: app.session(name) }.run(job)));
         if done.is_err() {
-            app.tell(name, Msg::Event(obj! {"forming" => false}));
-            app.tell(name, Msg::Event(obj! {"error" => "the session's thread failed; the server's output says why"}));
+            app.tell(name, Msg::Event(Event::Forming(false)));
+            app.tell(name, Msg::Event(Event::End(Some("the session's thread failed; the server's output says why".into()))));
         }
         app.tell(name, Msg::Done);
     }
@@ -96,7 +96,7 @@ impl Worker<'_> {
     fn tell(&self, msg: Msg) { self.app.tell(self.name, msg) }
 
     /// An event for the pages following the job.
-    fn event(&self, event: Value) { self.tell(Msg::Event(event)) }
+    fn event(&self, event: Event) { self.tell(Msg::Event(event)) }
 
     /// The pages told that the log has grown, and to what length.
     fn logged(&self) { self.tell(Msg::Logged(self.s.count("messages"))) }
@@ -105,7 +105,7 @@ impl Worker<'_> {
         match job {
             Job::Say { text, page } => {
                 self.tell(Msg::Start(page));
-                self.event(self.turn(text.as_deref()).map_or_else(|e| obj! {"error" => e}, |()| obj! {"ok" => true}));
+                self.event(Event::End(self.turn(text.as_deref()).err()));
                 if let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup) } // the turn's memories
             }
             Job::Fork { at, name: fork, reply } => {
@@ -122,19 +122,8 @@ impl Worker<'_> {
     /// A chat turn: the message joins the log, then steps run until a reply calls no tools. Without a
     /// message, the turn continues the log as it is: after an interruption the context ends with the
     /// user's message or the tool results, and after a reply cut short with that reply, which the
-    /// Messages API continues (a prefill). The pages hear:
-    /// - the log's length each time it grows ({"logged"});
-    /// - how the context folded before a reply ({"fold"}, costs::fold);
-    /// - the pieces of a reply's reasoning and text ({"thinking"}, {"text"}), each call's tool as the
-    ///   reply starts it and its input as it comes ({"calling"}, {"input"});
-    /// - what the session's requests have used after each, and a reply's prompt as its provider
-    ///   counted it ({"spent", "prompt"}, costs::spend);
-    /// - the question whether each call may run ({"approve"}: its id; the hub tells the answers,
-    ///   {"answered": the id, "answer"}), and each call's result ({"result"}: the block, brief);
-    /// - memories forming ({"forming"}: true, then false).
-    ///
-    /// Then run tells the turn's end ({"ok": true} once it has joined the log, or {"error"}), and the
-    /// memories after it form.
+    /// Messages API continues (a prefill). The pages hear it as it goes (hub's Event); then run tells
+    /// them the turn's end, and the memories after it form.
     fn turn(&self, text: Option<&str>) -> Result<(), String> {
         if let Some(text) = text {
             append(&self.s, &obj! {"participant" => "user", "content" => vec![obj! {"type" => "text", "text" => text}]}, &self.app.profile(self.name)?.config);
@@ -168,15 +157,15 @@ impl Worker<'_> {
             compiled = select(s, w, current(s), cfg);
         }
         let turns = compiled.map_err(|r| format!("{}: {} tokens over a budget of {}", r.stage, r.actual, r.budget))?;
-        if let Some(fold) = costs::fold(s) { self.event(obj! {"fold" => fold}) }
+        if let Some(fold) = costs::fold(s) { self.event(Event::Fold(fold)) }
         let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.settings.system.as_deref(), "tools" => setup.definitions.clone()});
-        let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), |kind, piece| self.event(obj! {kind => piece}))?;
-        self.spend(&setup, "reply");
+        let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), |piece| self.event(Event::Piece(piece)))?;
+        self.spend(&setup, For::Reply);
         append(s, &obj! {"participant" => "assistant", "content" => reply["content"].clone()}, cfg);
         self.logged();
         let calls = reply["content"].arr().iter().filter(|b| b.kind() == "tool_use");
         let results = calls.map(|call| self.approve(&setup, call).map_or_else(|why| tools::result(call, Err(why.into())), |()| setup.tools.call(call)));
-        let results: Vec<Value> = results.inspect(|result| self.event(obj! {"result" => brief(result)})).collect();
+        let results: Vec<Value> = results.inspect(|result| self.event(Event::Result(brief(result)))).collect();
         if results.is_empty() { return Ok(false) }
         append(s, &obj! {"participant" => "user", "content" => results}, cfg);
         self.logged();
@@ -199,17 +188,21 @@ impl Worker<'_> {
 
     /// Memories form (memory::drive), the pages told while they do.
     fn form(&self, setup: &Setup) {
-        self.event(obj! {"forming" => true});
+        self.event(Event::Forming(true));
         if let Some(error) = drive(&self.s, &mut &*setup, &setup.settings.config) {
             eprintln!("{}: forming a memory: {error}", self.name);
         }
-        self.spend(setup, "memories");
-        self.event(obj! {"forming" => false});
+        self.spend(setup, For::Memories);
+        self.event(Event::Forming(false));
     }
 
     /// What the step's requests used since this was last told (Llm::spent), for `what`, joins the
-    /// session's costs log, which the pages hear.
-    fn spend(&self, setup: &Setup, what: &str) {
-        if let Some(spent) = costs::spend(&self.s, what, setup.llm.spent.take()) { self.event(spent) }
+    /// session's costs log; the pages hear the totals, and a reply's prompt.
+    fn spend(&self, setup: &Setup, what: For) {
+        let used = setup.llm.spent.take();
+        if let Some(spent) = costs::spend(&self.s, what, used) {
+            self.event(Event::Spent(spent));
+            if what == For::Reply { self.event(Event::Prompt(used.input)) }
+        }
     }
 }

@@ -306,7 +306,7 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
             if 'input' in last:
                 calls[-1][1] += last['input']
             seen['forming'] |= last.get('forming', False)
-            end = last if {'ok', 'error'} & set(last) else end
+            end = last if 'end' in last else end
             if 'approve' in last:                                           # a call of the reply just logged
                 reply = call(port, f'/api/s/{name}/messages?from={logged - 1}')[0]
                 tool = next(b['name'] for b in reply['content'] if b.get('id') == last['approve'])
@@ -314,7 +314,7 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
                 call(port, f'/api/s/{name}/approve', {'id': last['approve'], 'answer': (answers or {}).get(tool, 'allow')})
             thoughts.append(last.get('thinking', ''))
     seen['calls'] = calls
-    if not end.get('ok'):
+    if end.get('end', 'never ended') is not None:
         raise SystemExit(f'{name}: "{(text or "(continue)")[:40]}" got {end or last}')
     return ''.join(pieces), ''.join(thoughts), times
 
@@ -328,8 +328,14 @@ def settle(port, name):
     raise SystemExit(f'{name}: a job still runs after 20 s')
 
 
-def peak_kb(pid) -> int:
-    return int(next(line.split()[1] for line in open(f'/proc/{pid}/status') if line.startswith('VmHWM')))
+def peak_kb(pid, of='VmHWM') -> int:
+    return int(next(line.split()[1] for line in open(f'/proc/{pid}/status') if line.startswith(of)))
+
+
+def peak_from_now(pid) -> int:
+    """The process's size now, from which its peak counts again (Linux resets it on clear_refs 5)."""
+    Path(f'/proc/{pid}/clear_refs').write_text('5')
+    return peak_kb(pid, 'VmRSS')
 
 
 def chat(port, name, turns, start, window=WINDOW):
@@ -380,8 +386,9 @@ def streamed_large(tls, ca) -> str:
             contexts.append(seen['largest'] // 1024)
         if peaks[-1] - peaks[1] > 3 * size // 1024:
             raise SystemExit(f'peak memory grew from {peaks[1]} KB to {peaks[-1]} KB as contexts grew from {contexts[1]} KB to {contexts[-1]} KB')
-        if len(call(port, '/api/s/large/messages')) != 24 or (listed := peak_kb(app.pid)) - peaks[-1] > 3 * size // 1024:
-            raise SystemExit(f'listing the messages took the peak from {peaks[-1]} KB to {listed} KB')
+        before = peak_from_now(app.pid)                                  # the listing's own peak, however high the turns' went
+        if len(call(port, '/api/s/large/messages')) != 24 or (listed := peak_kb(app.pid)) - before > 3 * size // 1024:
+            raise SystemExit(f'listing the messages took the app from {before} KB to a peak of {listed} KB')
         say(port, 'large', 'p' * 1_500_000)                              # a paste past a megabyte
         if len(call(port, '/api/s/large/messages?from=24')[0]['content'][0]['text']) != 1_500_000:
             raise SystemExit('a pasted message past a megabyte did not join the log whole')
@@ -531,6 +538,12 @@ def tooled(tls, ca, baseline) -> str:
             time.sleep(0.02)
         else:
             raise SystemExit('a turn waiting for an answer did not show as running')
+        try:
+            call(port, '/api/s/tools/approve', {'id': 'call-none', 'answer': 'allow'})
+            raise SystemExit('a turn waiting for an answer took one for a call that is not waiting')
+        except urllib.error.HTTPError as error:
+            if error.code != 400:
+                raise
         queued = 'Message queued while a turn waits'
         waiter = threading.Thread(target=lambda: say(port, 'tools', queued))
         waiter.start()
@@ -547,9 +560,9 @@ def tooled(tls, ca, baseline) -> str:
         # gets what the first page gets from there on, but the reply's pieces, which a page a moment behind when the log
         # grows reads from the log
         outline = lambda events: [e for e in events if not {'text', 'thinking'} & set(e)]
-        kinds = [next(iter(e)) for e in outline(late) if not {'logged', 'forming', 'spent'} & set(e)]
+        kinds = [next(iter(e)) for e in outline(late) if not {'logged', 'forming', 'spent', 'prompt'} & set(e)]
         if outline(first)[-len(outline(late)):] != outline(late) or late[0] != {'logged': state['messages'] + 2} or 'approve' not in late[1] \
-                or kinds != ['approve', 'answered', 'result', 'ok'] or call(port, '/api/s/tools')['running']:
+                or kinds != ['approve', 'answered', 'result', 'end'] or call(port, '/api/s/tools')['running']:
             raise SystemExit(f'a page that came in during the turn got {kinds} from {late[:2]}; the page that started it {len(first)} events, it {len(late)}')
         told = call(port, f'/api/s/tools/messages?from={state["messages"]}')
         if [m['participant'] for m in told] != ['user', 'assistant', 'user', 'assistant', 'user', 'assistant'] or words(told[4]) != queued:
@@ -699,7 +712,7 @@ def chatted(turns, tls, ca, baseline) -> str:
                 or call(port, '/api/s/branch/settings', {'provider': 'plain'})['problem']:
             raise SystemExit(f'a session whose provider has gone shows {lost["settings"]}, {lost["problem"]}')
         for path, wrong in [('settings', {'provider': 'nowhere'}), ('settings', {'workspace': '/nonexistent/dir'}), ('settings', {'config': {'merge_threshold': 3}}),
-                            ('fork', {'at': 5, 'name': 'branch'})]:     # and a fork onto a session there is
+                            ('fork', {'at': 5, 'name': 'branch'}), ('approve', {'id': 'call-none', 'answer': 'allow'})]:   # a fork onto a session there is, an answer no call waits for
             try:
                 call(port, f'/api/s/main/{path}', wrong)
                 raise SystemExit(f'a session took the {path} {wrong}')
@@ -734,6 +747,10 @@ def chatted(turns, tls, ca, baseline) -> str:
         say(port, 'unpriced', 'hello')
         if (spent := settle(port, 'unpriced')['spent']['total'])['cost'] is not None or spent['input'] <= 0:
             raise SystemExit(f'a session no provider priced has used {spent}')
+        costs = Path(root, 'unpriced', 'costs.jsonl')                    # a record edited into one the app can't read is passed over
+        costs.write_text(costs.read_text() + json.dumps({'id': len(costs.read_text().splitlines()), 'for': 'lunch'}, separators=(',', ':')) + '\n')
+        if (edited := call(port, '/api/s/unpriced'))['spent']['total'] != spent or edited['prompt'] is None:
+            raise SystemExit(f'after a hand edit to its costs the session shows {edited["spent"]}, its prompt {edited["prompt"]}')
         call(port, '/api/sessions', {'name': 'cut'})
         try:
             say(port, 'cut', 'cut off please')

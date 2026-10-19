@@ -19,12 +19,7 @@ pub struct Llm {
 /// What replies used, as their providers report it: dollars, if a provider prices them (OpenRouter
 /// does), and tokens: the prompts', of those the ones read from the provider's cache, and the replies'.
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
-pub struct Usage {
-    pub cost: Option<f64>,
-    pub input: f64,
-    pub cached: f64,
-    pub output: f64,
-}
+pub struct Usage { pub cost: Option<f64>, pub input: f64, pub cached: f64, pub output: f64 }
 
 impl Add for Usage {
     type Output = Usage;
@@ -63,11 +58,9 @@ pub fn agent(ca: Option<&[u8]>) -> Result<ureq::Agent, String> {
 impl Llm {
     /// POSTs to {base}/v1/messages (or {base}/messages for a base that ends in /v1) `head`'s fields
     /// and `turns` as the messages, read through `reader` as they're written out, asking for a stream.
-    /// Hands `piece` each piece of the reply as it arrives: ("text" or "thinking", a piece of it), and
-    /// for each call ("calling", its tool) as it starts and ("input", a piece of its JSON) as it comes.
-    /// Gives the whole reply as the library takes it: {stopReason, content, usage: {inputTokens,
-    /// outputTokens}}.
-    pub fn messages(&self, mut head: Value, turns: &[Turn], reader: &mut Reader, mut piece: impl FnMut(&str, &str)) -> Result<Value, String> {
+    /// Hands `piece` each piece of the reply as it arrives (Piece), and gives the whole reply as the
+    /// library takes it: {stopReason, content, usage: {inputTokens, outputTokens}}.
+    pub fn messages(&self, mut head: Value, turns: &[Turn], reader: &mut Reader, mut piece: impl FnMut(Piece)) -> Result<Value, String> {
         let base = self.base.trim_end_matches('/');
         let url = if base.ends_with("/v1") { format!("{base}/messages") } else { format!("{base}/v1/messages") };
         let request = self.agent.post(&url).header("x-api-key", &self.key).header("anthropic-version", "2023-06-01").header("content-type", "application/json");
@@ -93,98 +86,150 @@ impl Llm {
         let lines = BufReader::new(body.into_reader()).lines().map(|line| line.map_err(|e| e.to_string()));
         let data = lines.filter_map(|line| line.map(|l| l.strip_prefix("data:").map(|d| d.trim().to_string())).transpose());
         let mut events = data.take_while(|d| d.as_deref() != Ok("[DONE]"));
-        let reply = events.try_fold(Reply::default(), |reply, d| reply.event(&json::parse(d?.as_bytes())?, &mut piece))?;
+        let reply = events.try_fold(Reply::default(), |reply, d| reply.event(serde_json::from_str(&d?).map_err(|e| e.to_string())?, &mut piece))?;
         self.spent.set(self.spent.get() + reply.used);
         reply.done()
     }
 }
 
-/// A streamed reply as its events build it, a fold over them.
-#[derive(Default)]
-struct Reply {
-    blocks: Vec<Value>,
-    stop: Value,
-    used: Usage,
+/// A piece of a reply as it streams in: of its reasoning or its text, a call's tool as the call starts,
+/// or a piece of the call's input (JSON). Serialized as {"thinking": piece} and so on.
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Piece { Thinking(String), Text(String), Calling(String), Input(String) }
+
+/// The server-sent events that build a reply; any other passes.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Streamed {
+    MessageStart { message: Started },
+    ContentBlockStart { content_block: Content },
+    ContentBlockDelta { delta: Delta },
+    ContentBlockStop {},
+    MessageDelta { delta: Stopped, #[serde(default)] usage: Counted },
+    Error { error: Failure },
+    #[serde(other)] Other, // ping, message_stop
 }
 
+#[derive(Deserialize)]
+struct Started { #[serde(default)] usage: Counted }
+
+#[derive(Deserialize)]
+struct Stopped { stop_reason: Option<String> }
+
+#[derive(Deserialize)]
+struct Failure { #[serde(rename = "type", default)] kind: String, #[serde(default)] message: String }
+
+/// The tokens and dollars an event reports; any of them may be missing.
+#[derive(Deserialize, Default)]
+struct Counted {
+    input_tokens: Option<f64>,
+    cache_read_input_tokens: Option<f64>,
+    cache_creation_input_tokens: Option<f64>,
+    output_tokens: Option<f64>,
+    cost: Option<f64>,
+}
+
+/// A content block as its events build it: started, then extended by deltas of its kind.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Content {
+    Text { text: String },
+    Thinking { thinking: String, signature: Option<String> },
+    RedactedThinking { data: Value },
+    ToolUse { id: String, name: String, input: Value, #[serde(skip)] json: String }, // the input's JSON, parsed once whole
+    #[serde(other)] Other,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum Delta {
+    #[serde(rename = "text_delta")] Text { text: String },
+    #[serde(rename = "thinking_delta")] Thinking { thinking: String },
+    #[serde(rename = "signature_delta")] Signature { signature: String },
+    #[serde(rename = "input_json_delta")] InputJson { partial_json: String },
+    #[serde(other)] Other,
+}
+
+/// A streamed reply as its events build it, a fold over them.
+#[derive(Default)]
+struct Reply { blocks: Vec<Content>, stop: Option<String>, used: Usage }
+
 impl Reply {
-    fn event(mut self, e: &Value, show: &mut impl FnMut(&str, &str)) -> Result<Reply, String> {
-        match e.kind() {
-            "message_start" => self.used(&e["message"]["usage"]),
-            "content_block_start" => {
-                if e["content_block"].kind() == "tool_use" {
-                    show("calling", e["content_block"]["name"].as_str().unwrap_or(""));
+    fn event(mut self, e: Streamed, show: &mut impl FnMut(Piece)) -> Result<Reply, String> {
+        match e {
+            Streamed::MessageStart { message } => self.used(&message.usage),
+            Streamed::ContentBlockStart { content_block } => {
+                if let Content::ToolUse { name, .. } = &content_block {
+                    show(Piece::Calling(name.clone()));
                 }
-                self.blocks.push(e["content_block"].clone());
+                self.blocks.push(content_block);
             }
-            "content_block_delta" => {
-                let block = self.blocks.last_mut().ok_or("a delta before its block")?;
-                let key = match e["delta"].kind().strip_suffix("_delta") {
-                    Some(key @ ("text" | "thinking" | "signature")) => key,
-                    Some("input_json") => "partial_json", // a tool call's input, parsed once whole
-                    _ => return Ok(self),
-                };
-                let more = e["delta"][key].as_str().unwrap_or("");
-                match &mut block[key] {
-                    Value::String(s) => s.push_str(more),
-                    slot => *slot = more.into(),
+            Streamed::ContentBlockDelta { delta } => match (self.blocks.last_mut().ok_or("a delta before its block")?, delta) {
+                (Content::Text { text }, Delta::Text { text: more }) => {
+                    text.push_str(&more);
+                    show(Piece::Text(more));
                 }
-                match key {
-                    "partial_json" => show("input", more),
-                    "signature" => {}
-                    _ => show(key, more),
+                (Content::Thinking { thinking, .. }, Delta::Thinking { thinking: more }) => {
+                    thinking.push_str(&more);
+                    show(Piece::Thinking(more));
                 }
-            }
-            "content_block_stop" => {
-                if let Some(block) = self.blocks.last_mut()
-                    && block.kind() == "tool_use"
-                    && let Some(input) = block["partial_json"].as_str().filter(|j| !j.is_empty())
+                (Content::Thinking { signature, .. }, Delta::Signature { signature: more }) => signature.get_or_insert_default().push_str(&more),
+                (Content::ToolUse { json, .. }, Delta::InputJson { partial_json }) => {
+                    json.push_str(&partial_json);
+                    show(Piece::Input(partial_json));
+                }
+                _ => {} // a delta this app doesn't keep
+            },
+            Streamed::ContentBlockStop {} => {
+                if let Some(Content::ToolUse { input, json, .. }) = self.blocks.last_mut()
+                    && !json.is_empty()
                 {
-                    block["input"] = json::parse(input.as_bytes())?;
+                    *input = json::parse(json.as_bytes())?;
                 }
             }
-            "message_delta" => {
-                self.stop = e["delta"]["stop_reason"].clone();
-                self.used(&e["usage"]);
+            Streamed::MessageDelta { delta, usage } => {
+                self.stop = delta.stop_reason;
+                self.used(&usage);
             }
-            "error" => return Err(format!("{}: {}", e["error"]["type"].as_str().unwrap_or("error"), e["error"]["message"].as_str().unwrap_or(""))),
-            _ => {} // ping, message_stop
+            Streamed::Error { error } => return Err(format!("{}: {}", if error.kind.is_empty() { "error" } else { &error.kind }, error.message)),
+            Streamed::Other => {}
         }
         Ok(self)
     }
 
     /// The usage an event reports. Counts only grow over a stream, which reports them at its start
     /// (Anthropic), at its end (OpenRouter, 0 at the start), or at both; the cost comes at its end.
-    fn used(&mut self, usage: &Value) {
-        let n = |k: &str| usage[k].as_f64().unwrap_or(0.0);
-        let (prompt, cached) = (n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens"), n("cache_read_input_tokens"));
+    fn used(&mut self, c: &Counted) {
+        let n = |count: Option<f64>| count.unwrap_or(0.0);
+        let (prompt, cached) = (n(c.input_tokens) + n(c.cache_read_input_tokens) + n(c.cache_creation_input_tokens), n(c.cache_read_input_tokens));
         let used = &mut self.used;
-        (used.input, used.cached, used.output) = (used.input.max(prompt), used.cached.max(cached), used.output.max(n("output_tokens")));
-        used.cost = usage["cost"].as_f64().or(used.cost);
+        (used.input, used.cached, used.output) = (used.input.max(prompt), used.cached.max(cached), used.output.max(n(c.output_tokens)));
+        used.cost = c.cost.or(used.cost);
     }
 
     /// The reply, once it has stopped: a stream that ends before its stop reason was cut off.
     fn done(self) -> Result<Value, String> {
-        if self.stop.is_null() {
-            return Err("the reply's stream ended before the reply did".into());
-        }
+        let stop = self.stop.ok_or("the reply's stream ended before the reply did")?;
         Ok(obj! {
-            "stopReason" => self.stop,
-            "content" => self.blocks.iter().filter_map(from_api).collect::<Vec<_>>(),
+            "stopReason" => stop,
+            "content" => self.blocks.into_iter().filter_map(Content::logged).collect::<Vec<_>>(),
             "usage" => obj! {"inputTokens" => self.used.input, "outputTokens" => self.used.output},
         })
     }
 }
 
-/// A block of the API's as the library logs it.
-fn from_api(b: &Value) -> Option<Value> {
-    Some(match b.kind() {
-        "text" => obj! {"type" => "text", "text" => b["text"].clone()},
-        "thinking" => obj! {"type" => "thinking", "thinking" => b["thinking"].clone(), "signature" => b["signature"].clone()},
-        "redacted_thinking" => obj! {"type" => "redacted_thinking", "data" => b["data"].clone()},
-        "tool_use" => obj! {"type" => "tool_use", "id" => b["id"].clone(), "name" => b["name"].clone(), "input" => b["input"].clone()},
-        _ => return None,
-    })
+impl Content {
+    /// The block as the library logs it; None for a kind it doesn't keep.
+    fn logged(self) -> Option<Value> {
+        Some(match self {
+            Content::Text { text } => obj! {"type" => "text", "text" => text},
+            Content::Thinking { thinking, signature } => obj! {"type" => "thinking", "thinking" => thinking, "signature" => signature},
+            Content::RedactedThinking { data } => obj! {"type" => "redacted_thinking", "data" => data},
+            Content::ToolUse { id, name, input, .. } => obj! {"type" => "tool_use", "id" => id, "name" => name, "input" => input},
+            Content::Other => return None,
+        })
+    }
 }
 
 /// A block of the library's as the API takes it, its content moved, not copied.
@@ -233,4 +278,58 @@ fn write_body(mut out: impl Write, head: &Value, turns: &[Turn], reader: &mut Re
         out.write_all(b"]}")?;
     }
     out.write_all(b"]}").and_then(|()| out.flush())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reply built from a stream's events, and the pieces it showed.
+    fn streamed(events: &[&str]) -> (Result<Reply, String>, Vec<String>) {
+        let mut pieces = vec![];
+        let reply = events.iter().try_fold(Reply::default(), |reply, e| reply.event(serde_json::from_str(e).expect("an event"), &mut |p| pieces.push(json::to_string(&p))));
+        (reply, pieces)
+    }
+
+    #[test]
+    fn a_stream_builds_its_reply() {
+        let (reply, pieces) = streamed(&[
+            r#"{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"usage":{"input_tokens":10,"cache_read_input_tokens":5,"cache_creation_input_tokens":null,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Hm."}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"c2ln"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"ping"}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":"","citations":null}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"citations_delta","citation":{"cited_text":"x"}}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"server_tool_use","id":"s1","name":"web_search","input":{}}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"t1","name":"bash","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}"#,
+            r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}"#,
+            r#"{"type":"content_block_stop","index":3}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":7,"cost":0.5}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        let reply = reply.expect("a reply");
+        assert_eq!((reply.used.cost, reply.used.input, reply.used.cached, reply.used.output), (Some(0.5), 15.0, 5.0, 7.0));
+        assert_eq!(pieces, [r#"{"thinking":"Hm."}"#, r#"{"text":"Hi"}"#, r#"{"calling":"bash"}"#, r#"{"input":"{\"command\":"}"#, r#"{"input":"\"ls\"}"}"#]);
+        let content = vec![
+            obj! {"type" => "thinking", "thinking" => "Hm.", "signature" => "c2ln"},
+            obj! {"type" => "text", "text" => "Hi"},
+            obj! {"type" => "tool_use", "id" => "t1", "name" => "bash", "input" => obj! {"command" => "ls"}},
+        ];
+        assert_eq!(reply.done(), Ok(obj! {"stopReason" => "tool_use", "content" => content, "usage" => obj! {"inputTokens" => 15.0, "outputTokens" => 7.0}}));
+    }
+
+    #[test]
+    fn a_stream_can_fail() {
+        let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":0}}}"#;
+        let (reply, _) = streamed(&[start, r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#]);
+        assert_eq!(reply.err(), Some("overloaded_error: Overloaded".into()));
+        let (reply, _) = streamed(&[start, r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#]);
+        assert_eq!(reply.expect("a reply so far").done().err(), Some("the reply's stream ended before the reply did".into()));
+    }
 }

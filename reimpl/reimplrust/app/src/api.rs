@@ -4,9 +4,9 @@
 //! carry an x-connectome header (another site's page can't send one without a CORS preflight, which
 //! this server never approves), since a POST can change where the key goes.
 
-use crate::{costs, hub::{Job, Msg, Routed}, settings, work::Setup, App};
+use crate::{costs::{self, Compile, Fold, Spent}, hub::{Job, Msg, Routed}, settings::{self, SessionSettings}, work::Setup, App};
 use connectome::{json::{self, sparse, Json, Value}, obj, store::Session};
-use serde::Serializer;
+use serde::{Serialize, Serializer};
 use std::{collections::{BTreeSet, HashMap}, net::TcpStream, path::Path, sync::mpsc::{channel, Sender}, time::Duration};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 
@@ -95,7 +95,7 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
         ("GET", ["messages"]) => {
             let (from, messages) = listing(&s, "messages", 200, query);
             let folds = costs::folds(&s, from);
-            send_all(stream, messages.map(|m| shown(&m, folds.get(&m.id()))))
+            send_all(stream, messages.map(|mut m| Shown { id: m.id(), content: m["content"].arr().iter().map(brief).collect(), fold: folds.get(&m.id()), participant: m["participant"].take() }))
         }
         ("GET", ["layer", n]) => send_all(stream, listing(&s, &format!("layer{n}"), u64::MAX, query).1),
         ("POST", ["fork"]) => {
@@ -139,23 +139,43 @@ fn create(app: &App, v: &Value) -> Result<Value, String> {
     Ok(state(app, name, &app.session(name)))
 }
 
-/// What the page shows of a session: counts, each layer's size, the last compile, its settings as its
-/// file has them, the tools that ask before they run and the tokens every request carries (or the
-/// problem that keeps it from running), whether a job runs (a turn, then its memories forming), what
-/// its requests have used, and the last reply's prompt as its provider counted it.
+/// What the page shows of a session: counts, each layer's size, the last compile's frontier and
+/// calibration, its settings as its file has them, the tools that ask before they run and the tokens
+/// every request carries (or the problem that keeps it from running), whether a turn runs (with its
+/// memories forming after it), what its requests have used, and the last reply's prompt as its
+/// provider counted it.
+#[derive(Serialize)]
+struct State<'a> {
+    messages: u64,
+    layers: Vec<u64>,
+    #[serde(flatten)] last: Option<Compile>,
+    refused: bool,
+    running: bool,
+    spent: Option<Spent>,
+    prompt: Option<f64>,
+    settings: Option<SessionSettings>,
+    tools: Vec<&'a str>,
+    overhead: f64,
+    problem: Option<&'a str>,
+}
+
+/// A session's State, as JSON.
 fn state(app: &App, name: &str, s: &Session) -> Value {
-    let layers: Vec<Value> = (0..).map(|n| s.count(&format!("layer{n}"))).take_while(|&c| c > 0).map(Value::from).collect();
-    let last = s.last("compiles").unwrap_or(obj! {});
-    let refused = s.last("attempts").is_some_and(|a| a["outcome"] == "refusal");
-    let (setup, running) = (Setup::new(app, name), app.ask_session(name, Msg::Status));
-    obj! {
-        "messages" => s.count("messages"), "layers" => layers,
-        "frontier" => last["frontier"].clone(), "armed" => last["armed"].clone(), "multiplier" => last["multiplier"].clone(), "refused" => refused,
-        "running" => running, "spent" => costs::spent(s), "prompt" => costs::prompted(s),
-        "settings" => app.profile(name).ok().map(|p| serde_json::to_value(p).expect("settings are JSON")),
-        "tools" => setup.as_ref().map_or(vec![], |x| x.tools.asking()), "overhead" => setup.as_ref().map_or(0.0, |x| x.overhead),
-        "problem" => setup.as_ref().err().map(String::as_str),
-    }
+    let setup = Setup::new(app, name);
+    let state = State {
+        messages: s.count("messages"),
+        layers: (0..).map(|n| s.count(&format!("layer{n}"))).take_while(|&c| c > 0).collect(),
+        last: s.last("compiles").and_then(|c| serde_json::from_value(c).ok()),
+        refused: s.last("attempts").is_some_and(|a| a["outcome"] == "refusal"),
+        running: app.ask_session(name, Msg::Status),
+        spent: costs::spent(s),
+        prompt: costs::prompted(s),
+        settings: app.profile(name).ok(),
+        tools: setup.as_ref().map_or(vec![], |x| x.tools.asking()),
+        overhead: setup.as_ref().map_or(0.0, |x| x.overhead),
+        problem: setup.as_ref().err().map(String::as_str),
+    };
+    serde_json::to_value(state).expect("a state is JSON")
 }
 
 /// Every session: its name, messages, the session it forked from, and its workspace.
@@ -183,8 +203,12 @@ fn listing<'s>(s: &'s Session, file: &str, newest: u64, query: &Query) -> (u64, 
 }
 
 /// A message as the page shows it: its blocks brief, and how the context folded before it (costs::folds).
-fn shown(m: &Value, fold: Option<&Value>) -> Value {
-    sparse(obj! {"id" => m.id(), "participant" => m["participant"].clone(), "content" => m["content"].arr().iter().map(brief).collect::<Vec<_>>(), "fold" => fold.cloned()})
+#[derive(Serialize)]
+struct Shown<'a> {
+    id: u64,
+    participant: Value,
+    content: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")] fold: Option<&'a Fold>,
 }
 
 /// A block as the page gets it: text and tool calls as they are, reasoning without its signature, a
@@ -225,7 +249,7 @@ fn fail(stream: &mut TcpStream, status: &str, why: &str) -> io::Result<()> {
 
 /// A JSON array to the page as its items are read, never held whole; past the head, a failure can only
 /// end it early.
-fn send_all(stream: &mut TcpStream, items: impl Iterator<Item = Value>) -> Route {
+fn send_all(stream: &mut TcpStream, items: impl Iterator<Item = impl Serialize>) -> Route {
     if stream.write_all(head("200 OK", "application/json", None).as_bytes()).is_ok() {
         let _ = serde_json::Serializer::with_formatter(BufWriter::new(stream), json::Js).collect_seq(items);
     }

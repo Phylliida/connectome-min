@@ -554,13 +554,16 @@ async function follow(response) {
     answered: (id) => $(`call-${id}`).querySelector('.ask')?.remove(),
     result: (b) => draw(reply(), b),
     // what the session's requests have used so far, and the last reply's prompt
-    spent: (spent, { prompt }) => {
-      Object.assign(state, { spent, prompt: prompt ?? state.prompt });
+    spent: (spent) => {
+      state.spent = spent;
       drawMemory();
     },
-    // the turn has ended: the log as it leaves it, while its memories form
-    ok: () => showLog(undefined, true),
-    error: (why) => {
+    prompt: (prompt) => {
+      state.prompt = prompt;
+      drawMemory();
+    },
+    // the turn has ended (`why` it failed, if it did): the log as it leaves it, while its memories form
+    end: (why) => {
       error = why;
       return showLog(undefined, true);
     },
