@@ -72,6 +72,7 @@ input[type=checkbox] { width: auto; }
 .hljs-comment, .hljs-quote { color: var(--muted); font-style: italic; }
 .hljs-title, .hljs-section { color: var(--accent); }
 .hljs-type, .hljs-attr, .hljs-attribute, .hljs-meta, .hljs-variable { color: var(--type); }
+.diff > div::before { content: attr(data-n) " " attr(data-mark); display: inline-block; width: 6ch; margin-right: 1ch; text-align: right; color: var(--muted); white-space: pre; }   /* never copied */
 .diff .add { background: var(--add); }
 .diff .del { background: var(--del); }
 .md blockquote { margin: 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
@@ -301,13 +302,26 @@ const views = {
 };
 
 // an edit's change as a diff: the lines it takes out and puts in (all in, for a new file), colored in
-// its file's language
+// its file's language, each marked in a gutter (data-mark, then data-n: number) the page draws and a
+// copy leaves out
 function diff({ path = '', old = '', new: text = '' }) {
   const lines = Diff.diffLines(String(old), String(text)).flatMap((part) => {
     const [mark, kind] = part.added ? ['+', 'add'] : part.removed ? ['-', 'del'] : [' ', ''];
-    return part.value.replace(/\n$/, '').split('\n').map((line) => `<div class="${kind}">${mark} ${highlight(line, String(path).split('.').pop())}</div>`);
+    return part.value.replace(/\n$/, '').split('\n').map((line) => `<div class="${kind}" data-mark="${mark}">${highlight(line, String(path).split('.').pop())}</div>`);
   });
   return `<pre class="diff">${lines.join('')}</pre>`;
+}
+
+// an edit's diff numbered from where its result says it starts (the edit tool's "at line N"; a file it
+// made, 1): a line taken out by the file's old count, any other by its new
+function number(diff, result) {
+  const start = Number(/at line (\d+)$/.exec(result)?.[1] ?? (result.startsWith('made ') ? 1 : 0));
+  let [old, now] = [start, start];
+  for (const row of start ? diff.children : []) {
+    row.dataset.n = row.dataset.mark === '-' ? old : now;
+    if (row.dataset.mark !== '+') old++;
+    if (row.dataset.mark !== '-') now++;
+  }
 }
 
 // block b at the end of `into`; a tool result joins its call's card when the page shows it
@@ -329,6 +343,7 @@ function result(card, b) {
   card.querySelector('summary').insertAdjacentHTML('beforeend', `<span class="out"> → ${escape(text.split('\n')[0].slice(0, 100))}</span>`);
   card.classList.toggle('failed', !!b.isError);
   card.open = !!card.querySelector('.diff');
+  if (card.open && !b.isError) number(card.querySelector('.diff'), text);
 }
 
 // the session form shows the session's settings, a field per input of its name
