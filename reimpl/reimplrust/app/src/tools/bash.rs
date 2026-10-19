@@ -6,7 +6,8 @@
 //!
 //! In a sandbox (Linux's bubblewrap, `bwrap`), the command sees only its workspace, read-write, and
 //! the paths the sandbox's settings name that exist, in its own PID namespace, which goes when bwrap is
-//! killed, so a timeout still takes everything the command started.
+//! killed, so a timeout still takes everything the command started. The rest is bwrap's own root, kept
+//! read-only, so a write anywhere else fails rather than vanishing with the sandbox.
 
 use super::{Outcome, Tool, Toolbox};
 use crate::settings::{expand, Sandbox};
@@ -72,14 +73,14 @@ fn run(dir: &Path, input: &Value, limit: Duration, sandbox: Option<&Sandbox>) ->
 }
 
 /// bubblewrap's arguments up to the command: a new PID namespace and session, /proc and /dev, the
-/// sandbox's paths that exist (read-only, then read-write), the workspace, and the network unless the
-/// sandbox has none.
+/// sandbox's paths that exist (read-only, then read-write), the workspace, the root they're mounted in
+/// made read-only, and the network unless the sandbox has none.
 fn bwrap(dir: &Path, b: &Sandbox) -> Vec<OsString> {
     let fixed = ["--die-with-parent", "--new-session", "--unshare-pid", "--proc", "/proc", "--dev-bind", "/dev", "/dev"].map(OsString::from);
     let paths = b.ro.iter().map(|p| ("--ro-bind-try", p)).chain(b.rw.iter().map(|p| ("--bind-try", p)));
     let binds = paths.flat_map(|(how, p)| [how.into(), expand(p).into(), expand(p).into()]);
     let workspace = ["--bind".into(), dir.into(), dir.into(), "--chdir".into(), dir.into()];
-    fixed.into_iter().chain(binds).chain(workspace).chain((!b.network).then(|| "--unshare-net".into())).chain(["--".into()]).collect()
+    fixed.into_iter().chain(binds).chain(workspace).chain((!b.network).then(|| "--unshare-net".into())).chain(["--remount-ro".into(), "/".into(), "--".into()]).collect()
 }
 
 /// A file's text, the middle cut out past twice KEPT bytes.

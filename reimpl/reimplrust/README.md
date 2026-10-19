@@ -59,8 +59,9 @@ the model's own tool-call markup as text).
 
 In a session's sandbox (Linux's bubblewrap, `bwrap`), a command sees its workspace, read-write, and
 of everything else only the paths `settings.json`'s `sandbox` lists that exist: `ro` read-only, `rw`
-read-write (a leading `~/` is the home directory); it has the network if `network`, and a PID
-namespace of its own, so a timeout still kills everything it started.
+read-write (a leading `~/` is the home directory); a write anywhere else fails (`Read-only file
+system`), so a tool that keeps a cache in the home directory needs that directory in `rw`. It has the
+network if `network`, and a PID namespace of its own, so a timeout still kills everything it started.
 
 Each call asks first: the page shows it with Allow, Always allow and Deny, and a denied call (or one
 left unanswered for ten minutes) gets an error result the model sees. Always allowed tools are kept in
@@ -102,5 +103,5 @@ python3 tests/mutants.py tests/test_app.py app/src/main.rs=mutants.json   # muta
 ```
 
 The three take under 30 seconds together. A batch of mutants takes about as long as its slowest one
-(81 of the app's, under a minute): they build without link-time optimization, from a build kept in
+(82 of the app's, under a minute): they build without link-time optimization, from a build kept in
 `target/mutants`.

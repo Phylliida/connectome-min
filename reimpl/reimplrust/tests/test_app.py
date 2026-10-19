@@ -467,9 +467,9 @@ def tooled(tls, ca, baseline) -> str:
         everything['sandbox'].update(ro=everything['sandbox']['ro'] + [str(shown)], rw=[str(shared)], network=False)   # the rest of /tmp, where root is, out of sight
         Path(root, 'settings.json').write_text(json.dumps(everything))
         call(port, '/api/s/tools/settings', {'sandbox': True})
-        command = f'pwd; echo made > inside; cat inside; echo noted > {shared}/note; cat {secret} 2>&1; cat {shown}/seen; touch {shown}/x 2>&1; echo $$; tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d " "'
+        command = f'pwd; echo made > inside; cat inside; echo noted > {shared}/note; cat {secret} 2>&1; cat {shown}/seen; touch {shown}/x 2>&1; touch /stray 2>&1; echo $$; tail -n +3 /proc/net/dev | cut -d: -f1 | tr -d " "'
         got = results('call ' + json.dumps([['bash', {'command': command}]]), asked=[])
-        sandboxed = f"{work}\nmade\ncat: {secret}: No such file or directory\nseen\ntouch: cannot touch '{shown}/x': Read-only file system\n2\nlo\n\n[exit code 0]"
+        sandboxed = f"{work}\nmade\ncat: {secret}: No such file or directory\nseen\ntouch: cannot touch '{shown}/x': Read-only file system\ntouch: cannot touch '/stray': Read-only file system\n2\nlo\n\n[exit code 0]"
         if got['0']['content'] != sandboxed or Path(work, 'inside').read_text() != 'made\n' or Path(shared, 'note').read_text() != 'noted\n':
             raise SystemExit(f'bash in the sandbox: {got}')
         started = time.monotonic()
