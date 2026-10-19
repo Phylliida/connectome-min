@@ -56,7 +56,7 @@ since one holds the keys:
 - `ROOT/settings.json`: `providers`, each a name with a `base` URL and a `key`; `defaults`, what a
   new session starts with; and `sandbox`, what a sandboxed command sees. The first run writes it
   with a provider named `default` for `https://api.anthropic.com` without a key, which the page then
-  asks for, and defaults for a window of 60k tokens, 30k of them reserved for the reply (and its
+  asks for, and defaults for a window of 90k tokens, 30k of them reserved for the reply (and its
   reasoning: a reply that reaches its reserve stops there).
 - `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its

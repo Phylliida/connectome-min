@@ -16,7 +16,7 @@ pub struct Settings {
 
 impl Settings {
     /// What settings.json starts as: a provider named default, Anthropic's API without a key yet, and
-    /// new sessions on it with a window of 60k tokens: the reply's reserve, `overhead`, which every
+    /// new sessions on it with a window of 90k tokens: the reply's reserve, `overhead`, which every
     /// request carries (the system prompt and tool definitions), and the context, which the library's
     /// settings are sized for.
     pub fn first(overhead: f64) -> Settings {
@@ -66,7 +66,7 @@ pub struct SessionSettings {
     pub workspace: Option<PathBuf>,
     pub sandbox: bool,
     pub allow: BTreeSet<String>,          // the tools that run without asking
-    #[default(60000.0)] pub window: f64,  // tokens a request may take, the reply's included
+    #[default(90000.0)] pub window: f64,  // tokens a request may take, the reply's included
     #[default(30000.0)] pub reserve: f64, // tokens for the reply (its reasoning too)
     pub system: Option<String>,
     pub config: Config,

@@ -805,6 +805,14 @@ def chatted(turns, tls, ca, baseline) -> str:
         costs.write_text(costs.read_text() + json.dumps({'id': len(costs.read_text().splitlines()), 'for': 'lunch'}, separators=(',', ':')) + '\n')
         if (edited := call(port, '/api/s/unpriced'))['spent']['total'] != spent or edited['prompt'] is None:
             raise SystemExit(f'after a hand edit to its costs the session shows {edited["spent"]}, its prompt {edited["prompt"]}')
+        call(port, '/api/sessions', {'name': 'tight'})                   # a message bigger than the window leaves the context
+        call(port, '/api/s/tight/settings', {'window': 3000, 'reserve': 1000})
+        try:
+            say(port, 'tight', 'too long ' * 2000)
+            raise SystemExit('a context that does not fit was sent')
+        except SystemExit as refused:
+            if "The context doesn't fit" not in str(refused) or 'less 1000 for the reply' not in str(refused) or 'Raise the window' not in str(refused):
+                raise
         call(port, '/api/sessions', {'name': 'cut'})
         try:
             say(port, 'cut', 'cut off please')

@@ -6,7 +6,7 @@
 //! steps and after the turn. The thread tells the hub what the pages following the job see (Msg).
 
 use crate::{api::brief, costs::{self, For}, hub::{Event, Job, Msg}, llm::Llm, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, Toolbox}, App};
-use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Reader}, json::{self, sparse, Json, Value}, obj};
+use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{Host, Request}, store::Session};
 use std::{panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver}, time::Duration};
 
@@ -65,6 +65,17 @@ pub fn toolbox(app: &App, workspace: Option<&Path>, sandbox: Option<Sandbox>) ->
     };
     let bash = if app.bash { bash } else { Toolbox::default() };
     bash + edit + mcp::toolbox(&app.mcp)
+}
+
+/// Why the context can't compile, as the user can do something about it: at its most folded it's
+/// bigger than what the window leaves it, or (rarer) structural repair dropped the newest message.
+fn refused(r: &Refusal, setup: &Setup) -> String {
+    let s = &setup.settings;
+    if r.actual <= r.budget {
+        return format!("{} ({:.0} tokens, of {:.0})", r.stage, r.actual, r.budget);
+    }
+    format!("The context doesn't fit: folded as far as it can be, it takes {:.0} tokens, and the window leaves it {:.0} ({:.0}, less {:.0} for the reply and {:.0} for the tools and system prompt). \
+        Raise the window, lower the reply reserve, or keep fewer recent tokens raw (config.recent_window_tokens, now {:.0}).", r.actual, r.budget, s.window, s.reserve, setup.overhead, s.config.recent_window_tokens)
 }
 
 /// The tokens a system prompt and tool definitions take.
@@ -157,7 +168,7 @@ impl Worker<'_> {
             self.form(&setup);
             compiled = select(s, w, current(s), cfg);
         }
-        let turns = compiled.map_err(|r| format!("{}: {} tokens over a budget of {}", r.stage, r.actual, r.budget))?;
+        let turns = compiled.map_err(|r| refused(&r, &setup))?;
         if let Some(fold) = costs::fold(s) { self.event(Event::Fold(fold)) }
         let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.settings.system.as_deref(), "tools" => setup.definitions.clone()});
         let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), |piece| self.event(Event::Piece(piece)))?;
