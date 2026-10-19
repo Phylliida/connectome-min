@@ -605,10 +605,12 @@ def chatted(turns, tls, ca, baseline) -> str:
             raise SystemExit(f'the price multiplier ({state["multiplier"]}) never calibrated to the prompt sizes the API reports')
         baseline.put(state['multiplier'])
         costs = [json.loads(line) for line in Path(root, 'main', 'costs.jsonl').read_text().splitlines()]   # each step's, each memory round's
-        sums = {k: sum(c['used'][k] for c in costs) for k in ('cost', 'input', 'cached', 'output')}
-        if {c['for'] for c in costs} != {'reply', 'memories'} or any(abs(sums[k] - state['spent'][k]) > 1e-9 for k in sums) or seen['costs']['main'] != state['spent'] \
-                or any(c['used']['input'] <= 0 or c['used']['cached'] <= 0 or c['used']['output'] <= 0 for c in costs) or state['spent'] != costs[-1]['total']:
-            raise SystemExit(f'main used {state["spent"]}, its log {sums} in {len(costs)} records, the page last heard {seen["costs"].get("main")}')
+        sums = {what: {k: sum(c['used'][k] for c in costs if c['for'] == what) for k in ('cost', 'input', 'cached', 'output')} for what in ('reply', 'memories')}
+        sums['total'] = {k: sums['reply'][k] + sums['memories'][k] for k in sums['reply']}
+        spent = state['spent']
+        if {c['for'] for c in costs} != {'reply', 'memories'} or any(abs(sums[w][k] - spent[w][k]) > 1e-9 for w in sums for k in sums[w]) or seen['costs']['main'] != spent \
+                or any(c['used']['input'] <= 0 or c['used']['cached'] <= 0 or c['used']['output'] <= 0 for c in costs) or costs[-1]['total'] != {w: spent[w] for w in ('reply', 'memories')}:
+            raise SystemExit(f'main used {spent}, its log {sums} in {len(costs)} records, the page last heard {seen["costs"].get("main")}')
         if state['prompt'] != next(c['used']['input'] for c in reversed(costs) if c['for'] == 'reply') or state['prompt'] != seen['prompts']['main']:
             raise SystemExit(f'main\'s last prompt {state["prompt"]}, the page last heard {seen["prompts"].get("main")}')
         if seen['problems']:
@@ -651,7 +653,7 @@ def chatted(turns, tls, ca, baseline) -> str:
         before = call(port, '/api/s/branch')['spent']
         say(port, 'branch', 'with the saved key, over plain HTTP')
         after = settle(port, 'branch')['spent']                          # mock-2's provider reports no cost, but tokens
-        if after['cost'] != before['cost'] or after['input'] <= before['input']:
+        if after['total']['cost'] != before['total']['cost'] or after['total']['input'] <= before['total']['input']:
             raise SystemExit(f'a turn whose provider reports no cost: {before} then {after}')
         shown, mode = call(port, '/api/settings')['providers'], os.stat(os.path.join(root, 'settings.json')).st_mode & 0o777
         listed = next((p for p in shown if p['name'] == 'plain'), None)
@@ -709,7 +711,7 @@ def chatted(turns, tls, ca, baseline) -> str:
         call(port, '/api/sessions', {'name': 'unpriced'})                # a model whose provider reports no cost: tokens, but no cost
         call(port, '/api/s/unpriced/settings', {'model': 'mock-2'})
         say(port, 'unpriced', 'hello')
-        if (spent := settle(port, 'unpriced')['spent'])['cost'] is not None or spent['input'] <= 0:
+        if (spent := settle(port, 'unpriced')['spent']['total'])['cost'] is not None or spent['input'] <= 0:
             raise SystemExit(f'a session no provider priced has used {spent}')
         call(port, '/api/sessions', {'name': 'cut'})
         try:

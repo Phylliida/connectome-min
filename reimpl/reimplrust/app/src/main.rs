@@ -22,7 +22,7 @@ use crate::{llm::{Llm, Usage}, settings::{SessionSettings, Settings}, tools::{ba
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Reader}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{Host, Request}, store::Session};
 use serde::{de::DeserializeOwned, Serialize, Serializer};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::{io::{BufRead, BufReader, BufWriter, Read, Write}, net::{TcpListener, TcpStream}, panic::{catch_unwind, AssertUnwindSafe}};
 use std::{path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender}, time::Duration};
 
@@ -508,13 +508,16 @@ fn form(tell: &dyn Fn(Msg), name: &str, s: &Session, setup: &Setup) {
 }
 
 /// What the step's requests used since this was last told (Llm::spent) joins the session's costs log,
-/// saying what it was `for`, with the session's running total, which the pages hear.
+/// saying what it was `for`, with the session's running totals by what they were for, which the pages
+/// hear.
 fn spend(s: &Session, setup: &Setup, what: &str, tell: &dyn Fn(Msg)) {
     let used = setup.llm.spent.take();
     if used.input + used.output > 0.0 {
-        let total = spent(s).unwrap_or_default() + used;
-        s.append("costs", obj! {"for" => what, "used" => used, "total" => total});
-        tell(Msg::Event(sparse(obj! {"spent" => total, "prompt" => (what == "reply").then_some(used.input)})));
+        let mut totals = totals(s);
+        let total = totals.entry(what.to_string()).or_default();
+        *total = *total + used;
+        s.append("costs", obj! {"for" => what, "used" => used, "total" => serde_json::to_value(&totals).expect("usage is JSON")});
+        tell(Msg::Event(sparse(obj! {"spent" => spent(&totals), "prompt" => (what == "reply").then_some(used.input)})));
     }
 }
 
@@ -524,9 +527,17 @@ fn prompted(s: &Session) -> Option<f64> {
     (0..s.count("costs")).rev().map(|i| s.read("costs", i)).find(|c| c["for"] == "reply").and_then(|c| c["used"]["input"].as_f64())
 }
 
-/// What the session's requests have used: its costs log's last running total; None before any.
-fn spent(s: &Session) -> Option<Usage> {
-    s.last("costs").and_then(|c| serde_json::from_value(c["total"].clone()).ok())
+/// What the session's requests have used, by what they were for ("reply", "memories"): its costs log's
+/// last running totals; none before any.
+fn totals(s: &Session) -> BTreeMap<String, Usage> {
+    s.last("costs").and_then(|c| serde_json::from_value(c["total"].clone()).ok()).unwrap_or_default()
+}
+
+/// The totals as the page shows them, and all of them ("total"); None before any.
+fn spent(totals: &BTreeMap<String, Usage>) -> Option<Value> {
+    let total = totals.values().fold(Usage::default(), |sum, &used| sum + used);
+    let shown: BTreeMap<&str, Usage> = totals.iter().map(|(what, &used)| (what.as_str(), used)).chain([("total", total)]).collect();
+    (!totals.is_empty()).then(|| serde_json::to_value(shown).expect("usage is JSON"))
 }
 
 /// What a session's step runs with, from the settings as they are now.
@@ -672,7 +683,7 @@ fn state(app: &App, name: &str, s: &Session) -> Value {
     obj! {
         "messages" => s.count("messages"), "layers" => layers,
         "frontier" => last["frontier"].clone(), "armed" => last["armed"].clone(), "multiplier" => last["multiplier"].clone(), "refused" => refused,
-        "running" => running, "spent" => spent(s), "prompt" => prompted(s),
+        "running" => running, "spent" => spent(&totals(s)), "prompt" => prompted(s),
         "settings" => profile(app, name).ok().map(|p| serde_json::to_value(p).expect("settings are JSON")),
         "tools" => setup.as_ref().map_or(vec![], |x| x.tools.asking()), "overhead" => setup.as_ref().map_or(0.0, |x| x.overhead),
         "problem" => setup.as_ref().err().map(String::as_str),

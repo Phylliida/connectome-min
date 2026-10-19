@@ -366,6 +366,8 @@ function setStatus(text, warn) {
 }
 
 const tokens = (n) => new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(n);
+// what requests cost, in dollars, if their provider said
+const dollars = (used) => !used ? 'none yet' : used.cost == null ? 'not reported' : '$' + used.cost.toFixed(used.cost < 1 ? 4 : 2);
 
 function drawMemory() {
   const s = state, used = s.prompt ?? s.armed ?? 0, { window = 0, model = '', allow = [], config = {} } = s.settings || {};
@@ -374,8 +376,10 @@ function drawMemory() {
     <div class="bar"><div style="width:${Math.min(100, 100 * used / window)}%"></div></div>
     <div class="stat"><span>Messages</span><span>${s.messages}</span></div>
     <div class="stat"><span>Chunks · memories</span><span>${s.layers[0] || 0} · ${s.layers.slice(1).join(' / ') || 0}</span></div>
-    <div class="stat"><span>Cost</span><span title="What the session's requests cost, as the provider reports it">${s.spent?.cost == null ? 'not reported' : '$' + s.spent.cost.toFixed(s.spent.cost < 1 ? 4 : 2)}</span></div>
-    <div class="stat"><span>Tokens</span><span title="In the session's prompts (of them, read from the provider's cache) and its replies">${s.spent ? `in ${tokens(s.spent.input)} (${tokens(s.spent.cached)} cached) · out ${tokens(s.spent.output)}` : 'none yet'}</span></div>
+    <div class="stat"><span>Cost of replies</span><span>${dollars(s.spent?.reply)}</span></div>
+    <div class="stat"><span>Cost of memories</span><span title="The summarizer's requests, which form the memories">${dollars(s.spent?.memories)}</span></div>
+    <div class="stat"><span>Total cost</span><span title="What the session's requests cost, as the provider reports it">${dollars(s.spent?.total)}</span></div>
+    <div class="stat"><span>Tokens</span><span title="In all the session's prompts (of them, read from the provider's cache) and its replies">${s.spent ? `in ${tokens(s.spent.total.input)} (${tokens(s.spent.total.cached)} cached) · out ${tokens(s.spent.total.output)}` : 'none yet'}</span></div>
     <div class="stat"><span>Price multiplier</span><span>${(s.multiplier || 1).toFixed(3)}</span></div>
     <div class="stat"><span>Model</span><span>${escape(model)}</span></div>
     <div class="stat"><span>Tools</span><span>${s.tools.map((t) => `<button class="chip ${allow.includes(t) ? 'on' : ''}" data-tool="${escape(t)}" title="${allow.includes(t) ? 'Always allowed. Click to ask first.' : 'Asks first. Click to always allow.'}">${escape(t)}</button>`).join('') || 'none'}</span></div>
