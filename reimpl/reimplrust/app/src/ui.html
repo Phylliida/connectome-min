@@ -142,7 +142,7 @@ try { folded = new Set(JSON.parse(localStorage.getItem('folded')) || []); } catc
 
 // the sessions, grouped by workspace (those without one last); in a group, a fork under its parent
 async function listSessions() {
-  const all = await api('/api/sessions'), workspace = (s) => (s.workspace || '').replace(/[\\/]+$/, '');
+  const all = await api('/api/sessions'), workspace = (s) => s.workspace || '';
   const group = (w) => {
     const members = all.filter((s) => workspace(s) === w), inside = (s) => members.some((m) => m.name === s.parent?.name);
     const draw = (p, depth) => members.filter((s) => (inside(s) ? s.parent.name : null) === p).map((s) => `<a href="#${s.name}" class="${s.name === current ? 'on' : ''}" style="padding-left:${6 + depth * 14}px">${escape(s.name)} <small>${s.messages}${s.parent ? ' · from ' + s.parent.at : ''}</small></a>` + draw(s.name, depth + 1)).join('');
@@ -160,31 +160,25 @@ $('sessions').addEventListener('toggle', (e) => {
   try { localStorage.setItem('folded', JSON.stringify([...folded])); } catch { /* no storage here: kept until the page reloads */ }
 }, true);
 
-// What the context shows of message i: 'tail' (raw, not in a chunk yet), 'raw' (a raw chunk), or 'recalled' (through a memory).
-function shownAs(i) {
-  if (!state || !state.chunks.length || i > state.chunks[state.chunks.length - 1][1]) return 'tail';
-  const chunk = state.chunks.findIndex(([a, b]) => a <= i && i <= b);
-  for (const [level, p] of state.frontier || []) {
-    const span = level === 0 ? 1 : state.k ** (level - 1);
-    if (chunk >= p * span && chunk < (p + 1) * span) return level === 0 ? 'raw' : 'recalled';
-  }
-  return 'raw';
-}
-
 async function open(name) {
   showing?.abort();
   current = name;
   state = await api(`/api/s/${name}`);
-  // while a turn runs, the log up to it, then the turn as it goes on
-  const messages = await api(`/api/s/${name}/messages${state.running == null ? '' : `?to=${state.running}`}`);
-  const thinking = (m) => m.thinking ? `<details class="thinking"><summary>Thinking</summary>${escape(m.thinking)}</details>` : '';
-  $('log').innerHTML = messages.map((m) => `<div class="msg ${shownAs(m.id)}"><div class="who">#${m.id} · ${escape(m.participant)}</div>${thinking(m)}${escape(m.text)}<button data-fork="${m.id}">fork here</button></div>`).join('');
-  $('log').scrollTop = $('log').scrollHeight;
+  await showLog();
   drawMemory();
   fill();
   listSessions();
   setStatus();
-  if (state.running != null) follow(fetch(`/api/s/${name}/live`, { signal: (showing = new AbortController()).signal }));
+  if (state.running) follow(fetch(`/api/s/${name}/live`, { signal: (showing = new AbortController()).signal }));
+}
+
+// the log's newest messages, up to the nth if given, each as the context shows it: in the raw tail,
+// in a raw chunk, or recalled through a memory
+async function showLog(n) {
+  const messages = await api(`/api/s/${current}/messages${n == null ? '' : `?to=${n}`}`);
+  const thinking = (m) => m.thinking ? `<details class="thinking"><summary>Thinking</summary>${escape(m.thinking)}</details>` : '';
+  $('log').innerHTML = messages.map((m) => `<div class="msg ${m.shown}"><div class="who">#${m.id} · ${escape(m.participant)}</div>${thinking(m)}${escape(m.text)}<button data-fork="${m.id}">fork here</button></div>`).join('');
+  $('log').scrollTop = $('log').scrollHeight;
 }
 
 // the session form shows the session's settings, a field per input of its name
@@ -262,7 +256,7 @@ $('log').onclick = async (e) => {
     if (!answer) return;
     e.target.parentElement.remove();
     setStatus(answer === 'deny' ? 'Denied.' : 'Running…');
-    await api('/api/approve', { id: card.id.slice('call-'.length), answer });
+    await api(`/api/s/${current}/approve`, { id: card.id.slice('call-'.length), answer });
   } catch (err) { setStatus(err.message, true); }
 };
 
@@ -279,18 +273,16 @@ $('continue').onclick = () => turn(null);
 // a turn: `text` joins the log and the model answers it, or without text the model goes on from the log as it is
 function turn(text) {
   if (!current) return;
-  if (text) $('log').insertAdjacentHTML('beforeend', `<div class="msg tail"><div class="who">user</div>${escape(text)}</div>`);
   showing?.abort();
   showing = new AbortController();
   follow(fetch(`/api/s/${current}/${text ? 'say' : 'continue'}`, { method: 'POST', headers: { 'x-connectome': '1' }, body: JSON.stringify({ text }), signal: showing.signal }));
 }
 
-// a turn as it streams, then the log as it leaves it: JSON lines, {"thinking"} or {"text"} for each
-// piece of a reply, {"tool"} for each call, {"approve"} when it asks to run and {"answered"} once it's
-// answered, {"result"} for its result, then {"ok"} or {"error"}; the page stops showing it when it opens a session
+// a turn as it streams, JSON lines: {"logged": n} each time the log grows (the page shows it, then what
+// it doesn't hold yet below it), {"thinking"} or {"text"} for each piece of a reply, {"tool"} for each
+// call, {"approve"} when it asks to run and {"answered"} once a page answers, {"result"} for its result,
+// then {"ok"} or {"error"}; then the session as the turn leaves it. Opening a session stops it showing.
 async function follow(response) {
-  $('log').insertAdjacentHTML('beforeend', '<div class="msg tail" id="reply"><div class="who">assistant</div></div>');
-  $('log').scrollTop = $('log').scrollHeight;
   setStatus('Waiting for the model…');
   let error = null;
   try {
@@ -305,9 +297,13 @@ async function follow(response) {
       }
       return reply.lastElementChild;
     };
-    const take = (line) => {
+    const take = async (line) => {
       if (!line.trim()) return;
       const event = JSON.parse(line);
+      if (event.logged != null) {
+        await showLog(event.logged);
+        $('log').insertAdjacentHTML('beforeend', '<div class="msg tail" id="reply"><div class="who">assistant</div></div>');
+      }
       if (event.thinking) part('thinking', '<details class="thinking" open><summary>Thinking</summary><span></span></details>').lastElementChild.textContent += event.thinking;
       if (event.text) part('text', '<div></div>').textContent += event.text;
       if (event.tool) part('tool', `<details class="tool" open><summary>${escape(event.tool.name)}</summary><pre>${escape(JSON.stringify(event.tool.input))}</pre></details>`).id = `call-${event.tool.id}`;
@@ -328,9 +324,9 @@ async function follow(response) {
       const { done, value } = await reader.read();
       if (done) break;
       buffered += decoder.decode(value, { stream: true });
-      for (let i; (i = buffered.indexOf('\n')) >= 0; buffered = buffered.slice(i + 1)) take(buffered.slice(0, i));
+      for (let i; (i = buffered.indexOf('\n')) >= 0; buffered = buffered.slice(i + 1)) await take(buffered.slice(0, i));
     }
-    take(buffered);
+    await take(buffered);
   } catch (err) {
     if (err.name === 'AbortError') return;
     error = err.message;
@@ -368,7 +364,7 @@ $('text').onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.prevent
 $('create').onsubmit = async (e) => {
   e.preventDefault();
   try {
-    await api('/api/sessions', { name: $('newname').value.trim(), workspace: $('newspace').value });
+    await api('/api/sessions', { name: $('newname').value.trim(), workspace: $('newspace').value.trim() || null });
     location.hash = $('newname').value.trim();
     $('newname').value = $('newspace').value = '';
   } catch (err) { alert(err.message); }

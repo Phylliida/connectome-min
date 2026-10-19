@@ -6,7 +6,8 @@
 //! runs with: its provider (by name) and model, its workspace (where bash runs; a session without one
 //! has no bash), whether bash runs in the sandbox, the tools it always allows, its window, reply
 //! reserve and system prompt, and the library's settings (`config`). A new session's file starts as a
-//! copy of `defaults` with the workspace it's given, a fork's as a copy of its parent's.
+//! copy of `defaults` with the workspace it's given, a fork's as a copy of its parent's; a session
+//! without one has none to run with.
 
 use connectome::config::Config;
 use serde::de::DeserializeOwned;
@@ -65,13 +66,9 @@ pub fn expand(path: &str) -> PathBuf {
     }
 }
 
-/// A settings file, or None if there's none.
-pub fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| format!("{}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("{}: {e}", path.display())),
-    }
+pub fn read<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Writes a settings file whole, through a new file that then takes the old one's place, so no one

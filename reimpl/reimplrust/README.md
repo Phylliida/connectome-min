@@ -32,7 +32,8 @@ Settings are JSON files you can edit by hand, read again at each use:
 - `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its
   `window`, `reserve` and `system` prompt, and the library's settings (`config`). A new session's
-  file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its parent's.
+  file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its parent's;
+  a session without one has none to run with, and the page says so.
   The page edits the main fields; `config.merge_threshold` can't change once memories have merged.
 
 Tools: the model can call `bash` (built in: a command in a new shell in the session's workspace, or
@@ -59,8 +60,10 @@ the session's settings; the page's tool list toggles them. A call has `--tool-ti
 default): bash kills a command still running then, with what it started, and an MCP call that runs out
 is cancelled without holding up the server's next call; a server that stops starts again at its next
 call. A turn takes steps, a model request each, until a reply calls no tools (at most 64), and the page
-shows each call as it runs. A page opened while a turn runs (after a reload, or on another device)
-follows it: the turn so far, then the rest as it happens, its calls waiting to be allowed included;
+shows each call as it runs. A turn's log is the session's: a page following a turn shows the log
+as it grows, read from disk, and below it only what the log doesn't hold yet (a reply streaming in, the
+step's calls, their questions and results), which is all the app keeps of a turn. A page opened while
+a turn runs (after a reload, or on another device) follows it the same way, and answers its questions;
 the turn runs on whether any page follows it or not. The page's Continue button runs a turn without a message: after an
 interruption (a failed request, the 64 steps, a restart) the model goes on from the log as it is, and
 after a reply cut short it goes on from that reply (the request ends with it, as a prefill). Tool sources compose as a monoid: a later source's tool shadows an earlier
@@ -85,4 +88,6 @@ python3 tests/test_app.py   # the app against mock APIs over HTTPS, its parts at
 python3 tests/mutants.py tests/test_app.py app/src/main.rs=mutants.json   # mutation testing, each mutant in a copy of its own, many at once
 ```
 
-The three take under 20 seconds together; a batch of mutants takes about as long as one.
+The three take under 30 seconds together. A batch of mutants takes about as long as its slowest one
+(40 of them, half a minute): they build without link-time optimization, from a build kept in
+`target/mutants`.

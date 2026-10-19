@@ -5,9 +5,11 @@ time, and NOBUILD if it doesn't compile. Mutants are JSON, {label: [text, replac
 
     python3 tests/mutants.py tests/test_app.py app/src/main.rs=main.json [app/src/bash.rs=bash.json ...]
 
-A copy has the project's sources and a copy of its release build, so only what a mutant changes
-builds again, and ../reimplclean2 beside it, which test_rust.py runs. A test passes when its last line
-says so: 'chat turns and' (test_app.py) or 'the same as' (test_rust.py).
+Mutants build as the release build does but without link-time optimization (FAST), the same code in
+a fifth of the time. A copy has the project's sources, a copy of a build of them kept in
+target/mutants (so only what a mutant changes builds again), and ../reimplclean2 beside it, which
+test_rust.py runs. A test passes when its last line says so: 'chat turns and' (test_app.py) or 'the
+same as' (test_rust.py).
 """
 import json
 import os
@@ -23,30 +25,31 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TIMEOUT = 240
+FAST = {**os.environ, 'CARGO_PROFILE_RELEASE_LTO': 'false', 'CARGO_PROFILE_RELEASE_CODEGEN_UNITS': '16', 'CARGO_PROFILE_RELEASE_INCREMENTAL': 'true'}
 
 
 def copy(at: Path) -> Path:
     tree = at / ROOT.name
     shutil.copytree(ROOT, tree, ignore=shutil.ignore_patterns('target', 'sessions', '__pycache__'))
     (tree / 'target').mkdir()
-    subprocess.run(['cp', '-a', str(ROOT / 'target' / 'release'), str(tree / 'target')], check=True)
+    subprocess.run(['cp', '-a', str(ROOT / 'target' / 'mutants' / 'release'), str(tree / 'target')], check=True)
     (at / 'reimplclean2').symlink_to(ROOT.parent / 'reimplclean2')
     return tree
 
 
 def run(tree: Path, test: str, file: str, text: str, replacement: str) -> tuple[str, str]:
-    source = tree / file
+    source, started = tree / file, time.monotonic()
     original = source.read_text()
     source.write_text(original.replace(text, replacement))
     try:
-        p = subprocess.Popen([sys.executable, test], cwd=tree, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        p = subprocess.Popen([sys.executable, test], cwd=tree, env=FAST, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
         try:
             out = p.communicate(timeout=TIMEOUT)[0]
         except subprocess.TimeoutExpired:
             os.killpg(p.pid, signal.SIGKILL)
             p.wait()
             return 'TIMEOUT', f'past {TIMEOUT} s'
-        last = (out.strip().splitlines() or [''])[-1]
+        last = f'({time.monotonic() - started:.0f} s) ' + (out.strip().splitlines() or [''])[-1]
         if 'could not compile' in out:
             return 'NOBUILD', next((line for line in out.splitlines() if line.startswith('error')), last)
         return ('MISSED' if 'chat turns and' in last or 'the same as' in last else 'CAUGHT'), last
@@ -64,7 +67,8 @@ def main(test: str, *specs: str) -> int:
                 print(f'{label}: its text is in {file} {source.count(text)} times, not once')
                 return 1
             mutants.append((file, label, text, replacement))
-    workers, started = min(len(mutants), max(1, (os.cpu_count() or 4) // 4)), time.monotonic()
+    workers, started = min(len(mutants), os.cpu_count() or 4), time.monotonic()
+    subprocess.run(['cargo', 'build', '--release', '--quiet'], cwd=ROOT, env={**FAST, 'CARGO_TARGET_DIR': str(ROOT / 'target' / 'mutants')}, check=True)
     with tempfile.TemporaryDirectory() as scratch, ThreadPoolExecutor(workers) as pool:
         trees = queue.Queue()
         for tree in pool.map(lambda i: copy(Path(scratch, str(i))), range(workers)):

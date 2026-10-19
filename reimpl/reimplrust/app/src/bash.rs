@@ -90,16 +90,11 @@ fn run(dir: &Path, input: &Value, limit: Duration, sandbox: Option<&Sandbox>) ->
 /// sandbox's paths that exist (read-only, then read-write), the workspace, and the network unless the
 /// sandbox has none.
 fn bwrap(dir: &Path, b: &Sandbox) -> Vec<OsString> {
-    let mut args: Vec<OsString> = ["--die-with-parent", "--new-session", "--unshare-pid", "--proc", "/proc", "--dev-bind", "/dev", "/dev"].map(OsString::from).into();
-    for (how, path) in b.ro.iter().map(|p| ("--ro-bind-try", p)).chain(b.rw.iter().map(|p| ("--bind-try", p))) {
-        args.extend([how.into(), expand(path).into(), expand(path).into()]);
-    }
-    args.extend(["--bind".into(), dir.into(), dir.into(), "--chdir".into(), dir.into()]);
-    if !b.network {
-        args.push("--unshare-net".into());
-    }
-    args.push("--".into());
-    args
+    let fixed = ["--die-with-parent", "--new-session", "--unshare-pid", "--proc", "/proc", "--dev-bind", "/dev", "/dev"].map(OsString::from);
+    let paths = b.ro.iter().map(|p| ("--ro-bind-try", p)).chain(b.rw.iter().map(|p| ("--bind-try", p)));
+    let binds = paths.flat_map(|(how, p)| [how.into(), expand(p).into(), expand(p).into()]);
+    let workspace = ["--bind".into(), dir.into(), dir.into(), "--chdir".into(), dir.into()];
+    fixed.into_iter().chain(binds).chain(workspace).chain((!b.network).then(|| "--unshare-net".into())).chain(["--".into()]).collect()
 }
 
 /// A file's text, the middle cut out past twice KEPT bytes.

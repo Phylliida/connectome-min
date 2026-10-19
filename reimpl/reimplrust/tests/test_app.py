@@ -10,7 +10,7 @@ and memory requests. Checked: every chat turn gets its reply; memories form and 
 to show them; the context stays within the window; the fork shares its parent's messages through the
 fork point, and its settings are its parent's; a provider saved from the page, and a model a session
 picks, reach the API, the key never the page or a session's file, in a file only its user can read;
-a session's settings refuse a provider there isn't, a workspace that isn't a directory and a new
+a session without settings says so; a session's settings refuse a provider there isn't, a workspace that isn't a directory and a new
 merge_threshold once memories have merged; a session that calls bash after losing its workspace
 gets a failed call, the request still declaring bash; a turn continues without a message, a reply
 cut short going on from its text and a turn whose request failed answering the message it had;
@@ -44,7 +44,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
-seen = {'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None}
+seen = {'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None}
 
 
 class Mock(BaseHTTPRequestHandler):
@@ -108,7 +108,8 @@ class Mock(BaseHTTPRequestHandler):
                 seen['results'].append(results)
             blocks = [{'type': 'thinking', 'thinking': 'Let me think about it.', 'signature': 'c2ln'}] * (seen['chat'] % 4 == 0) \
                 + [{'type': 'text', 'text': f'Reply {seen["chat"]}: ' + ' '.join(['words'] * 80)}]
-        self.stream(blocks, prompt, 0.25 if 'slowly' in last else 0, stop)
+        memory = 'memory' in last and ('Write the memory' in last or 'consolidate' in last)
+        self.stream(blocks, prompt, 0.25 if 'slowly' in last else 0.01 if memory else 0, stop)   # a memory takes a moment, as a page may see
 
     def stream(self, blocks, input_tokens, pause, stop):
         """The reply as server-sent events, its text in five pieces `pause` seconds apart and a tool
@@ -252,7 +253,7 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
     has for its tool, else allow."""
     request = urllib.request.Request(f'http://127.0.0.1:{port}/api/s/{name}/{"continue" if text is None else "say"}', data=json.dumps({'text': text}).encode(), headers={'x-connectome': '1'})
     pieces, thoughts, times, last, tools = [], [], [], {}, {}
-    with urllib.request.urlopen(request, timeout=60) as r:
+    with urllib.request.urlopen(request, timeout=15) as r:                   # no turn here goes 15 s without an event
         for line in r:
             last = json.loads(line)
             if 'text' in last:
@@ -264,7 +265,7 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
                 tools[last['tool']['id']] = last['tool']['name']
             if 'approve' in last:
                 seen['asked'].append(tools[last['approve']])
-                call(port, '/api/approve', {'id': last['approve'], 'answer': (answers or {}).get(tools[last['approve']], 'allow')})
+                call(port, f'/api/s/{name}/approve', {'id': last['approve'], 'answer': (answers or {}).get(tools[last['approve']], 'allow')})
             thoughts.append(last.get('thinking', ''))
     if not last.get('ok'):
         raise SystemExit(f'{name}: "{(text or "(continue)")[:40]}" got {last}')
@@ -274,6 +275,7 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
 def settle(port, name):
     """The session's state once its memories have formed."""
     while (state := call(port, f'/api/s/{name}'))['forming']:
+        seen['forming'] = True
         time.sleep(0.05)
     return state
 
@@ -288,7 +290,8 @@ def chat(port, name, turns, start, window=WINDOW):
         reply, thinking, _ = say(port, name, text)
         state = settle(port, name)
         logged = call(port, f'/api/s/{name}/messages?from={state["messages"] - 1}')[0]
-        if not reply.startswith('Reply ') or (logged['text'], logged['thinking']) != (reply, thinking):
+        # what streamed is the logged reply's start: a page a moment behind when it's logged reads the rest from the log
+        if not logged['text'].startswith('Reply ') or not logged['text'].startswith(reply) or not logged['thinking'].startswith(thinking):
             raise SystemExit(f'turn {t}: the page got {reply[:60]!r} after {thinking[:40]!r}, the log holds {logged}')
         seen['thought'] += bool(thinking)
         if state['armed'] and state['armed'] > window * 1.02:
@@ -299,18 +302,21 @@ def chat(port, name, turns, start, window=WINDOW):
 def streamed_large(tls, ca) -> str:
     """A session of large messages in a huge window, each context streaming all of them: from the
     second turn to the last the contexts grow sixfold, and the app's peak memory may grow by less
-    than three messages."""
+    than three messages, and no more as the page lists them all. The app runs without bash (--no-bash),
+    which a session with a workspace then lacks."""
     port, root, size, mock_port = free_port(), tempfile.mkdtemp(), 900_000, free_port()
     mock = serve(mock_port, tls)
     app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--base', f'https://localhost:{mock_port}', '--ca', ca,
-                            '--model', 'mock', '--window', '20000000', '--reserve', '1000', '--no-open'], stderr=subprocess.PIPE, text=True)
+                            '--model', 'mock', '--window', '20000000', '--reserve', '1000', '--no-bash', '--no-open'], stderr=subprocess.PIPE, text=True)
     try:
         for _ in range(100):
             try:
-                call(port, '/api/sessions', {'name': 'large'})
+                call(port, '/api/sessions', {'name': 'large', 'workspace': tempfile.mkdtemp()})
                 break
             except OSError:
                 time.sleep(0.05)
+        if (tools := call(port, '/api/s/large')['tools']) != []:
+            raise SystemExit(f'without bash, a session with a workspace has tools {tools}')
         peaks, contexts = [], []
         for t in range(12):
             words = ' '.join(f'w{t}x{i}' for i in range(size // 8))[:size]
@@ -320,6 +326,8 @@ def streamed_large(tls, ca) -> str:
             contexts.append(seen['largest'] // 1024)
         if peaks[-1] - peaks[1] > 3 * size // 1024:
             raise SystemExit(f'peak memory grew from {peaks[1]} KB to {peaks[-1]} KB as contexts grew from {contexts[1]} KB to {contexts[-1]} KB')
+        if len(call(port, '/api/s/large/messages')) != 24 or (listed := peak_kb(app.pid)) - peaks[-1] > 3 * size // 1024:
+            raise SystemExit(f'listing the messages took the peak from {peaks[-1]} KB to {listed} KB')
         return f'contexts of {contexts[1]} KB to {contexts[-1]} KB streamed at peaks of {peaks[1]} KB to {peaks[-1]} KB'
     finally:
         app.terminate()
@@ -366,7 +374,7 @@ def tooled(tls, ca, baseline) -> str:
             raise SystemExit(f'"{text}" asked to run {seen["asked"][before:]}, not {asked}')
         return {r['tool_use_id'].split('-')[1]: r for r in seen['results'][-1]}
     try:
-        call(port, '/api/sessions', {'name': 'tools', 'workspace': work})
+        call(port, '/api/sessions', {'name': 'tools', 'workspace': work + '/'})   # kept without the slash
         if (names := [t['name'] for t in call(port, '/api/sessions', {'name': 'bare'})['tools']]) != ['fail', 'picture', 'hang', 'die', 'add']:
             raise SystemExit(f'a session without a workspace has tools {names}')
         if (spaces := {s['name']: s['workspace'] for s in call(port, '/api/sessions')}) != {'tools': work, 'bare': None}:
@@ -424,7 +432,7 @@ def tooled(tls, ca, baseline) -> str:
         got = results('call [["die", {}], ["picture", {}]]', asked=['die'])
         if got['0']['content'] != 'MCP server first: the server stopped' or got['1'].get('is_error'):
             raise SystemExit(f'a server that stops, then a call that starts it again: {got}')
-        first, asking = [], 'call ' + json.dumps([['add', {'a': 1, 'b': 2}]])
+        first, asking, state = [], 'call ' + json.dumps([['add', {'a': 1, 'b': 2}]]), call(port, '/api/s/tools')
 
         def started():
             request = urllib.request.Request(f'http://127.0.0.1:{port}/api/s/tools/say', data=json.dumps({'text': asking}).encode(), headers={'x-connectome': '1'})
@@ -432,8 +440,8 @@ def tooled(tls, ca, baseline) -> str:
                 first.extend(json.loads(line) for line in r)
         starter = threading.Thread(target=started)
         starter.start()
-        for _ in range(500):                                            # the turn waits for an answer, so it runs until one comes
-            if call(port, '/api/s/tools')['running'] is not None:
+        for _ in range(500):                                            # until the turn waits for an answer, which it does until one comes
+            if any('approve' in e for e in first) and call(port, '/api/s/tools')['running']:
                 break
             time.sleep(0.02)
         else:
@@ -443,11 +451,15 @@ def tooled(tls, ca, baseline) -> str:
             for line in r:
                 late.append(json.loads(line))
                 if 'approve' in late[-1]:
-                    call(port, '/api/approve', {'id': late[-1]['approve'], 'answer': 'allow'})
+                    call(port, '/api/s/tools/approve', {'id': late[-1]['approve'], 'answer': 'allow'})
         starter.join()
-        kinds = [next(iter(e)) for e in late if 'text' not in e and 'thinking' not in e]
-        if late != first or kinds != ['tool', 'approve', 'answered', 'result', 'ok'] or call(port, '/api/s/tools')['running'] is not None:
-            raise SystemExit(f'a page that came in during the turn got {kinds}; the page that started it {len(first)} events, it {len(late)}')
+        # it starts where the log stands (the message and the reply that calls logged), then gets what the first page
+        # gets from there on, but the reply's pieces, which a page a moment behind when the log grows reads from the log
+        outline = lambda events: [e for e in events if not {'text', 'thinking'} & set(e)]
+        kinds = [next(iter(e)) for e in outline(late) if 'logged' not in e]
+        if outline(first)[-len(outline(late)):] != outline(late) or late[0] != {'logged': state['messages'] + 2} \
+                or kinds != ['tool', 'approve', 'answered', 'result', 'ok'] or call(port, '/api/s/tools')['running']:
+            raise SystemExit(f'a page that came in during the turn got {kinds} from {late[0]}; the page that started it {len(first)} events, it {len(late)}')
         try:
             say(port, 'tools', 'use tools forever', {'add': 'always'})
             raise SystemExit('a turn that never stops calling tools ended')
@@ -495,16 +507,22 @@ def chatted(turns, tls, ca, baseline) -> str:
         if abs(state['multiplier'] - 1) < 0.01:
             raise SystemExit(f'the price multiplier ({state["multiplier"]}) never calibrated to the prompt sizes the API reports')
         baseline.put(state['multiplier'])
+        shown = [m['shown'] for m in call(port, '/api/s/main/messages')]     # memories, then raw chunks, then the tail, as the context shows them
+        if 'recalled' not in shown or shown[-1] != 'tail' or shown != sorted(shown, key=['recalled', 'raw', 'tail'].index):
+            raise SystemExit(f'the context shows the log as {shown}')
         if seen['problems']:
             raise SystemExit(f'the API would reject a request: {seen["problems"][0]}')
         if not seen['thought']:
             raise SystemExit('no reply streamed its reasoning')
+        if not seen['forming']:
+            raise SystemExit('the page never saw memories forming')
         levels = {level for level, _ in state['frontier'] or []}
         if len(state['layers']) < 3 or not levels - {0}:
             raise SystemExit(f'memories did not form or show: layers {state["layers"]}, frontier {state["frontier"]}')
         call(port, '/api/s/main/settings', {'system': 'You are being tested.'})
         call(port, '/api/s/main/fork', {'at': 20, 'name': 'branch'})
-        parent, fork = call(port, '/api/s/main/messages?from=0&to=21'), call(port, '/api/s/branch/messages?from=0')
+        logged = lambda name, query: [{k: v for k, v in m.items() if k != 'shown'} for m in call(port, f'/api/s/{name}/messages?{query}')]   # how each context shows them aside
+        parent, fork = logged('main', 'from=0&to=21'), logged('branch', 'from=0')
         if fork != parent:
             raise SystemExit('the fork does not share its parent\'s messages')
         if call(port, '/api/s/branch')['settings'] != call(port, '/api/s/main')['settings']:
@@ -532,9 +550,9 @@ def chatted(turns, tls, ca, baseline) -> str:
             raise SystemExit(f'settings: the API saw key {seen["key"]!r} and model {seen["model"]!r}, the page sees {shown}, settings.json has mode {mode:o}')
         if not next(p for p in call(port, '/api/settings', {'name': 'plain', 'base': f'http://127.0.0.1:{plain_port}/v1', 'key': ' '})['providers'] if p['name'] == 'plain')['key']:
             raise SystemExit('a provider saved without a key lost the one it had')
-        Path(root, 'old').mkdir()                                       # a session from before session settings
-        if call(port, '/api/s/old')['settings'] != json.loads(Path(root, 'settings.json').read_text())['defaults']:
-            raise SystemExit('a session without settings did not get the defaults')
+        Path(root, 'old').mkdir()                                       # a session without settings has none to run with
+        if 'session_settings.json' not in (call(port, '/api/s/old')['problem'] or ''):
+            raise SystemExit('a session without settings did not say so')
         for wrong in ({'provider': 'nowhere'}, {'workspace': '/nonexistent/dir'}, {'config': {'merge_threshold': 3}}):
             try:
                 call(port, '/api/s/main/settings', wrong)
