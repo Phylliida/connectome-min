@@ -43,8 +43,10 @@ input[type=checkbox] { width: auto; }
 .settings label, .settings small, .legend, .msg .who { font-size: 12px; color: var(--muted); }
 #chat { display: flex; flex-direction: column; padding: 0; }
 #log { flex: 1; overflow: auto; padding: 16px; }
-.msg { position: relative; margin: 0 0 12px; }
+.msg { position: relative; margin-top: 12px; }
 .msg .who { margin-bottom: 4px; }
+.msg.more { margin-top: 0; }
+.msg.more > .who { display: none; }
 .msg[data-who="user"]:not(.results) { display: flex; flex-direction: column; align-items: flex-end; }
 .msg[data-who="user"]:not(.results) .bubble { max-width: 85%; }
 .msg[data-who="user"] > button { right: auto; left: 0; }
@@ -249,17 +251,24 @@ async function open() {
   } catch (err) { setStatus(err.message, true); }
 }
 
-// the log's newest messages, up to the nth if given, their blocks drawn, the user's on the right
+// the log's newest messages, up to the nth if given, their blocks drawn, the user's on the right. A
+// message's line shows only where the speaker changes ("more" goes on), and a message of tool results
+// whose results all joined their calls isn't shown at all.
 async function showLog(n) {
   const messages = await api(`/api/s/${current()}/messages${n == null ? '' : `?to=${n}`}`);
   $('log').innerHTML = '';
   for (const m of messages) {
-    const results = m.content.every((b) => b.type === 'tool_result');
-    $('log').insertAdjacentHTML('beforeend', `<div class="msg${results ? ' results' : ''}" data-who="${escape(m.participant)}"><div class="who">#${m.id} · ${escape(m.participant)}${results ? ' · tool results, on the calls' : ''}</div><button data-fork="${m.id}">fork here</button></div>`);
-    for (const b of m.content) draw($('log').lastElementChild, b);
+    const results = m.content.every((b) => b.type === 'tool_result'), more = m.participant === shownLast()?.dataset.who;
+    $('log').insertAdjacentHTML('beforeend', `<div class="msg${results ? ' results' : ''}${more ? ' more' : ''}" data-who="${escape(m.participant)}"><div class="who">#${m.id} · ${escape(m.participant)}${results ? ' · tool results' : ''}</div><button data-fork="${m.id}">fork here</button></div>`);
+    const shown = $('log').lastElementChild;
+    for (const b of m.content) draw(shown, b);
+    shown.hidden = results && !shown.querySelector('.tool');
   }
   $('log').scrollTop = $('log').scrollHeight;
 }
+
+// the last message the log shows
+const shownLast = () => [...$('log').querySelectorAll('.msg:not([hidden])')].pop();
 
 // how a block shows, each a bubble of its own under its message's line: text as it is (the assistant's
 // as markdown), reasoning folded to its last line, a call as a card that stays open until its result
@@ -421,7 +430,8 @@ async function follow(response) {
       const event = JSON.parse(line);
       if (event.logged != null) {
         await showLog(event.logged);
-        $('log').insertAdjacentHTML('beforeend', '<div class="msg" id="reply" data-who="assistant"><div class="who">assistant</div></div>');
+        const more = shownLast()?.dataset.who === 'assistant' ? ' more' : '';
+        $('log').insertAdjacentHTML('beforeend', `<div class="msg${more}" id="reply" data-who="assistant"><div class="who">assistant</div></div>`);
       }
       if (event.thinking) {   // the reasoning so far, its block showing its last line
         const thinking = part('thinking');
