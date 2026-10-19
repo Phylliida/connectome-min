@@ -103,5 +103,5 @@ python3 tests/mutants.py tests/test_app.py app/src/main.rs=mutants.json   # muta
 ```
 
 The three take under 30 seconds together. A batch of mutants takes about as long as its slowest one
-(82 of the app's, under a minute): they build without link-time optimization, from a build kept in
+(80 of the app's, under a minute): they build without link-time optimization, from a build kept in
 `target/mutants`.

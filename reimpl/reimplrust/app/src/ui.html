@@ -44,7 +44,6 @@ input[type=checkbox] { width: auto; }
 #chat { display: flex; flex-direction: column; padding: 0; }
 #log { flex: 1; overflow: auto; padding: 16px; }
 .msg { position: relative; margin: 0 0 12px; }
-.msg.recalled { opacity: .55; }
 .msg .who { margin-bottom: 4px; }
 .msg[data-who="user"]:not(.results) { display: flex; flex-direction: column; align-items: flex-end; }
 .msg[data-who="user"]:not(.results) .bubble { max-width: 85%; }
@@ -250,14 +249,13 @@ async function open() {
   } catch (err) { setStatus(err.message, true); }
 }
 
-// the log's newest messages, up to the nth if given, its blocks drawn, the user's on the right and a
-// message the context only recalls through a memory faded
+// the log's newest messages, up to the nth if given, their blocks drawn, the user's on the right
 async function showLog(n) {
   const messages = await api(`/api/s/${current()}/messages${n == null ? '' : `?to=${n}`}`);
   $('log').innerHTML = '';
   for (const m of messages) {
     const results = m.content.every((b) => b.type === 'tool_result');
-    $('log').insertAdjacentHTML('beforeend', `<div class="msg ${m.shown}${results ? ' results' : ''}" data-who="${escape(m.participant)}"><div class="who">#${m.id} · ${escape(m.participant)}${results ? ' · tool results, on the calls' : ''}</div><button data-fork="${m.id}">fork here</button></div>`);
+    $('log').insertAdjacentHTML('beforeend', `<div class="msg${results ? ' results' : ''}" data-who="${escape(m.participant)}"><div class="who">#${m.id} · ${escape(m.participant)}${results ? ' · tool results, on the calls' : ''}</div><button data-fork="${m.id}">fork here</button></div>`);
     for (const b of m.content) draw($('log').lastElementChild, b);
   }
   $('log').scrollTop = $('log').scrollHeight;
@@ -423,7 +421,7 @@ async function follow(response) {
       const event = JSON.parse(line);
       if (event.logged != null) {
         await showLog(event.logged);
-        $('log').insertAdjacentHTML('beforeend', '<div class="msg tail" id="reply" data-who="assistant"><div class="who">assistant</div></div>');
+        $('log').insertAdjacentHTML('beforeend', '<div class="msg" id="reply" data-who="assistant"><div class="who">assistant</div></div>');
       }
       if (event.thinking) {   // the reasoning so far, its block showing its last line
         const thinking = part('thinking');

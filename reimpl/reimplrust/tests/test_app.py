@@ -593,9 +593,6 @@ def chatted(turns, tls, ca, baseline) -> str:
         if abs(state['multiplier'] - 1) < 0.01:
             raise SystemExit(f'the price multiplier ({state["multiplier"]}) never calibrated to the prompt sizes the API reports')
         baseline.put(state['multiplier'])
-        shown = [m['shown'] for m in call(port, '/api/s/main/messages')]     # memories, then raw chunks, then the tail, as the context shows them
-        if 'recalled' not in shown or shown[-1] != 'tail' or shown != sorted(shown, key=['recalled', 'raw', 'tail'].index):
-            raise SystemExit(f'the context shows the log as {shown}')
         if seen['problems']:
             raise SystemExit(f'the API would reject a request: {seen["problems"][0]}')
         if not seen['thought']:
@@ -608,7 +605,7 @@ def chatted(turns, tls, ca, baseline) -> str:
         call(port, '/api/s/main/settings', {'system': 'You are being tested.'})
         if (made := call(port, '/api/s/main/fork', {'at': 20, 'name': 'branch'})).get('messages') != 21:   # the fork as the page then shows it
             raise SystemExit(f'the fork answered {str(made)[:80]}, not its state with 21 messages')
-        logged = lambda name, query: [{k: v for k, v in m.items() if k != 'shown'} for m in call(port, f'/api/s/{name}/messages?{query}')]   # how each context shows them aside
+        logged = lambda name, query: call(port, f'/api/s/{name}/messages?{query}')
         parent, fork = logged('main', 'from=0&to=21'), logged('branch', 'from=0')
         if fork != parent:
             raise SystemExit('the fork does not share its parent\'s messages')

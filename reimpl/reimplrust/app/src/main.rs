@@ -345,12 +345,8 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, par
     let s = Session::open(app.root.join(name));
     match (method, rest) {
         ("GET", []) => Ok(Some(state(app, name, &s))),
-        ("GET", ["messages"]) => {
-            let (from, messages) = listing(&s, "messages", 200, param);
-            let class = shown_as(&s, from);
-            send_all(stream, messages.map(|m| shown(&m, class(m.id()))))
-        }
-        ("GET", ["layer", n]) => send_all(stream, listing(&s, &format!("layer{n}"), u64::MAX, param).1),
+        ("GET", ["messages"]) => send_all(stream, listing(&s, "messages", 200, param).map(|m| shown(&m))),
+        ("GET", ["layer", n]) => send_all(stream, listing(&s, &format!("layer{n}"), u64::MAX, param)),
         ("POST", ["fork"]) => {
             let at = body["at"].as_f64().ok_or("fork at which message?")? as u64;
             let fork = body["name"].as_str().filter(|f| named(f)).ok_or("a fork's name")?;
@@ -380,22 +376,11 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, par
     }
 }
 
-/// Records `from` to `to` of a file (by default, its newest `newest`), as they're read, and `from`.
-fn listing<'s>(s: &'s Session, file: &str, newest: u64, param: impl Fn(&str) -> Option<u64>) -> (u64, Box<dyn Iterator<Item = Value> + 's>) {
+/// Records `from` to `to` of a file (by default, its newest `newest`), as they're read.
+fn listing<'s>(s: &'s Session, file: &str, newest: u64, param: impl Fn(&str) -> Option<u64>) -> Box<dyn Iterator<Item = Value> + 's> {
     let to = param("to").map_or(s.count(file), |to| to.min(s.count(file)));
     let from = param("from").unwrap_or(to.saturating_sub(newest));
-    (from, if from < to { s.span(file, from, to - 1) } else { Box::new(std::iter::empty()) })
-}
-
-/// How the last compile's context shows each message from `from` on: in the raw tail, past the chunks
-/// ("tail"), through a memory the context shows ("recalled"), or in a raw chunk ("raw"). Only the
-/// memories that reach `from` are read, from the end.
-fn shown_as(s: &Session, from: u64) -> impl Fn(u64) -> &'static str {
-    let chunked = s.last("layer0").map_or(0, |c| c["last"].u64() + 1);
-    let frontier = s.last("compiles").map_or(vec![], |c| c["frontier"].arr().iter().map(|n| (n[0].u64(), n[1].u64())).collect());
-    let memories = frontier.into_iter().rev().filter(|&(level, _)| level > 0).map(|(level, p)| s.read(&format!("layer{level}"), p));
-    let recalled: Vec<(u64, u64)> = memories.map(|m| (m["first"].u64(), m["last"].u64())).take_while(|&(_, last)| last >= from).collect();
-    move |i| if i >= chunked { "tail" } else if recalled.iter().any(|&(first, last)| (first..=last).contains(&i)) { "recalled" } else { "raw" }
+    if from < to { s.span(file, from, to - 1) } else { Box::new(std::iter::empty()) }
 }
 
 /// A session's thread: it does its jobs one at a time, in the order they come (a message or fork told
@@ -614,9 +599,9 @@ fn tuned(app: &App, old: &SessionSettings, v: &Value, merged: bool) -> Result<Se
     Ok(new)
 }
 
-/// A message as the page shows it: how the context shows it, and its blocks, brief.
-fn shown(m: &Value, class: &str) -> Value {
-    obj! {"id" => m.id(), "participant" => m["participant"].clone(), "shown" => class, "content" => m["content"].arr().iter().map(brief).collect::<Vec<_>>()}
+/// A message as the page shows it: its blocks brief.
+fn shown(m: &Value) -> Value {
+    obj! {"id" => m.id(), "participant" => m["participant"].clone(), "content" => m["content"].arr().iter().map(brief).collect::<Vec<_>>()}
 }
 
 /// A block as the page gets it: text and tool calls as they are, reasoning without its signature, a
