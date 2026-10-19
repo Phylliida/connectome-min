@@ -43,10 +43,16 @@ input[type=checkbox] { width: auto; }
 .settings label, .settings small, .legend, .msg .who { font-size: 12px; color: var(--muted); }
 #chat { display: flex; flex-direction: column; padding: 0; }
 #log { flex: 1; overflow: auto; padding: 16px; }
-.msg { position: relative; background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--raw); border-radius: 6px; padding: 8px 10px; margin: 0 0 8px; white-space: pre-wrap; word-wrap: break-word; }
+.msg { position: relative; border-left: 4px solid var(--raw); padding: 0 0 0 10px; margin: 0 0 12px; }
 .msg.tail { border-left-color: var(--tail); }
 .msg.recalled { opacity: .55; }
-.thinking { color: var(--muted); font-style: italic; margin: 2px 0 6px; }
+.msg .who { margin-bottom: 4px; }
+.bubble, .thinking, .tool { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; margin: 0 0 6px; }
+.bubble { white-space: pre-wrap; word-wrap: break-word; }
+.thinking { border-style: dashed; color: var(--muted); padding: 6px 10px; }
+.thinking > div { white-space: pre-wrap; font-style: italic; margin-top: 6px; }
+.thinking .last { display: inline-block; max-width: calc(100% - 90px); vertical-align: bottom; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-style: italic; margin-left: 6px; }
+.thinking[open] .last { display: none; }
 .md { white-space: normal; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
@@ -66,8 +72,8 @@ input[type=checkbox] { width: auto; }
 .diff .add { background: var(--add); }
 .diff .del { background: var(--del); }
 .md blockquote { margin: 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
-.thinking summary { cursor: pointer; font-style: normal; font-size: 12px; }
-.tool { border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; margin: 4px 0; }
+.thinking summary { cursor: pointer; font-size: 12px; }
+.tool { padding: 6px 10px; }
 .tool summary { cursor: pointer; font-size: 12px; color: var(--muted); }
 .tool pre { white-space: pre-wrap; font: 12px/1.4 ui-monospace, monospace; margin: 4px 0; }
 .tool.failed summary, .tool pre.failed { color: var(--warn); }
@@ -75,7 +81,7 @@ input[type=checkbox] { width: auto; }
 #reply:has(> .who:only-child) { display: none; }
 .chip { font-size: 12px; padding: 0 6px; margin-left: 4px; color: var(--muted); }
 .chip.on { border-color: var(--tail); color: var(--tail); }
-.msg > button { position: absolute; top: 6px; right: 6px; font-size: 12px; padding: 1px 6px; display: none; }
+.msg > button { position: absolute; top: 0; right: 0; font-size: 12px; padding: 1px 6px; display: none; }
 .msg:hover > button { display: block; }
 form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
 form textarea { resize: vertical; min-height: 42px; }
@@ -255,13 +261,16 @@ async function showLog(n) {
   $('log').scrollTop = $('log').scrollHeight;
 }
 
-// how a block shows: text as it is (the assistant's as markdown), reasoning folded, a call as a card
-// that stays open until its result joins it (an edit's as a diff; a call the reply is still writing
-// as its tool and its input so far), anything else as a note (an image as its size)
+// how a block shows, each a bubble of its own under its message's line: text as it is (the assistant's
+// as markdown), reasoning folded to its last line, a call as a card that stays open until its result
+// joins it (an edit's as a diff; a call the reply is still writing as its tool and its input so far),
+// anything else as a note (an image as its size)
 const note = (b) => b.type === 'image' ? `[image, ${b.kb} KB]` : `[${b.type}]`;
+// reasoning's last line, what its folded block shows (the end of it, when long)
+const lastLine = (text) => { const line = text.trimEnd().split('\n').pop(); return line.length > 200 ? '…' + line.slice(-200) : line; };
 const parts = {
-  text: (b, into) => into.dataset.who === 'assistant' ? `<div class="md">${markdown(b.text)}</div>` : `<div>${escape(b.text)}</div>`,
-  thinking: (b) => `<details class="thinking"><summary>Thinking</summary><span>${escape(b.thinking)}</span></details>`,
+  text: (b, into) => into.dataset.who === 'assistant' ? `<div class="bubble md">${markdown(b.text)}</div>` : `<div class="bubble">${escape(b.text)}</div>`,
+  thinking: (b) => `<details class="thinking"><summary>Thinking<span class="last">${escape(lastLine(b.thinking))}</span></summary><div>${escape(b.thinking)}</div></details>`,
   tool_use: (b) => {
     const edit = b.name === 'edit', what = edit ? diff(b.input) : `<pre>${escape(JSON.stringify(b.input))}</pre>`;
     return `<details class="tool" id="call-${escape(b.id)}" open><summary>${escape(b.name)}${edit ? ' ' + escape(b.input.path ?? '') : ''}</summary>${what}</details>`;
@@ -282,15 +291,19 @@ function diff({ path = '', old = '', new: text = '' }) {
 // block b at the end of `into`; a tool result joins its call's card when the page shows it
 function draw(into, b) {
   if (b.type === 'tool_result') return result($(`call-${b.toolUseId}`) ?? into, b);
-  into.insertAdjacentHTML('beforeend', (parts[b.type] ?? ((b) => `<div>${escape(note(b))}</div>`))(b, into));
+  into.insertAdjacentHTML('beforeend', (parts[b.type] ?? ((b) => `<div class="bubble">${escape(note(b))}</div>`))(b, into));
   into.lastElementChild.dataset.kind = b.type;
 }
 
-// a tool result's text, and on its call's card its first line, the card then closed unless it shows a diff
+// a tool result's text, and on its call's card its first line, the card then closed unless it shows a
+// diff; without its call on the page, a card of its own
 function result(card, b) {
   const text = typeof b.content === 'string' ? b.content : b.content.map((c) => c.text ?? note(c)).join('\n');
+  if (!card.matches('.tool')) {
+    card.insertAdjacentHTML('beforeend', '<details class="tool" open><summary>an earlier call</summary></details>');
+    card = card.lastElementChild;
+  }
   card.insertAdjacentHTML('beforeend', `<pre class="${b.isError ? 'failed' : ''}">${escape(text)}</pre>`);
-  if (!card.matches('.tool')) return;
   card.querySelector('summary').textContent += ` → ${text.split('\n')[0].slice(0, 100)}`;
   card.classList.toggle('failed', !!b.isError);
   card.open = !!card.querySelector('.diff');
@@ -410,7 +423,11 @@ async function follow(response) {
         await showLog(event.logged);
         $('log').insertAdjacentHTML('beforeend', '<div class="msg tail" id="reply" data-who="assistant"><div class="who">assistant</div></div>');
       }
-      if (event.thinking) Object.assign(part('thinking'), { open: true }).lastElementChild.textContent += event.thinking;
+      if (event.thinking) {   // the reasoning so far, its block showing its last line
+        const thinking = part('thinking');
+        thinking.lastElementChild.textContent += event.thinking;
+        thinking.querySelector('.last').textContent = lastLine(thinking.lastElementChild.textContent);
+      }
       if (event.calling) draw($('reply'), { type: 'calling', name: event.calling });
       if (event.input) $('reply').lastElementChild.lastElementChild.textContent += event.input;
       if (event.text) {   // the reply's markdown so far, drawn again

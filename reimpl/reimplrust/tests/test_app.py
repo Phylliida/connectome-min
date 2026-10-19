@@ -91,6 +91,9 @@ class Mock(BaseHTTPRequestHandler):
         elif last.startswith('echo '):                             # the message back, as the reply
             seen['chat'] += 1
             blocks = [{'type': 'text', 'text': last[len('echo '):]}]
+        elif last.startswith('think '):                            # the message back as reasoning, then an answer
+            seen['chat'] += 1
+            blocks = [{'type': 'thinking', 'thinking': last[len('think '):], 'signature': 'c2ln'}, {'type': 'text', 'text': 'Thought it through.'}]
         elif 'a long story' in last:
             seen['chat'] += 1
             blocks, stop = [{'type': 'text', 'text': 'Once upon a time'}], 'max_tokens'
