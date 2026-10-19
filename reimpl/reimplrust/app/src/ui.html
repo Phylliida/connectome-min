@@ -59,6 +59,7 @@ input[type=checkbox] { width: auto; }
 .thinking .last { display: inline-block; max-width: calc(100% - 90px); vertical-align: bottom; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-style: italic; margin-left: 6px; }
 .thinking[open] .last { display: none; }
 .md { white-space: normal; }
+.md .tail { display: contents; }
 .md > :first-child { margin-top: 0; }
 .md > :last-child { margin-bottom: 0; }
 .md pre, .md code { font: 12px/1.4 ui-monospace, monospace; background: var(--bg); border-radius: 4px; }
@@ -246,12 +247,13 @@ $('sessions').addEventListener('toggle', (e) => {
   try { localStorage.setItem('folded', JSON.stringify([...folded])); } catch { /* no storage here: kept until the page reloads */ }
 }, true);
 
-// the session the page shows, and the job running in it as it goes on
-async function open() {
+// the session the page shows, and the job running in it as it goes on; with `more`, its log only
+// drawn on from where the page has it
+async function open(more = false) {
   showing?.abort();
   try {
     state = await api(`/api/s/${current()}`);
-    await showLog();
+    await showLog(undefined, more);
     drawMemory();
     fill();
     listSessions();
@@ -260,15 +262,20 @@ async function open() {
   } catch (err) { setStatus(err.message, true); }
 }
 
-// the log's newest messages, up to the nth if given, their blocks drawn, the user's on the right. A
-// message's line (whose it is) shows only where the speaker changes ("more" goes on), and a message of tool results
-// whose results all joined their calls isn't shown at all.
-async function showLog(n) {
-  const messages = await api(`/api/s/${current()}/messages${n == null ? '' : `?to=${n}`}`);
-  $('log').innerHTML = '';
+// the log's newest messages, up to the nth if given, all drawn again; with `more`, only those after the
+// last the page shows, in place of the streaming reply (and the fold line drawn before it). Their
+// blocks are drawn, the user's on the right. A message's line (whose it is) shows only where the
+// speaker changes ("more" goes on), and a message of tool results whose results all joined their
+// calls isn't shown at all.
+async function showLog(n, more = false) {
+  const last = more ? [...$('log').querySelectorAll('.msg[data-id]')].pop()?.dataset.id : undefined;
+  const range = [last == null ? '' : `from=${+last + 1}`, n == null ? '' : `to=${n}`].filter(Boolean).join('&');
+  const messages = await api(`/api/s/${current()}/messages?${range}`);
+  if (last == null) $('log').innerHTML = '';
+  $('log').querySelectorAll('#reply, .fold.live').forEach((streamed) => streamed.remove());
   for (const m of messages) {
     const results = m.content.every((b) => b.type === 'tool_result'), more = m.participant === shownLast()?.dataset.who;
-    $('log').insertAdjacentHTML('beforeend', `<div class="msg${results ? ' results' : ''}${more ? ' more' : ''}" data-who="${escape(m.participant)}"><div class="who">${escape(m.participant)}${results ? ' · tool results' : ''}</div><button data-fork="${m.id}">fork here</button></div>`);
+    $('log').insertAdjacentHTML('beforeend', `<div class="msg${results ? ' results' : ''}${more ? ' more' : ''}" data-id="${m.id}" data-who="${escape(m.participant)}"><div class="who">${escape(m.participant)}${results ? ' · tool results' : ''}</div><button data-fork="${m.id}">fork here</button></div>`);
     const shown = $('log').lastElementChild;
     if (m.fold) shown.insertAdjacentHTML('beforebegin', foldLine(m.fold));
     for (const b of m.content) draw(shown, b);
@@ -293,6 +300,20 @@ const shownLast = () => [...$('log').querySelectorAll('.msg:not([hidden])')].pop
 // joins it (an edit's as a diff; a call the reply is still writing as its tool and its input so far),
 // anything else as a note (an image as its size)
 const note = (b) => b.type === 'image' ? `[image, ${b.kb} KB]` : `[${b.type}]`;
+// a streaming reply's text: its markdown up to its last blank line outside code (finished blocks) drawn
+// once, into the part before its tail, and only the rest drawn again as pieces come
+function drawText(part) {
+  if (!part.lastElementChild) part.innerHTML = '<div class="tail"></div>';
+  let [open, cut] = [false, part.cut ?? 0];
+  for (const m of part.source.slice(part.cut ?? 0).matchAll(/^(?:```|~~~)|\n\n/gm)) {
+    if (m[0] !== '\n\n') open = !open;
+    else if (!open) cut = (part.cut ?? 0) + m.index + 2;
+  }
+  if (cut > (part.cut ?? 0)) part.lastElementChild.insertAdjacentHTML('beforebegin', markdown(part.source.slice(part.cut ?? 0, cut)));
+  part.cut = cut;
+  part.lastElementChild.innerHTML = markdown(part.source.slice(cut));
+}
+
 // reasoning's last line, what its folded block shows (the end of it, when long)
 const lastLine = (text) => { const line = text.trimEnd().split('\n').pop(); return line.length > 200 ? '…' + line.slice(-200) : line; };
 const parts = {
@@ -343,14 +364,16 @@ function draw(into, b) {
 }
 
 // a tool result's text, and on its call's line its first line (shown while the card is folded), the
-// card then folded unless it shows a diff; without its call on the page, a card of its own
+// card then folded unless it shows a diff; in place of the result the card has (the one that streamed,
+// once the log has it); without its call on the page, a card of its own
 function result(card, b) {
   const text = typeof b.content === 'string' ? b.content : b.content.map((c) => c.text ?? note(c)).join('\n');
   if (!card.matches('.tool')) {
     card.insertAdjacentHTML('beforeend', '<details class="tool" open><summary>an earlier call</summary></details>');
     card = card.lastElementChild;
   }
-  card.insertAdjacentHTML('beforeend', `<pre class="${b.isError ? 'failed' : ''}">${escape(text)}</pre>`);
+  card.querySelectorAll(':scope > pre.result, summary > .out').forEach((had) => had.remove());
+  card.insertAdjacentHTML('beforeend', `<pre class="result${b.isError ? ' failed' : ''}">${escape(text)}</pre>`);
   card.querySelector('summary').insertAdjacentHTML('beforeend', `<span class="out"> → ${escape(text.split('\n')[0].slice(0, 100))}</span>`);
   card.classList.toggle('failed', !!b.isError);
   card.open = !!card.querySelector('.diff');
@@ -473,40 +496,51 @@ async function follow(response) {
       if ($('reply').lastElementChild.dataset.kind !== kind) draw($('reply'), { type: kind, [kind]: '' });
       return $('reply').lastElementChild;
     };
+    // the parts pieces grew, drawn at most once a frame however fast pieces come, and the log scrolled
+    // to the end then, once
+    const grown = new Set();
+    let frame = null;
+    const grow = (part, piece) => grown.add(Object.assign(part, { source: (part.source ?? '') + piece }));
+    const paint = () => {
+      frame = null;
+      for (const part of grown) {
+        if (part.dataset.kind === 'text') drawText(part);
+        else part.lastElementChild.textContent = part.source;   // reasoning, a call's input
+        if (part.dataset.kind === 'thinking') part.querySelector('.last').textContent = lastLine(part.source);
+      }
+      grown.clear();
+      $('log').scrollTop = $('log').scrollHeight;
+    };
     const take = async (line) => {
       if (!line.trim()) return;
       const event = JSON.parse(line);
       if (event.logged != null) {
-        await showLog(event.logged);
+        await showLog(event.logged, true);
         const more = shownLast()?.dataset.who === 'assistant' ? ' more' : '';
         $('log').insertAdjacentHTML('beforeend', `<div class="msg${more}" id="reply" data-who="assistant"><div class="who">assistant</div></div>`);
       }
-      if (event.thinking) {   // the reasoning so far, its block showing its last line
-        const thinking = part('thinking');
-        thinking.lastElementChild.textContent += event.thinking;
-        thinking.querySelector('.last').textContent = lastLine(thinking.lastElementChild.textContent);
-      }
+      if (event.thinking) grow(part('thinking'), event.thinking);   // its block showing its last line
       if (event.spent) {   // what the session's requests have used so far, and the last reply's prompt
         state.spent = event.spent;
         state.prompt = event.prompt ?? state.prompt;
         drawMemory();
       }
-      if (event.fold) $('reply').insertAdjacentHTML('beforebegin', foldLine(event.fold));   // before the reply it was compiled for
-      if (event.calling) draw($('reply'), { type: 'calling', name: event.calling });
-      if (event.input) $('reply').lastElementChild.lastElementChild.textContent += event.input;
-      if (event.text) {   // the reply's markdown so far, drawn again
-        const text = part('text');
-        text.innerHTML = markdown(text.source = (text.source ?? '') + event.text);
+      if (event.fold) {   // before the reply it was compiled for, until the log has it
+        $('reply').insertAdjacentHTML('beforebegin', foldLine(event.fold));
+        $('reply').previousElementSibling.classList.add('live');
       }
+      if (event.calling) draw($('reply'), { type: 'calling', name: event.calling });
+      if (event.input) grow($('reply').lastElementChild, event.input);
+      if (event.text) grow(part('text'), event.text);
       if (event.approve) $(`call-${event.approve}`).insertAdjacentHTML('beforeend', '<div class="ask"><button data-answer="allow">Allow</button><button data-answer="always">Always allow</button><button data-answer="deny">Deny</button></div>');
       if (event.answered) $(`call-${event.answered}`).querySelector('.ask')?.remove();
       if (event.result) draw($('reply'), event.result);
       if (event.ok || event.error) {   // the turn has ended: the log as it leaves it, while its memories form
         error = event.error ?? null;
-        await showLog();
+        await showLog(undefined, true);
       }
       setStatus(event.approve ? 'Waiting for you to allow or deny the call…' : event.forming ? 'Forming memories…' : '');
-      $('log').scrollTop = $('log').scrollHeight;
+      frame ??= requestAnimationFrame(paint);
     };
     for (let read; !(read = await reader.read()).done;) {
       const lines = (buffered + read.value).split('\n');
@@ -518,7 +552,7 @@ async function follow(response) {
     if (err.name === 'AbortError') return;
     error = err.message;
   }
-  await open();
+  await open(true);
   if (error) setStatus(error, true);
 }
 
