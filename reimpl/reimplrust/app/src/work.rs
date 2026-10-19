@@ -6,7 +6,7 @@
 //! steps and after the turn. The thread tells the hub what the pages following the job see (Msg).
 //! The user can stop a turn: it ends where it is (Worker::stopped).
 
-use crate::{api::brief, costs::{self, For}, hub::{Event, Job, Msg}, llm::Llm, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, Toolbox}, App};
+use crate::{api::brief, costs::{self, For}, hub::{Event, Job, Msg}, llm::Llm, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{Host, Request, INTERRUPTED}, store::Session};
 use std::{panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
@@ -39,7 +39,7 @@ impl Setup {
         let (all, settings) = (app.settings()?, app.profile(name)?);
         let p = all.providers.get(&settings.provider).ok_or_else(|| format!("no provider {} in settings.json", settings.provider))?;
         let llm = Llm { base: p.base.clone(), key: p.key.clone(), agent: app.agent.clone(), spent: Default::default() };
-        let tools = toolbox(app, settings.workspace.as_deref(), settings.sandbox.then_some(all.sandbox));
+        let tools = toolbox(app, settings.workspace.as_deref(), settings.sandbox.then_some(all.sandbox), all.search.as_deref());
         let definitions = tools.definitions();
         Ok(Setup { overhead: overhead(settings.system.as_deref(), &definitions), settings, llm, tools, definitions })
     }
@@ -66,15 +66,17 @@ impl Host for Summarizer<'_> {
 }
 
 /// A session's tools: bash (unless --no-bash) and edit in its `workspace`, bash in `sandbox` if given,
-/// both declared but failing without a workspace; then the MCP servers'.
-pub fn toolbox(app: &App, workspace: Option<&Path>, sandbox: Option<Sandbox>) -> Toolbox {
+/// both declared but failing without a workspace; web_search, if settings.json names a SearXNG server
+/// (`searching`); then the MCP servers'.
+pub fn toolbox(app: &App, workspace: Option<&Path>, sandbox: Option<Sandbox>, searching: Option<&str>) -> Toolbox {
     let why = "it has no workspace; the user can set one in the session's settings";
     let (bash, edit) = match workspace {
         Some(dir) => (bash::tool(dir.into(), app.limit, sandbox), edit::tool(dir.into())),
         None => (bash::unavailable(why), edit::unavailable(why)),
     };
     let bash = if app.bash { bash } else { Toolbox::default() };
-    bash + edit + mcp::toolbox(&app.mcp)
+    let web = searching.map_or_else(Toolbox::default, |base| search::tool(base.into(), app.agent.clone(), app.limit));
+    bash + edit + web + mcp::toolbox(&app.mcp)
 }
 
 /// Why the context can't compile, as the user can do something about it: at its most folded it's

@@ -12,6 +12,7 @@ pub struct Settings {
     pub providers: BTreeMap<String, Provider>,
     pub defaults: SessionSettings, // what a new session starts with
     pub sandbox: Sandbox,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub search: Option<String>, // a SearXNG server, which web_search asks
 }
 
 impl Settings {
@@ -25,7 +26,7 @@ impl Settings {
         let (recent_window_tokens, target_chunk_tokens) = ((left / 4.0).min(30000.0), (left / 16.0).min(3000.0));
         let config = Config { summary_participant: "assistant".into(), recent_window_tokens, target_chunk_tokens, compression_max_tokens: Some(8000.0), ..Config::default() };
         let providers = BTreeMap::from([("default".into(), Provider { base, key: String::new() })]);
-        Settings { providers, defaults: SessionSettings { config, ..defaults }, sandbox: Sandbox::default() }
+        Settings { providers, defaults: SessionSettings { config, ..defaults }, sandbox: Sandbox::default(), search: None }
     }
 
     /// The providers as the page sees them: never a key, only whether there is one.

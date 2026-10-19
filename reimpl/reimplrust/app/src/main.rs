@@ -68,7 +68,7 @@ fn main() {
     let (addr, agent) = (arg("--addr", "127.0.0.1:8080"), llm::agent(ca.as_deref()).expect("--ca"));
     let app: &'static App = Box::leak(Box::new(App { root, addr, agent, mcp, bash: !flag("--no-bash"), limit, hub: told }));
     if !app.settings_path().exists() {
-        let tools = work::toolbox(app, Some(Path::new("")), None);
+        let tools = work::toolbox(app, Some(Path::new("")), None, None);
         settings::write(&app.settings_path(), &Settings::first(work::overhead(None, &tools.definitions()))).expect("settings.json");
     }
     std::thread::spawn(move || hub::hub(app, inbox));

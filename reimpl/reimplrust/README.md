@@ -54,11 +54,12 @@ Settings are JSON files you can edit by hand, read again at each use, and only y
 since one holds the keys:
 
 - `ROOT/settings.json`: `providers`, each a name with a `base` URL and a `key`; `defaults`, what a
-  new session starts with; and `sandbox`, what a sandboxed command sees. The first run writes it
-  with a provider named `default` for `https://api.anthropic.com` without a key, which the page then
-  asks for, and defaults for a window of 90k tokens, 30k of them reserved for the reply (and its
-  reasoning: a reply that reaches its reserve stops there).
-- `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
+  new session starts with; `sandbox`, what a sandboxed command sees; and `search`, a SearXNG
+  server's address (say `http://10.0.0.139:8288`), which gives sessions the `web_search` tool. The
+  first run writes it with a provider named `default` for `https://api.anthropic.com` without a key,
+  which the page then asks for, and defaults for a window of 90k tokens, 30k of them reserved for
+  the reply (and its reasoning: a reply that reaches its reserve stops there). -
+  `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its
   `window`, `reserve` and `system` prompt, and the library's settings (`config`). A new session's
   file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its
@@ -68,9 +69,12 @@ since one holds the keys:
 Tools (`app/src/tools/`): the model can call `bash` (a command in a new shell in the session's
 workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in the workspace changed
 by replacing text in it, which must occur once unless the call says `all`, or made; its paths can't
-lead out of the workspace, through `..`, an absolute path or a link) and the tools of the MCP
-servers in `ROOT/mcp.json` (or `--mcp FILE`), listed all at once at startup (one whose tools can't
-be listed is stopped), in the usual format:
+lead out of the workspace, through `..`, an absolute path or a link), `web_search` (when
+settings.json names a SearXNG server: a query asked through its JSON API, which its settings.yml
+must allow by listing `json` in `search.formats`, the pages found given back as text, each one's
+title, address, date when known and excerpt) and the tools of the MCP servers in `ROOT/mcp.json` (or
+`--mcp FILE`), listed all at once at startup (one whose tools can't be listed is stopped), in the
+usual format:
 
 ```json
 {"mcpServers": {"NAME": {"command": "...", "args": ["..."], "env": {"KEY": "..."}}}}

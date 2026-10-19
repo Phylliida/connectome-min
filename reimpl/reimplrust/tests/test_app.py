@@ -41,6 +41,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -54,6 +55,20 @@ seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 
 class Mock(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
+
+    def do_GET(self):
+        """A SearXNG server's JSON search: two pages for a query, 25 for 'many' (a query of 'no json'
+        as a server whose settings.yml doesn't allow JSON answers it). The path is the request line's:
+        http.server collapses a leading // in self.path, which a real server may not."""
+        url = urllib.parse.urlparse(self.requestline.split()[1])
+        asked = urllib.parse.parse_qs(url.query)
+        if url.path != '/search' or asked.get('format') != ['json'] or asked['q'] == ['no json']:
+            return self.answer(403, {'error': 'forbidden'})
+        seen['searched'] = asked['q'][0]
+        many = [{'title': f'Page {n}', 'url': f'https://example.com/{n}', 'content': '', 'publishedDate': None} for n in range(25)]
+        self.answer(200, {'query': asked['q'][0], 'results': many if asked['q'] == ['many'] else [
+            {'title': 'Bees', 'url': 'https://example.com/bees', 'content': f'All about {asked["q"][0]}. ', 'publishedDate': '2026-07-27T00:00:00'},
+            {'title': 'Wasps', 'url': 'https://example.com/wasps', 'content': 'Less about bees.', 'publishedDate': None}]})
 
     def do_POST(self):
         if self.path != '/v1/messages':
@@ -667,6 +682,19 @@ def tooled(tls, ca, baseline) -> str:
         except urllib.error.HTTPError as error:
             if error.code != 400:
                 raise
+        everything = json.loads(Path(root, 'settings.json').read_text())   # a SearXNG server named in settings.json: sessions get web_search
+        Path(root, 'settings.json').write_text(json.dumps({**everything, 'search': everything['providers']['default']['base'] + '/'}))
+        if 'web_search' not in call(port, '/api/s/halt')['tools']:
+            raise SystemExit(f'with a SearXNG server, a session has the tools {call(port, "/api/s/halt")["tools"]}')
+        say(port, 'halt', 'echo next')
+        say(port, 'halt', 'call ' + json.dumps([['web_search', {'query': 'bees and wasps', 'count': 1}], ['web_search', {'query': 'bees'}], ['web_search', {'query': 'no json'}],
+                                                ['web_search', {'query': 'many', 'count': 99}]]))
+        found = [(r['content'], r.get('is_error', False)) for r in seen['results'][-1]]
+        Path(root, 'settings.json').write_text(json.dumps(everything))
+        if found[:2] != [('1. Bees\nhttps://example.com/bees\n2026-07-27 · All about bees and wasps.', False),
+                         ('1. Bees\nhttps://example.com/bees\n2026-07-27 · All about bees.\n\n2. Wasps\nhttps://example.com/wasps\nLess about bees.', False)] \
+                or 'search.formats' not in found[2][0] or not found[2][1] or found[3][0].count('https://example.com/') != 20 or seen['asked'][-4:] != ['web_search'] * 4:
+            raise SystemExit(f'web_search gave {found}, the server asked {seen.get("searched")!r}')
         try:
             say(port, 'tools', 'use tools forever', {'add': 'always'})
             raise SystemExit('a turn that never stops calling tools ended')

@@ -4,8 +4,9 @@
 //! result's (a string, or text and image blocks as the library logs them). A Toolbox is a monoid under
 //! `+`: the union of two, a tool on the right shadowing a same-named one on the left, with the empty
 //! toolbox as identity. So tool sources compose in order: the tools built into the binary (bash.rs,
-//! edit.rs), whose `run` does the work in-process, then each MCP server's, in the config's order
-//! (mcp.rs). A toolbox is made for each step, from the settings as they are then, and owns its tools.
+//! edit.rs, search.rs), whose `run` does the work in-process, then each MCP server's, in the config's
+//! order (mcp.rs). A toolbox is made for each step, from the settings as they are then, and owns its
+//! tools.
 
 use connectome::{json::{sparse, Value}, obj};
 use std::{ops::Add, panic::{catch_unwind, AssertUnwindSafe}, time::Duration};
@@ -13,6 +14,7 @@ use std::{ops::Add, panic::{catch_unwind, AssertUnwindSafe}, time::Duration};
 pub mod bash;
 pub mod edit;
 pub mod mcp;
+pub mod search;
 
 pub type Outcome = Result<Value, Value>;
 
