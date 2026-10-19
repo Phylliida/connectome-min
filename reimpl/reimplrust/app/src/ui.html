@@ -76,8 +76,14 @@ input[type=checkbox] { width: auto; }
 .diff .del { background: var(--del); }
 .md blockquote { margin: 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
 .thinking summary { cursor: pointer; font-size: 12px; }
+.thinking summary, .tool summary { list-style: none; }
+.thinking summary::-webkit-details-marker, .tool summary::-webkit-details-marker { display: none; }
 .tool { padding: 6px 10px; }
-.tool summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.tool summary { cursor: pointer; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tool[open] summary { white-space: pre-wrap; }
+.tool[open] summary .out { display: none; }
+.cmd { font: 12px/1.4 ui-monospace, monospace; color: var(--ink); }
+.cmd::before { content: '$ '; color: var(--muted); }
 .tool pre { white-space: pre-wrap; font: 12px/1.4 ui-monospace, monospace; margin: 4px 0; }
 .tool.failed summary, .tool pre.failed { color: var(--warn); }
 .ask { display: flex; gap: 6px; margin: 4px 0 6px; }
@@ -281,10 +287,17 @@ const parts = {
   text: (b, into) => into.dataset.who === 'assistant' ? `<div class="bubble md">${markdown(b.text)}</div>` : `<div class="bubble">${escape(b.text)}</div>`,
   thinking: (b) => `<details class="thinking"><summary>Thinking<span class="last">${escape(lastLine(b.thinking))}</span></summary><div>${escape(b.thinking)}</div></details>`,
   tool_use: (b) => {
-    const edit = b.name === 'edit', what = edit ? diff(b.input) : `<pre>${escape(JSON.stringify(b.input))}</pre>`;
-    return `<details class="tool" id="call-${escape(b.id)}" open><summary>${escape(b.name)}${edit ? ' ' + escape(b.input.path ?? '') : ''}</summary>${what}</details>`;
+    const [head, body] = (views[b.name] ?? ((input) => [escape(b.name), `<pre>${escape(JSON.stringify(input))}</pre>`]))(b.input);
+    return `<details class="tool" id="call-${escape(b.id)}" open><summary>${head}</summary>${body}</details>`;
   },
   calling: (b) => `<details class="tool" open><summary>${escape(b.name)} …</summary><pre></pre></details>`,
+};
+
+// a call's card as its tool shows it: the line it shows folded (open, all of it), and what it holds
+// above the result; any other tool's, its name and its input
+const views = {
+  bash: (input) => [`<span class="cmd">${escape(input.command ?? '')}</span>`, ''],
+  edit: (input) => [`edit ${escape(input.path ?? '')}`, diff(input)],
 };
 
 // an edit's change as a diff: the lines it takes out and puts in (all in, for a new file), colored in
@@ -304,8 +317,8 @@ function draw(into, b) {
   into.lastElementChild.dataset.kind = b.type;
 }
 
-// a tool result's text, and on its call's card its first line, the card then closed unless it shows a
-// diff; without its call on the page, a card of its own
+// a tool result's text, and on its call's line its first line (shown while the card is folded), the
+// card then folded unless it shows a diff; without its call on the page, a card of its own
 function result(card, b) {
   const text = typeof b.content === 'string' ? b.content : b.content.map((c) => c.text ?? note(c)).join('\n');
   if (!card.matches('.tool')) {
@@ -313,7 +326,7 @@ function result(card, b) {
     card = card.lastElementChild;
   }
   card.insertAdjacentHTML('beforeend', `<pre class="${b.isError ? 'failed' : ''}">${escape(text)}</pre>`);
-  card.querySelector('summary').textContent += ` → ${text.split('\n')[0].slice(0, 100)}`;
+  card.querySelector('summary').insertAdjacentHTML('beforeend', `<span class="out"> → ${escape(text.split('\n')[0].slice(0, 100))}</span>`);
   card.classList.toggle('failed', !!b.isError);
   card.open = !!card.querySelector('.diff');
 }
