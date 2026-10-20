@@ -128,14 +128,16 @@ come out of the window the context compiles to, and out of the usage that calibr
 calibration catches up with a request bigger than its estimate, the next context compiles that much
 smaller. Memory requests declare the same tools with tool choice "none", as the library does, so a
 memory can cover tool calls. The page's Continue button runs a turn without a message: after an
-interruption (a failed request, a stop, a restart) the model goes on from the log as it is, and
-after a reply cut short it goes on from that reply (the request ends with it, as a prefill). A turn
-on a log edited into something the library can't read fails, and the session goes on once the log is
-mended. The page's Stop button (`POST /api/s/NAME/stop`) ends the turn running where it is: a reply
-streaming in stops there and joins the log so, without a call it was still writing; a call not yet
-run doesn't run, its result saying so; one running ends (bash kills its command and what it started,
-and an MCP call is left to the server's timeout); a memory forming is dropped, not counted as a
-failed attempt; and no step comes after.
+interruption (a failed request, a stop, a restart) the model goes on from the log as it is (and if
+the server stopped in a step, its calls logged but not their results, each call first gets a failed
+result saying so, as it does before any turn), and after a reply cut short it goes on from that
+reply (the request ends with it, as a prefill). A turn on a log edited into something the library
+can't read fails, and the session goes on once the log is mended. The page's Stop button (`POST
+/api/s/NAME/stop`) ends the turn running where it is: a reply streaming in stops there and joins the
+log so, without a call it was still writing; a call not yet run doesn't run, its result saying so;
+one running ends (bash kills its command and what it started, and an MCP call is left to the
+server's timeout); a memory forming is dropped, not counted as a failed attempt; and no step comes
+after.
 
 A page follows its session on one stream (`GET /api/s/NAME/stream`, JSON lines; `hub::Event` lists
 them): the log's newest messages, read from disk, then the session, then whatever happens in it,

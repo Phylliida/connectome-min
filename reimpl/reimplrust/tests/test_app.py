@@ -743,6 +743,19 @@ def tooled(tls, ca, baseline) -> str:
             told = [e['message']['id'] for e in itertools.takewhile(lambda e: 'state' not in e, events)]
         if told != list(range(state['messages'] - 200, state['messages'])):
             raise SystemExit(f'a page following a session of {state["messages"]} messages heard {told[:3]}…{told[-3:]} first')
+        r, events = following(port, 'tools')                            # the server stops while a call waits for its answer: Continue goes on
+        with r:
+            next(events)
+            call(port, '/api/s/tools/say', {'text': 'call [["add", {"a": 1, "b": 2}]]'})
+            next(e for e in events if 'approve' in e)
+        app.kill()
+        app.wait()
+        app = start()
+        say(port, 'tools', None)
+        mended = call(port, f'/api/s/tools/messages?from={call(port, "/api/s/tools")["messages"] - 3}')
+        if [m['participant'] for m in mended] != ['assistant', 'user', 'assistant'] or not mended[1]['content'][0].get('isError') \
+                or 'the server stopped before this call finished' not in mended[1]['content'][0]['content']:
+            raise SystemExit(f'a call the server stopped in, then Continue: {mended}')
         return f'{len(seen["results"])} tool steps, {len(seen["asked"])} calls asked to run, {seen["tool memories"]} memory requests with tool calls, {state["messages"]} messages, multiplier {state["multiplier"]:.3f}'
     finally:
         app.terminate()

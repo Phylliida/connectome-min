@@ -25,6 +25,9 @@ pub const DENIED: &str = "the user didn't allow this call";
 /// A stopped turn's end, and the result of each of its calls that didn't run.
 pub const STOPPED: &str = "Stopped by the user.";
 
+/// The result of a call whose step the server stopped in, its reply logged but not its results.
+const UNFINISHED: &str = "No result: the server stopped before this call finished (while it ran, or waited for the user to allow it). It may or may not have run.";
+
 /// What a session's step runs with: its settings, the model client and tools they give, the tools'
 /// definitions, and the tokens the system prompt and those take, which every request carries.
 pub struct Setup {
@@ -169,12 +172,14 @@ impl Worker<'_> {
         if let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup) }
     }
 
-    /// A chat turn: its message joins the log, then steps run, as many as it takes, until a reply calls
-    /// no tools and the partner has told the session nothing more (deliver), or the user stops it. Without a message, the turn continues the
+    /// A chat turn: the log mended if the server stopped in a step (mend), its message joins the log,
+    /// then steps run, as many as it takes, until a reply calls no tools and the partner has told the
+    /// session nothing more (deliver), or the user stops it. Without a message, the turn continues the
     /// log as it is: after an interruption the context ends with the user's message or the tool
     /// results, and after a reply cut short with that reply, which the Messages API continues (a
     /// prefill).
     fn turn(&self, said: Option<Value>) -> Result<(), String> {
+        self.mend()?;
         if let Some(said) = said {
             append(&self.s, &said, &self.app.profile(self.name)?.config);
         }
@@ -185,6 +190,19 @@ impl Worker<'_> {
             let called = self.step()?;
             if !self.deliver()? && !called { return Ok(()) }
         }
+    }
+
+    /// A step the server stopped in, its reply's calls logged but not their results: each call gets a
+    /// failed result (UNFINISHED), so the log answers every call before a turn goes on from it.
+    fn mend(&self) -> Result<(), String> {
+        let n = self.s.count("messages");
+        let last = if n > 0 { self.s.read("messages", n - 1) } else { Value::Null };
+        let calls = last["content"].arr().iter().filter(|b| last["participant"] == "assistant" && b.kind() == "tool_use");
+        let results: Vec<Value> = calls.map(|call| tools::result(call, Err(UNFINISHED.into()))).collect();
+        if !results.is_empty() {
+            append(&self.s, &obj! {"participant" => "user", "content" => results}, &self.app.profile(self.name)?.config);
+        }
+        Ok(())
     }
 
     /// What the session's partner has told it meanwhile joins the log, each as the partner's message;
