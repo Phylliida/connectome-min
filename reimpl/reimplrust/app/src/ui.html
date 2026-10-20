@@ -161,6 +161,7 @@ dialog .buttons small { margin-right: auto; }
 /* the message box */
 form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
 form textarea { resize: vertical; min-height: 42px; }
+#text { resize: none; max-height: 50vh; }   /* as tall as what's in it (fit), then it scrolls */
 #say { align-items: stretch; }   /* its buttons as tall as the message box, which the user can make taller */
 #status { color: var(--muted); font-size: 12px; padding: 0 16px 8px; min-height: 18px; }
 #status.warn { color: var(--warn); }
@@ -521,19 +522,29 @@ function SessionForm() {
 function SayForm() {
   const say = (e) => {
     e.preventDefault();
-    const text = e.target.elements.text.value.trim();
+    const box = e.target.elements.text, text = box.value.trim();
     if (text) {
-      e.target.elements.text.value = '';
+      box.value = '';
+      fit(box);
       turn(text);
     }
   };
   const enter = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.form.requestSubmit(); } };
   return html`<form id="say" onSubmit=${say}>
-    <textarea id="text" name="text" placeholder="Message (Enter sends, Shift+Enter for a new line)" onKeyDown=${enter}></textarea>
+    <textarea id="text" name="text" placeholder="Message (Enter sends, Shift+Enter for a new line)" onKeyDown=${enter} onInput=${(e) => fit(e.target)}></textarea>
     <button class="icon send" title="Send (Enter)" aria-label="Send">${ICONS.send()}</button>
     <button type="button" id="continue" class="icon" title="Let the model go on, without a message" aria-label="Continue" onClick=${() => turn(null)}>${ICONS.go()}</button>
     <button type="button" id="stop" class="icon stop" title="Stop the turn" aria-label="Stop" disabled=${!page.live} onClick=${stop}>${ICONS.stop()}</button>
   </form>`;
+}
+
+// the message box as tall as what's in it (to half the window, then it scrolls), its buttons with it;
+// the log, if it was at its end, stays there as the box takes its room
+function fit(box) {
+  const log = document.getElementById('log'), end = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
+  box.style.height = 'auto';
+  box.style.height = `${box.scrollHeight + box.offsetHeight - box.clientHeight}px`;   // its borders too
+  if (end) log.scrollTop = log.scrollHeight;
 }
 
 // the buttons' pictures (each drawn anew where it's used), in the text's color: a paper plane
