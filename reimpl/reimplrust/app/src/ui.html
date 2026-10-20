@@ -90,8 +90,8 @@ dialog .buttons small { margin-right: auto; }
 /* the chat: a line where the speaker changes, then each block a bubble, the user's on the right */
 #chat { display: flex; flex-direction: column; padding: 0; }
 #log { flex: 1; overflow: auto; padding: 16px; }
-.msg { position: relative; margin-top: 12px; content-visibility: auto; contain-intrinsic-size: auto 120px; }   /* off screen, not laid out or painted */
-.earlier { text-align: center; font-size: 12px; color: var(--muted); min-height: 18px; }
+.msg { position: relative; margin-top: 12px; }
+.earlier { text-align: center; font-size: 12px; color: var(--muted); min-height: 18px; overflow-anchor: none; }   /* never what the view keeps in place */
 .msg .who { margin-bottom: 4px; }
 .msg.more { margin-top: 0; }
 .msg.more > .who, #reply.empty { display: none; }
@@ -214,7 +214,7 @@ const page = {
   detail: 'Select a memory or chunk.',    // the memory or chunk the pyramid last showed
   folded: new Set(),                      // the workspaces whose groups are folded, kept in this browser
   scroll: false,                          // whether the next draw takes the log to its end, wherever it's scrolled to
-  keep: null,                             // the message at the log's view's top and where in the view, which draws keep (earlier messages put above)
+  keep: null,                             // the log's height, which the next draw adds what it puts above to (earlier messages, at its very top)
   earlier: null,                          // 'loading' while a page of the log's earlier messages loads
 };
 let stream = null;   // aborts the stream the page follows its session on
@@ -222,10 +222,9 @@ let stream = null;   // aborts the stream the page follows its session on
 // the page drawn again from what it shows: at once (draw, after what the user does), or at most once a
 // frame however fast it changes (redraw, as a turn streams). The log keeps to its end as it grows while
 // the user is there (or near it), and stays where they scrolled to otherwise; opening a session or
-// sending a message takes it there (page.scroll), and earlier messages put above it keep the message
-// at the view's top where it was (page.keep). Each holds for a few frames (settle): a message off
-// screen is laid out at a guess of its height (content-visibility), and at its own once it comes near
-// the view, a frame later.
+// sending a message takes it there (page.scroll). Earlier messages put above the view leave it where
+// it was, even mid-scroll: the browser keeps what's in view in place (scroll anchoring), except at the
+// log's very top, where the draw does (page.keep).
 let frame = null;
 function draw() {
   cancelAnimationFrame(frame);
@@ -233,42 +232,10 @@ function draw() {
   const log = document.getElementById('log');
   const following = page.scroll || (log && log.scrollHeight - log.scrollTop - log.clientHeight < 48);
   render(html`<${App} />`, document.querySelector('main'));
-  const drawn = document.getElementById('log'), kept = page.keep;
-  if (kept) settle(() => hold(kept));
-  else if (following) stick(drawn);
+  const drawn = document.getElementById('log');
+  if (page.keep != null) drawn.scrollTop = drawn.scrollHeight - page.keep;
+  else if (following) drawn.scrollTop = drawn.scrollHeight;
   [page.scroll, page.keep] = [false, null];
-}
-
-// `step` now and in each of the next four frames, while it says to go on
-function settle(step) {
-  let left = 4;
-  const again = () => step() && --left && requestAnimationFrame(again);
-  if (step()) requestAnimationFrame(again);
-}
-
-// the log at its end, kept there as what's new in it is laid out, unless the user scrolls up
-function stick(log) {
-  let at = -1;
-  settle(() => {
-    if (log.scrollTop < at - 1) return false;
-    log.scrollTop = log.scrollHeight;
-    at = log.scrollTop;
-    return true;
-  });
-}
-
-// the log scrolled so message `id` is `top` pixels down its view; whether it's there to scroll to
-function hold({ id, top }) {
-  const log = document.getElementById('log'), m = log?.querySelector(`.msg[data-id="${id}"]`);
-  if (m) log.scrollTop += m.getBoundingClientRect().top - log.getBoundingClientRect().top - top;
-  return !!m;
-}
-
-// the message at the top of the log's view, and how far down it is
-function viewed() {
-  const log = document.getElementById('log'), top = log.getBoundingClientRect().top;
-  const m = [...log.querySelectorAll('.msg[data-id]')].find((m) => m.getBoundingClientRect().bottom > top);
-  return m && { id: m.dataset.id, top: m.getBoundingClientRect().top - top };
 }
 const redraw = () => frame ??= requestAnimationFrame(draw);
 
@@ -604,7 +571,8 @@ const ICONS = {
 
 // the log's messages, then the reply streaming in. A message's line (whose it is) shows only where the
 // speaker changes, and a message of tool results whose results all joined their calls isn't shown.
-// Near its top, the log's earlier messages load (earlier), until the page has the first.
+// Two views from its top, the log's earlier messages load (earlier), until the page has the first, so
+// they're there before the user scrolls to them.
 function Log() {
   const { messages, live } = page, reply = live?.reply;
   const results = new Map([...messages.flatMap((m) => m.content), ...(live?.results ?? [])].filter((b) => b.type === 'tool_result').map((b) => [b.toolUseId, b]));
@@ -619,7 +587,7 @@ function Log() {
         joined=${m.content.map((b) => b.type === 'tool_result' && calls.has(b.toolUseId))} />`];
   });
   const top = messages.length > 0 && html`<div class="earlier">${messages[0].id === 0 ? 'The start of the session.' : page.earlier === 'loading' ? 'Loading earlier messages…' : ''}</div>`;
-  return html`<div id="log" onScroll=${(e) => e.currentTarget.scrollTop < 600 && earlier()}>${top}${rows}${reply && reply.key > (messages.at(-1)?.id ?? -1) && [
+  return html`<div id="log" onScroll=${(e) => e.currentTarget.scrollTop < 2 * e.currentTarget.clientHeight && earlier()}>${top}${rows}${reply && reply.key > (messages.at(-1)?.id ?? -1) && [
     reply.fold && html`<${FoldLine} key="fold-live" fold=${reply.fold} live />`,
     html`<${Reply} key=${'reply-' + reply.key} reply=${reply} more=${who === 'assistant'} strays=${live.results.filter((b) => !calls.has(b.toolUseId))} />`,
   ]}</div>`;
@@ -894,7 +862,10 @@ async function earlier() {
   redraw();
   try {
     const got = await api(`/api/s/${name}/messages?to=${first}`);
-    if (name === current() && page.messages[0]?.id === first) [page.keep, page.messages] = [viewed(), [...got, ...page.messages]];
+    if (name === current() && page.messages[0]?.id === first) {
+      const log = document.getElementById('log');
+      [page.keep, page.messages] = [log.scrollTop < 1 ? log.scrollHeight : null, [...got, ...page.messages]];
+    }
   } catch (err) { fail(err); }
   page.earlier = null;
   draw();

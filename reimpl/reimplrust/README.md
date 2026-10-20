@@ -25,14 +25,14 @@ actions change. A turn it follows goes through phases the line under the chat sh
 model, streaming, asking whether a call may run, running a call, which its card says too, its
 request tried again, and why, forming memories); its reply streams in below the log and is drawn at
 most once a frame, its finished markdown blocks once. Opening a session shows its log's newest 200
-messages; scrolling near the top loads the 200 before them, until the first, the message at the top
-of the view staying where it was. A message off screen isn't laid out or painted
-(`content-visibility`), so a long log scrolls lightly; the log follows a reply only while the view
-is at its end. The page shows the assistant's text as markdown, through marked and then DOMPurify,
-which keeps only the HTML markdown makes, so a reply can neither run code on the page nor load
-anything; its math (`$…$` or `\(…\)` inline, `$$…$$` or `\[…\]` displayed) KaTeX sets in its own
-fonts, and highlight.js colors its code blocks. These, jsdiff for edits' diffs, Preact and htm are
-in `app/vendor/` as published, built in.
+messages; scrolling up, two views from the top, loads the 200 before them, until the first, so
+they're there before the view gets to them, and the messages in view stay where they are as they go
+in above, even mid-scroll (the browser's scroll anchoring). The log follows a reply only while the
+view is at its end. The page shows the assistant's text as markdown, through marked and then
+DOMPurify, which keeps only the HTML markdown makes, so a reply can neither run code on the page nor
+load anything; its math (`$…$` or `\(…\)` inline, `$$…$$` or `\[…\]` displayed) KaTeX sets in its
+own fonts, and highlight.js colors its code blocks. These, jsdiff for edits' diffs, Preact and htm
+are in `app/vendor/` as published, built in.
 
 The page also shows what a session's requests have used, from the session's `costs.jsonl`
 (`costs.rs`): a record for each step's reply and each round of memories, `{id, for, used, total}`.
