@@ -86,9 +86,15 @@ pub struct SessionSettings {
     #[default(30000.0)] pub reserve: f64, // tokens for the reply (its reasoning too)
     pub system: Option<String>,
     pub config: Config,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub companion: Option<String>,   // the session that is this one's companion (companion.rs)
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub accompanies: Option<String>, // the session this one is the companion of
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub auto: bool,               // each turn's end goes to the other
 }
 
 impl SessionSettings {
+    /// The session this one talks with: its companion, or the one it's the companion of.
+    pub fn partner(&self) -> Option<&str> { self.companion.as_deref().or(self.accompanies.as_deref()) }
+
     /// These settings as what `v` gives changes them: any of their fields, and any of config's. The
     /// provider must be one of `all`'s, a workspace given a directory that exists (absolute, a leading
     /// ~/ the home directory, no trailing /), and merge_threshold as it was once memories have `merged`.

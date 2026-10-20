@@ -104,6 +104,24 @@ that runs out is cancelled without holding up the server's next call; a server t
 again at its next call. Tool sources compose as a monoid: a later source's tool shadows an earlier
 one of the same name.
 
+A session can have a companion (`app/src/companion.rs`): another session, made from the page's Auto
+switch with the user's goal, that talks with it as a collaborator. It starts on the session's
+provider, model, window and library settings, without a workspace, its system prompt (which the
+user can edit) telling it the goal and its part. Their settings name each other (`companion`, and
+`accompanies` on the companion), and `auto` says whether Auto is on, which the switch sets for both.
+Each has the `message` tool, which tells the other something at once, or with `wait` waits for the
+answer (up to `--tool-timeout`); the companion also has `finish`, which turns Auto off when the goal
+is done or the work needs the user. A turn's end goes to the other, which takes a turn on it: what
+the turn last said, and what it ran (bash's commands, edit's paths, web_search's queries, other
+tools' names, failed calls marked). It goes while Auto is on; when the other messaged the session
+during the turn, so every message gets its answer; and after `finish`, so the session hears the
+companion's last word. A turn that fails or is stopped turns Auto off for both. What a session hears
+from the other joins its log as the other's message, its participant the other's name, headed by
+how it came: the other ended its turn, sends a message while it works, or asks and waits for the
+answer. A turn hears it between its steps, and goes on while there's more; an idle session takes a
+turn on it. Turning Auto on sends the session's last turn to the companion, unless a turn runs in
+either. A fork has no companion of its own.
+
 A turn takes steps, a model request each, until a reply calls no tools (at most 64). Every request
 carries the system prompt and the tool definitions, so their tokens come out of the window the
 context compiles to, and out of the usage that calibrates prices; while calibration catches up with

@@ -4,7 +4,7 @@
 //! carry an x-connectome header (another site's page can't send one without a CORS preflight, which
 //! this server never approves), since a POST can change where the key goes.
 
-use crate::{costs::{self, Compile, Fold, Spent}, hub::{Event, Job, Msg, Routed}, settings::{self, SessionSettings}, work::Setup, App};
+use crate::{companion, costs::{self, Compile, Fold, Spent}, hub::{Event, Job, Msg, Routed}, settings::{self, SessionSettings}, work::Setup, App};
 use connectome::{json::{self, sparse, Json, Value}, obj, store::Session};
 use serde::{Serialize, Serializer};
 use std::{collections::{BTreeSet, HashMap}, net::TcpStream, path::Path, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
@@ -128,6 +128,17 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
         }
         ("GET", ["stream"]) => follow(app, name, query, stream),
         ("POST", ["stop"]) => app.ask_session(name, Msg::Stop).map(|()| Some(obj! {})),
+        ("POST", ["companion"]) => {
+            let companion = body["name"].as_str().filter(|c| named(c)).ok_or("a companion's name is letters, digits, - and _")?;
+            let goal = body["goal"].as_str().map(str::trim).filter(|g| !g.is_empty()).ok_or("a companion needs the goal")?;
+            companion::make(app, name, companion, goal).map(|()| Some(state(app, name, &s)))
+        }
+        ("POST", ["auto"]) => {
+            let on = body["on"] == true;
+            app.ask_session(name, |reply| Msg::Auto(on, reply))?;
+            if on { companion::kick_off(app, name)? }
+            Ok(Some(state(app, name, &s)))
+        }
         ("POST", ["approve"]) => {
             let (id, answer) = (body["id"].as_str().unwrap_or("").into(), body["answer"].as_str().unwrap_or("deny").into());
             app.ask_session(name, |reply| Msg::Approve { id, answer, reply }).map(|()| Some(obj! {}))
@@ -187,13 +198,15 @@ fn state(app: &App, name: &str, s: &Session) -> Value {
     serde_json::to_value(state).expect("a state is JSON")
 }
 
-/// Every session: its name, messages, the session it forked from, and its workspace.
+/// Every session: its name, messages, the session it forked from, its workspace, and its companion or
+/// the session it accompanies.
 fn sessions(app: &App) -> Value {
     let names: BTreeSet<String> = std::fs::read_dir(&app.root).into_iter().flatten().flatten().filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().into_string().ok()).collect();
     Value::Array(names.iter().map(|name| {
-        let s = app.session(name);
-        let workspace = app.profile(name).ok().and_then(|p| p.workspace);
-        obj! {"name" => name.as_str(), "messages" => s.count("messages"), "parent" => parent(&s), "workspace" => workspace.map(|w| w.to_string_lossy().into_owned())}
+        let (s, own) = (app.session(name), app.profile(name).ok());
+        let workspace = own.as_ref().and_then(|p| p.workspace.as_ref()).map(|w| w.to_string_lossy().into_owned());
+        let (companion, accompanies) = own.map_or((None, None), |p| (p.companion, p.accompanies));
+        obj! {"name" => name.as_str(), "messages" => s.count("messages"), "parent" => parent(&s), "workspace" => workspace, "companion" => companion, "accompanies" => accompanies}
     }).collect())
 }
 

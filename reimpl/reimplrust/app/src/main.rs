@@ -15,6 +15,7 @@
 //! beside them only what they don't hold yet.
 
 mod api;
+mod companion;
 mod costs;
 mod hub;
 mod llm;

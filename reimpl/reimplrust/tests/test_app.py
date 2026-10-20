@@ -33,6 +33,7 @@ import itertools
 import json
 import multiprocessing
 import os
+import re
 import signal
 import ssl
 import shutil
@@ -51,7 +52,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
-seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None}
+seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': []}
 
 
 class Mock(BaseHTTPRequestHandler):
@@ -96,7 +97,9 @@ class Mock(BaseHTTPRequestHandler):
         if seen['limit'] and not request.get('tool_choice') and prompt + request['max_tokens'] > seen['limit']:
             return self.problem(f'prompt is too long: {prompt} tokens and {request["max_tokens"]} to answer in a window of {seen["limit"]}')
         messages = request['messages']
+        seen['requests'].append((request.get('system') or '', [t['name'] for t in request.get('tools') or []]))
         last = ' '.join(b.get('text', '') for b in messages[-1]['content'])
+        last = re.sub(r'^\s*\S+ (?:ended its turn|sends you a message while it works|asks you, and waits for your answer):\n\n', '', last)   # from a session's partner: what it says
         results = [b for b in messages[-1]['content'] if b['type'] == 'tool_result']
         asked = next(' '.join(b.get('text', '') for b in m['content']) for m in reversed(messages) if m['role'] == 'user' and any(b['type'] == 'text' for b in m['content']))
         stop = 'end_turn'
@@ -735,6 +738,113 @@ def tooled(tls, ca, baseline) -> str:
         mock.shutdown()
 
 
+def accompanied(tls, ca) -> str:
+    """A session and its companion, made with a goal: it starts on the session's provider and model,
+    without a workspace, the goal in its system prompt, Auto on; each declares message, the companion
+    finish too. The session's last turn goes to the companion, and each one's turn's end to the other,
+    each heading what it hears from the other with how it came, until the companion calls finish, after
+    which its answer is the last the session hears. With Auto off, a message waited for comes back as
+    the call's result, and one sent while working gets its answer once; nothing more runs after; one
+    that comes during a turn's last step, the turn goes on to answer. Auto
+    turned on from the page sends the session's last turn, with what it ran, to the companion; a turn
+    that fails turns Auto off for both. A session paired already, one paired by the other side, a
+    name taken and a missing goal are refused, as is Auto without a companion; a fork has none."""
+    port, root, mock_port, work = free_port(), tempfile.mkdtemp(), free_port(), tempfile.mkdtemp()
+    mock = serve(mock_port, tls)
+    app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--no-open'], stderr=subprocess.DEVNULL)
+    for _ in range(100):
+        try:
+            call(port, '/api/sessions')
+            break
+        except OSError:
+            time.sleep(0.05)
+    configure(root, f'https://localhost:{mock_port}', 12000, 2381, 595.25)
+
+    def quiet(*names):
+        """Once no turn has run in the sessions for six polls in a row, a tenth of a second apart."""
+        calm = 0
+        for _ in range(300):
+            calm = 0 if any(call(port, f'/api/s/{n}')['running'] for n in names) else calm + 1
+            if calm == 6:
+                return
+            time.sleep(0.1)
+        raise SystemExit(f'turns still run in {names} after 30 s')
+    log = lambda name: [(m['participant'], words(m)) for m in call(port, f'/api/s/{name}/messages')]
+    try:
+        call(port, '/api/sessions', {'name': 'pair', 'workspace': work})
+        say(port, 'pair', 'echo echo echo call [["finish", {}]]')
+        settle(port, 'pair')
+        before = len(seen['requests'])
+        call(port, '/api/s/pair/companion', {'name': 'pal', 'goal': 'Count the bees.'})
+        quiet('pair', 'pal')
+        finish = 'call [["finish", {}]]'
+        reply = lambda text: text.startswith('Reply ')
+        pair, pal = log('pair'), log('pal')
+        if pair[:4] != [('user', 'echo echo echo ' + finish), ('assistant', 'echo echo ' + finish), ('pal', 'pal ended its turn:\n\necho ' + finish), ('assistant', finish)] \
+                or [p for p, _ in pair[4:]] != ['pal', 'assistant'] or not pair[4][1].startswith('pal ended its turn:\n\nReply ') or not reply(pair[5][1]):
+            raise SystemExit(f'the session heard its companion as {pair}')
+        if pal[:3] != [('pair', 'pair ended its turn:\n\necho echo ' + finish), ('assistant', 'echo ' + finish), ('pair', 'pair ended its turn:\n\n' + finish)] \
+                or [p for p, _ in pal[3:]] != ['assistant', 'user', 'assistant'] or not reply(pal[5][1]):
+            raise SystemExit(f'the companion heard the session as {pal}')
+        own, its = call(port, '/api/s/pair')['settings'], call(port, '/api/s/pal')['settings']
+        if (own.get('companion'), own.get('auto'), its.get('accompanies'), its.get('auto'), its['workspace']) != ('pal', None, 'pair', None, None) \
+                or (its['provider'], its['model']) != (own['provider'], own['model']) or 'Count the bees.' not in its['system']:
+            raise SystemExit(f'after finish the session has {own}, its companion {its}')
+        declared = {('pal' if 'Count the bees.' in system else 'pair', tuple(t for t in tools if t in ('message', 'finish'))) for system, tools in seen['requests'][before:]}
+        if declared != {('pal', ('message', 'finish')), ('pair', ('message',))}:
+            raise SystemExit(f'the requests declared {declared}')
+        if {s['name']: (s['companion'], s['accompanies']) for s in call(port, '/api/sessions')} != {'pair': ('pal', None), 'pal': (None, 'pair')}:
+            raise SystemExit(f'the sessions listed as {call(port, "/api/sessions")}')
+        say(port, 'pair', 'call ' + json.dumps([['message', {'text': 'echo the answer', 'wait': True}]]))   # Auto off
+        quiet('pair', 'pal')
+        answer = [b['content'] for m in call(port, '/api/s/pair/messages')[-2:] for b in m['content'] if b['type'] == 'tool_result']
+        if answer != ['pal ended its turn:\n\nthe answer'] or log('pal')[-2:] != [('pair', 'pair asks you, and waits for your answer:\n\necho the answer'), ('assistant', 'the answer')]:
+            raise SystemExit(f'a message waited for got {answer}, the companion heard {log("pal")[-2:]}')
+        counts = len(log('pair')), len(log('pal'))
+        say(port, 'pair', 'call ' + json.dumps([['message', {'text': 'echo noted'}]]))
+        quiet('pair', 'pal')
+        pair, pal = log('pair')[counts[0]:], log('pal')[counts[1]:]
+        if pal != [('pair', 'pair sends you a message while it works:\n\necho noted'), ('assistant', 'noted')] or pair.count(('pal', 'pal ended its turn:\n\nnoted')) != 1 \
+                or pair[-1][0] != 'assistant' or len(pair) > 6:
+            raise SystemExit(f'a message sent while working: the companion heard {pal}, the session {pair}')
+        counts = len(log('pal'))                                        # a message that comes during a turn's last step: the turn goes on to answer it
+        call(port, '/api/s/pal/say', {'text': 'echo wait for it, slowly'})
+        time.sleep(0.3)
+        say(port, 'pair', 'call ' + json.dumps([['message', {'text': 'echo also noted'}]]))
+        quiet('pair', 'pal')
+        if (pal := log('pal')[counts:]) != [('user', 'echo wait for it, slowly'), ('assistant', 'wait for it, slowly'), ('pair', 'pair sends you a message while it works:\n\necho also noted'), ('assistant', 'also noted')]:
+            raise SystemExit(f'a message during a turn\'s last step: the companion\'s log went on {pal}')
+        call(port, '/api/s/pair/settings', {'allow': ['bash']})
+        say(port, 'pair', 'call ' + json.dumps([['bash', {'command': 'echo fail once please'}]]).replace(' once', '\\u0020once'))   # the mock fails only the companion's request
+        settle(port, 'pair')
+        counts = len(log('pair'))
+        state = call(port, '/api/s/pair/auto', {'on': True})
+        quiet('pair', 'pal')
+        last, ran = log('pal')[-1], 'What pair ran this turn: $ echo fail once please'
+        if last[0] != 'pair' or not last[1].startswith('pair ended its turn:\n\nReply ') or not last[1].endswith(ran) or not state['settings'].get('auto'):
+            raise SystemExit(f'Auto on sent the companion {last}')
+        if call(port, '/api/s/pair')['settings'].get('auto') or call(port, '/api/s/pal')['settings'].get('auto') or len(log('pair')) != counts:
+            raise SystemExit('a companion\'s failed turn left Auto on, or the session went on')
+        call(port, '/api/sessions', {'name': 'lone'})
+        for path, wrong in [('pair/companion', {'name': 'pal2', 'goal': 'g'}), ('pal/companion', {'name': 'pal3', 'goal': 'g'}), ('lone/companion', {'name': 'pair', 'goal': 'g'}),
+                            ('lone/companion', {'name': 'pal4'}), ('lone/auto', {'on': True})]:
+            try:
+                call(port, f'/api/s/{path}', wrong)
+                raise SystemExit(f'{path} took {wrong}')
+            except urllib.error.HTTPError as error:
+                if error.code != 400:
+                    raise
+        if (made := sorted(s['name'] for s in call(port, '/api/sessions'))) != ['lone', 'pair', 'pal']:
+            raise SystemExit(f'refused companions made sessions: {made}')
+        call(port, '/api/s/pair/fork', {'at': 1, 'name': 'pair-fork'})
+        if (forked := call(port, '/api/s/pair-fork')['settings']).get('companion') or forked.get('auto'):
+            raise SystemExit(f'a fork of a session with a companion has {forked}')
+        return f'a session and its companion: {len(log("pair"))} and {len(log("pal"))} messages'
+    finally:
+        app.terminate()
+        mock.shutdown()
+
+
 def chatted(turns, tls, ca, baseline) -> str:
     """The long chat, the fork and the settings; the main session's price multiplier goes to `baseline`."""
     mock_port, plain_port, port, root = free_port(), free_port(), free_port(), tempfile.mkdtemp()
@@ -984,7 +1094,8 @@ def main(turns=60):
     ca, cert, key = certificates(tempfile.mkdtemp())
     forked = multiprocessing.get_context('fork')
     done, baseline = forked.Queue(), forked.Queue()
-    parts = {'chat': lambda: chatted(turns, (cert, key), ca, baseline), 'tools': lambda: tooled((cert, key), ca, baseline), 'large': lambda: streamed_large((cert, key), ca)}
+    parts = {'chat': lambda: chatted(turns, (cert, key), ca, baseline), 'tools': lambda: tooled((cert, key), ca, baseline), 'large': lambda: streamed_large((cert, key), ca),
+             'companion': lambda: accompanied((cert, key), ca)}
     running = [forked.Process(target=part, args=(name, run, done)) for name, run in parts.items()]
     summaries, totals, failure = {}, {'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0}, None
     try:
@@ -1009,7 +1120,7 @@ def main(turns=60):
         print(failure)
         return 1
     print(f'{totals["chat"]} chat turns and {totals["memory"]} memory requests; {summaries["chat"]}; {totals["bytes"] // 1024} KB of requests streamed '
-          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}')
+          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}')
     return 0
 
 

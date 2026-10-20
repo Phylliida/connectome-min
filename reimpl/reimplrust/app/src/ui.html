@@ -67,6 +67,17 @@ dialog .buttons small { margin-right: auto; }
 .card .delete svg { width: 17px; height: 17px; }
 .card .delete:hover { color: var(--warn); border-color: var(--warn); }
 
+/* the Auto switch, with the session's companion */
+.pairing { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; }
+.pairing small { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.pairing a { color: var(--accent); }
+.switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; font-weight: 600; }
+.switch input { appearance: none; position: relative; width: 34px; height: 20px; padding: 0; margin: 0; border-radius: 10px; background: var(--line); border: 0; cursor: pointer; transition: background .15s; }
+.switch input::before { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--panel); box-shadow: 0 1px 2px rgb(0 0 0 / .3); transition: left .15s; }
+.switch input:checked { background: var(--tail); }
+.switch input:checked::before { left: 16px; }
+.switch input:disabled { opacity: .4; cursor: default; }
+
 /* the sessions, grouped by workspace */
 #sessions a { display: block; padding: 4px 6px; border-radius: 6px; color: inherit; text-decoration: none; }
 #sessions a.on { background: var(--panel); outline: 1px solid var(--line); }
@@ -85,6 +96,10 @@ dialog .buttons small { margin-right: auto; }
 .msg.more > .who, #reply.empty { display: none; }
 .msg[data-who="user"]:not(.results) { display: flex; flex-direction: column; align-items: flex-end; }
 .msg[data-who="user"]:not(.results) .bubble { max-width: 85%; }
+.msg.heard .bubble { border-left: 3px solid var(--tail); }   /* from the session's partner: how it came, what it says, what it ran */
+.bubble .head, .bubble .ran { font-size: 12px; color: var(--muted); white-space: normal; }
+.bubble .head { margin-bottom: 4px; }
+.bubble .ran { margin-top: 6px; }
 .msg > button { position: absolute; top: 0; right: 0; padding: 2px 5px; display: none; color: var(--muted); }
 .msg > button svg { width: 17px; height: 17px; }
 .msg[data-who="user"] > button { right: auto; left: 0; }
@@ -193,6 +208,7 @@ const page = {
   picked: null,                           // the provider chosen on the session form, until it starts again
   creating: null,                         // the new-session dialog, while it's open: {workspace chosen, error}
   settings: null,                         // the settings dialog, while it's open: {notes: under each card, by provider ('' the new one's), made: providers added}
+  accompanying: null,                     // the dialog that makes the session's companion, while it's open: {error}
   detail: 'Select a memory or chunk.',    // the memory or chunk the pyramid last showed
   folded: new Set(),                      // the workspaces whose groups are folded, kept in this browser
   scroll: false,                          // whether the next draw takes the log to its end, wherever it's scrolled to
@@ -294,6 +310,7 @@ const App = () => {
     </section>
     <aside id="memory">
       <h2>Session</h2>
+      <${Companion} />
       <${SessionForm} key=${current() + '/' + page.tuned} />
       <h2>Context</h2>
       <${Stats} />
@@ -303,21 +320,23 @@ const App = () => {
       <pre id="detail">${page.detail}</pre>
     </aside>
     ${page.creating && html`<${NewSession} />`}
-    ${page.settings && html`<${Settings} />`}`;
+    ${page.settings && html`<${Settings} />`}
+    ${page.accompanying && html`<${Accompany} />`}`;
 };
 
-// the sessions, grouped by workspace (those without one last)
+// the sessions, grouped by workspace (those without one last), a companion in its session's
 function Sessions() {
-  const workspace = (s) => s.workspace || '';
+  const workspace = (s) => (s.accompanies ? page.sessions.find((p) => p.name === s.accompanies) ?? s : s).workspace || '';
   const groups = [...new Set(page.sessions.map(workspace))].sort((a, b) => !a - !b || a.localeCompare(b));
   return html`<div id="sessions">${groups.length ? groups.map((w) => html`<${Group} key=${w} workspace=${w} members=${page.sessions.filter((s) => workspace(s) === w)} />`) : html`<small>No sessions yet.</small>`}</div>`;
 }
 
-// a workspace's sessions, a fork under its parent; its header folds it, as this browser remembers
+// a workspace's sessions, a fork under its parent and a companion under its session; its header folds
+// it, as this browser remembers
 function Group({ workspace: w, members }) {
-  const inside = (s) => members.some((m) => m.name === s.parent?.name);
-  const link = (s, depth) => html`<a key=${s.name} href="#${s.name}" class=${s.name === current() ? 'on' : ''} style="padding-left:${6 + depth * 14}px">${s.name} <small>${s.messages}${s.parent ? ' · from ' + s.parent.at : ''}</small></a>`;
-  const draw = (parent, depth) => members.filter((s) => (inside(s) ? s.parent.name : null) === parent).flatMap((s) => [link(s, depth), ...draw(s.name, depth + 1)]);
+  const above = (s) => s.parent?.name ?? s.accompanies, inside = (s) => members.some((m) => m.name === above(s));
+  const link = (s, depth) => html`<a key=${s.name} href="#${s.name}" class=${s.name === current() ? 'on' : ''} style="padding-left:${6 + depth * 14}px">${s.name} <small>${s.messages}${s.parent ? ' · from ' + s.parent.at : ''}${s.accompanies ? ' · companion' : ''}</small></a>`;
+  const draw = (parent, depth) => members.filter((s) => (inside(s) ? above(s) : null) === parent).flatMap((s) => [link(s, depth), ...draw(s.name, depth + 1)]);
   const title = w ? html`<b>${w.split(/[\\/]/).pop()}</b> · ${members.length}<small>${w}</small>` : html`<b>No workspace</b> · ${members.length}`;
   return html`<details class="group" data-workspace=${w} open=${!page.folded.has(w)} onToggle=${(e) => fold(w, !e.currentTarget.open)}><summary>${title}</summary>${draw(null, 0)}</details>`;
 }
@@ -357,6 +376,51 @@ function NewSession() {
       <div class="buttons">
         <button type="button" onClick=${(e) => e.target.closest('dialog').close()}>Cancel</button>
         <button class="primary">Create</button>
+      </div>
+    </form>
+  </dialog>`;
+}
+
+// the Auto switch, and the session's companion or the session it accompanies (companion.rs): on, each
+// one's turn's end goes to the other. Without a companion, turning it on opens the dialog that makes one.
+function Companion() {
+  const s = state?.settings ?? {}, partner = s.companion ?? s.accompanies;
+  const flip = (e) => {
+    if (partner) return auto(e.target.checked);
+    e.target.checked = false;
+    page.accompanying = { error: '' };
+    draw();
+  };
+  return html`<div id="companion" class="pairing">
+    <label class="switch" title=${partner ? 'While on, each one\'s turn\'s end goes to the other' : 'Make a companion: another session that keeps a goal and talks with this one'}>
+      <input type="checkbox" id="auto" checked=${!!s.auto} disabled=${!state?.settings} onChange=${flip} />Auto</label>
+    <small>${partner ? html`${s.companion ? 'with ' : 'companion of '}<a href="#${partner}">${partner}</a>` : 'no companion yet'}</small>
+  </div>`;
+}
+
+// the dialog that makes the session's companion: the user's goal, and its name
+function Accompany() {
+  const made = page.accompanying, s = state?.settings ?? {};
+  const make = async (e) => {
+    e.preventDefault();
+    const { name, goal } = e.target.elements;
+    try {
+      state = await api(`/api/s/${current()}/companion`, { name: name.value.trim(), goal: goal.value });
+      page.accompanying = null;
+      listSessions();
+    } catch (err) { made.error = err.message; }
+    draw();
+  };
+  return html`<dialog id="accompany" ref=${(d) => d && !d.open && d.showModal()} onClose=${() => { page.accompanying = null; draw(); }}>
+    <form class="settings" onSubmit=${make}>
+      <h2>A companion for ${current()}</h2>
+      <small>Another session, on ${s.provider} · ${s.model}, that keeps the goal in mind and talks with ${current()} as a collaborator. While Auto is on, each one's turn's end goes to the other, and either can message the other at any time. It has no workspace; its settings are a session's like any other's.</small>
+      <label>Goal <textarea id="goal" name="goal" rows="5" required placeholder="What the work is for, and what done looks like"></textarea></label>
+      <label>Its name <input id="companionname" name="name" required pattern="[A-Za-z0-9_\-]+" title="Letters, digits, - and _" defaultValue=${current() + '-companion'} /></label>
+      <small class="warn">${made.error}</small>
+      <div class="buttons">
+        <button type="button" onClick=${(e) => e.target.closest('dialog').close()}>Cancel</button>
+        <button class="primary">Start, with Auto on</button>
       </div>
     </form>
   </dialog>`;
@@ -530,21 +594,32 @@ class Message extends Component {
 
   render({ m, more, hidden, results, asked, joined }) {
     const all = m.content.every((b) => b.type === 'tool_result'), calls = m.content.filter((b) => b.type === 'tool_use');
+    const heard = m.participant !== 'user' && m.participant !== 'assistant';
     const block = (b, j) => {
       switch (b.type) {
-        case 'text': return m.participant === 'assistant' ? html`<div class="bubble md" data-kind="text" dangerouslySetInnerHTML=${{ __html: markdown(b.text) }} />` : html`<div class="bubble" data-kind="text">${b.text}</div>`;
+        case 'text': return heard ? html`<${Heard} text=${b.text} from=${m.participant} />`
+          : m.participant === 'assistant' ? html`<div class="bubble md" data-kind="text" dangerouslySetInnerHTML=${{ __html: markdown(b.text) }} />` : html`<div class="bubble" data-kind="text">${b.text}</div>`;
         case 'thinking': return html`<${Thinking} text=${b.thinking} />`;
         case 'tool_use': return html`<${Card} call=${b} result=${results[calls.indexOf(b)]} asking=${asked[calls.indexOf(b)]} />`;
         case 'tool_result': return joined[j] ? null : html`<${Card} result=${b} />`;   // its call isn't on the page
         default: return html`<div class="bubble" data-kind=${b.type}>${note(b)}</div>`;
       }
     };
-    return html`<div class=${'msg' + (all ? ' results' : '') + (more ? ' more' : '')} data-id=${m.id} data-who=${m.participant} hidden=${hidden}>
+    return html`<div class=${'msg' + (all ? ' results' : '') + (more ? ' more' : '') + (heard ? ' heard' : '')} data-id=${m.id} data-who=${m.participant} hidden=${hidden}>
       <div class="who">${m.participant}${all ? ' · tool results' : ''}</div>
       <button class="icon" data-fork=${m.id} title="Fork the session here" aria-label="Fork here" onClick=${() => fork(m.id)}>${ICONS.fork()}</button>
       ${m.content.map(block)}
     </div>`;
   }
+}
+
+// a message from the session's partner (companion.rs): how it came, then what it says, as markdown, and
+// what it ran
+function Heard({ text, from }) {
+  const parts = text.split('\n\n'), ran = parts.length > 2 && parts.at(-1).startsWith(`What ${from} ran this turn: `);
+  return html`<div class="bubble" data-kind="text"><div class="head">${parts[0]}</div>
+    <div class="md" dangerouslySetInnerHTML=${{ __html: markdown(parts.slice(1, ran ? -1 : undefined).join('\n\n')) }} />
+    ${ran && html`<div class="ran">${parts.at(-1)}</div>`}</div>`;
 }
 
 // the reply streaming in: its parts, each a run of reasoning or of text, or a call as the reply writes
@@ -714,6 +789,12 @@ async function tune(e) {
   redraw();
 }
 
+// Auto turned on or off, for the session and its partner
+async function auto(on) {
+  try { state = await api(`/api/s/${current()}/auto`, { on }); } catch (err) { fail(err); }
+  draw();
+}
+
 // a tool the session always allows, or no longer
 async function allows(tool) {
   const { allow } = state.settings;
@@ -867,7 +948,7 @@ function grow(part, piece) {
 
 try { page.folded = new Set(JSON.parse(localStorage.getItem('folded')) || []); } catch { /* no storage here: groups start open */ }
 window.onhashchange = () => {
-  [page.notes.session, page.picked, page.live, page.error] = ['', null, null, null];
+  [page.notes.session, page.picked, page.live, page.error, page.accompanying] = ['', null, null, null, null];
   listSessions();
   subscribe();
 };

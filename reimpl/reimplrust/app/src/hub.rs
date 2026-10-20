@@ -2,27 +2,38 @@
 //! and the sessions' settings files, which sessions have a thread (started the first time one is told
 //! something), and each session's pages and what they hear (Live).
 
-use crate::{api::Shown, costs::{Fold, Spent}, llm::Piece, settings::{self, SessionSettings, Settings}, work::{work, DENIED, STOPPED}, App};
+use crate::{api::Shown, companion::Heard, costs::{Fold, Spent}, llm::Piece, settings::{self, SessionSettings, Settings}, work::{work, DENIED, STOPPED}, App};
 use connectome::json::Value;
 use serde::Serialize;
-use std::{collections::HashMap, sync::mpsc::{channel, Receiver, Sender}};
+use std::{collections::HashMap, sync::mpsc::{channel, Receiver, SendError, Sender}};
 
 /// What the hub is told: a message about a session, or a change to settings.json, answered with the
 /// settings it leaves.
 pub enum Routed { To(String, Msg), Provide(Value, Sender<Result<Settings, String>>) }
 
 /// A job for a session's thread: a turn with a message, or without (None) one that continues the log;
-/// or a fork at message `at` as `name`.
+/// what its partner tells it (companion.rs), which joins a turn running between its steps, else starts
+/// one; or a fork at message `at` as `name`.
 pub enum Job {
     Say { text: Option<String> },
+    Hear(Heard),
     Fork { at: u64, name: String, reply: Sender<Result<(), String>> },
 }
 
 /// What the hub is told about a session, by requests' threads and by the session's.
 pub enum Msg {
     /// A job for the session's thread, which does them in the order they come, numbered from 1 (the
-    /// number answered) for as long as the server runs.
+    /// number answered) for as long as the server runs; but what its partner tells it while one of its
+    /// calls waits for the answer goes to that call (answered 0).
     Job(Job, Sender<u64>),
+    /// From the session's thread: a call waits for what the partner tells it next.
+    Await(Sender<Heard>),
+    /// Auto turned on or off, for the session and its partner.
+    Auto(bool, Sender<Result<(), String>>),
+    /// The session's companion made (companion::make): the two are paired, Auto on.
+    Pair(String, Sender<Result<(), String>>),
+    /// Whether a turn runs and hasn't ended yet (its memories may form after it).
+    Turning(Sender<bool>),
     /// A page that follows the session from now on, answered once it does: it hears the turn running
     /// so far first.
     Follow(Sender<Event>, Sender<()>),
@@ -122,15 +133,17 @@ struct Live {
     numbered: u64,
     pages: Vec<Sender<Event>>,
     turn: Option<Turn>,
+    awaiting: Option<Sender<Heard>>, // a call waiting for what the partner tells it next
 }
 
 /// A turn as a page that comes in during it hears it first: its start, then the events since the log
-/// last grew (what the log holds, the page reads from it); the calls waiting for an answer; and the
-/// session's thread's line, until the user stops the turn.
+/// last grew (what the log holds, the page reads from it); the calls waiting for an answer; the
+/// session's thread's line, until the user stops the turn; and whether it has ended.
 struct Turn {
     events: Vec<Event>,
     asked: HashMap<String, (String, Sender<Result<(), String>>)>, // by call id: its tool, where to answer
     stop: Option<Sender<()>>,
+    ended: bool,
 }
 
 impl Live {
@@ -139,11 +152,29 @@ impl Live {
         let (jobs, queue) = channel();
         let name = name.to_string();
         std::thread::spawn(move || work(app, &name, queue));
-        Live { jobs, numbered: 0, pages: vec![], turn: None }
+        Live { jobs, numbered: 0, pages: vec![], turn: None, awaiting: None }
     }
 
     fn handle(&mut self, app: &App, name: &str, msg: Msg) {
         match msg {
+            Msg::Job(Job::Hear(heard), reply) if self.awaiting.is_some() => match self.awaiting.take().expect("a call waits").send(heard) {
+                Ok(()) => drop(reply.send(0)),
+                Err(SendError(heard)) => self.handle(app, name, Msg::Job(Job::Hear(heard), reply)), // the call has stopped waiting
+            },
+            Msg::Await(waiting) => self.awaiting = Some(waiting),
+            Msg::Auto(on, reply) => {
+                let set = |name: &str| settings::change(&app.profile_path(name), |s: &mut SessionSettings| { s.auto = on; Ok(()) });
+                let partner = app.profile(name).and_then(|s| s.partner().map(str::to_string).ok_or(format!("{name} has no companion")));
+                let _ = reply.send(partner.and_then(|partner| set(name).and(set(&partner))).map(drop));
+            }
+            Msg::Pair(companion, reply) => {
+                let paired = settings::change(&app.profile_path(name), |s: &mut SessionSettings| match s.partner() {
+                    Some(partner) => Err(format!("{name} is paired with {partner} already")),
+                    None => Ok((s.companion, s.auto) = (Some(companion), true)),
+                });
+                let _ = reply.send(paired.map(drop));
+            }
+            Msg::Turning(reply) => drop(reply.send(self.turn.as_ref().is_some_and(|t| !t.ended))),
             Msg::Job(job, reply) => {
                 self.numbered += 1;
                 let _ = self.jobs.send((self.numbered, job));
@@ -161,7 +192,7 @@ impl Live {
                 let _ = reply.send(app.settings().and_then(tune).map(drop));
             }
             Msg::Start(id, stop) => {
-                self.turn = Some(Turn { events: vec![], asked: HashMap::new(), stop: Some(stop) });
+                self.turn = Some(Turn { events: vec![], asked: HashMap::new(), stop: Some(stop), ended: false });
                 self.send(Event::Turn(id));
             }
             Msg::Stop(reply) => {
@@ -197,7 +228,12 @@ impl Live {
                 }
                 self.send(Event::Logged(n));
             }
-            Msg::Event(event) => self.send(event),
+            Msg::Event(event) => {
+                if let (Event::End(_), Some(turn)) = (&event, &mut self.turn) {
+                    turn.ended = true;
+                }
+                self.send(event);
+            }
             Msg::Ask { id, tool, answer } => {
                 if let Some(turn) = &mut self.turn {
                     turn.asked.insert(id.clone(), (tool, answer));

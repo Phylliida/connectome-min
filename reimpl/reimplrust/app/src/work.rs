@@ -1,18 +1,26 @@
 //! A session's thread: it does its jobs one at a time, in the order they come (a message or fork told
-//! during a turn waits for it), the only one to write the session's log. A turn's chat message joins
-//! the log, then the turn takes steps until a reply calls no tools, each reading the settings again:
+//! during a turn waits for it, but what the session's partner tells it joins the turn), the only one
+//! to write the session's log. A turn's chat message joins the log, then the turn takes steps until a
+//! reply calls no tools and the partner has told it nothing more, each reading the settings again:
 //! the context compiles and streams from disk into the request, the reply joins the log, and the tools
-//! it calls run, each once the user allows it, their results joining the log. Memories form between
-//! steps and after the turn. The thread tells the hub what the pages following the job see (Msg).
-//! The user can stop a turn: it ends where it is (Worker::stopped).
+//! it calls run, each once the user allows it, their results joining the log. The turn's end goes to
+//! the partner (companion.rs), then memories form; they form between steps too. The thread tells the
+//! hub what the pages following the job see (Msg). The user can stop a turn: it ends where it is
+//! (Worker::stopped).
 
-use crate::{api::brief, costs::{self, For}, hub::{Event, Job, Msg}, llm::Llm, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
+use crate::{api::brief, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg}, llm::Llm, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{Host, Request, INTERRUPTED}, store::Session};
-use std::{panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
+use std::{cell::RefCell, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
 
 /// Steps a turn may take, a model request each, before it stops.
 const MAX_STEPS: usize = 64;
+
+/// A turn's end when it reaches MAX_STEPS.
+fn out_of_steps() -> String { format!("the turn stopped after {MAX_STEPS} steps") }
+
+/// A message from `who` of `text`, as the log keeps it.
+fn said(who: &str, text: String) -> Value { obj! {"participant" => who, "content" => vec![obj! {"type" => "text", "text" => text}]} }
 
 /// How long a call waits for the user's answer before it's denied.
 const APPROVAL_WAIT: Duration = Duration::from_secs(600);
@@ -39,7 +47,7 @@ impl Setup {
         let (all, settings) = (app.settings()?, app.profile(name)?);
         let p = all.providers.get(&settings.provider).ok_or_else(|| format!("no provider {} in settings.json", settings.provider))?;
         let llm = Llm { base: p.base.clone(), key: p.key.clone(), agent: app.agent.clone(), spent: Default::default() };
-        let tools = toolbox(app, settings.workspace.as_deref(), settings.sandbox.then_some(all.sandbox), all.search.as_deref());
+        let tools = toolbox(app, settings.workspace.as_deref(), settings.sandbox.then_some(all.sandbox), all.search.as_deref()) + companion::tools(app, name, &settings);
         let definitions = tools.definitions();
         Ok(Setup { overhead: overhead(settings.system.as_deref(), &definitions), settings, llm, tools, definitions })
     }
@@ -95,12 +103,16 @@ pub fn overhead(system: Option<&str>, definitions: &Option<Value>) -> f64 {
     density_tokens(system.unwrap_or("")) + definitions.as_ref().map_or(0.0, |d| density_tokens(&json::to_string(d)))
 }
 
-/// A session's thread, which does its `jobs` (Worker). A job that panics (a file edited into something
-/// the library can't read) fails, and the next runs.
+/// A session's thread, which does its `jobs` (Worker), and first those a turn took from them but left
+/// for after it (`later`). A job that panics (a file edited into something the library can't read)
+/// fails, and the next runs.
 pub fn work(app: &App, name: &str, jobs: Receiver<(u64, Job)>) {
-    for (id, job) in jobs {
+    let later = RefCell::new(VecDeque::new());
+    loop {
+        let next = later.borrow_mut().pop_front();
+        let Some((id, job)) = next.or_else(|| jobs.recv().ok()) else { return };
         let (stop, halt) = channel();
-        let done = catch_unwind(AssertUnwindSafe(|| Worker { app, name, s: app.session(name), halt }.run(id, job, stop)));
+        let done = catch_unwind(AssertUnwindSafe(|| Worker { app, name, s: app.session(name), halt, jobs: &jobs, later: &later }.run(id, job, stop)));
         if done.is_err() {
             app.tell(name, Msg::Event(Event::Forming(false)));
             app.tell(name, Msg::Event(Event::End(Some("the session's thread failed; the server's output says why".into()))));
@@ -109,13 +121,16 @@ pub fn work(app: &App, name: &str, jobs: Receiver<(u64, Job)>) {
     }
 }
 
-/// A job in a session, as it reads the session's files again; and where it hears that the user has
-/// stopped its turn: the hub holds the other end while the turn runs, and lets go of it to stop it.
+/// A job in a session, as it reads the session's files again; where it hears that the user has
+/// stopped its turn (the hub holds the other end while the turn runs, and lets go of it to stop it);
+/// and the session's jobs, from which a turn takes what the partner tells it, the rest left for later.
 struct Worker<'a> {
     app: &'a App,
     name: &'a str,
     s: Session,
     halt: Receiver<()>,
+    jobs: &'a Receiver<(u64, Job)>,
+    later: &'a RefCell<VecDeque<(u64, Job)>>,
 }
 
 impl Worker<'_> {
@@ -135,37 +150,92 @@ impl Worker<'_> {
     /// Job `id`; `stop` the hub holds while its turn runs.
     fn run(&self, id: u64, job: Job, stop: Sender<()>) {
         match job {
-            Job::Say { text } => {
-                self.tell(Msg::Start(id, stop));
-                self.event(Event::End(self.turn(text.as_deref()).err()));
-                if let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup) } // the turn's memories
-            }
+            Job::Say { text } => self.chat(id, stop, text.map(|text| said("user", text))),
+            Job::Hear(Heard { from, text }) => self.chat(id, stop, Some(said(&from, text))),
             Job::Fork { at, name: fork, reply } => {
                 let path = self.app.root.join(&fork); // claimed here, when the fork is made
                 let made = std::fs::create_dir(&path).map_err(|e| format!("can't fork {} as {fork}: {e}", self.name));
                 let _ = reply.send(made.and_then(|()| {
                     Session::fork(&self.s, at, path);
-                    settings::write(&self.app.profile_path(&fork), &self.app.profile(self.name)?)
+                    let own = self.app.profile(self.name)?; // a fork has no companion of its own
+                    settings::write(&self.app.profile_path(&fork), &SessionSettings { companion: None, accompanies: None, auto: false, ..own })
                 }));
             }
         }
     }
 
-    /// A chat turn: the message joins the log, then steps run until a reply calls no tools. Without a
-    /// message, the turn continues the log as it is: after an interruption the context ends with the
-    /// user's message or the tool results, and after a reply cut short with that reply, which the
-    /// Messages API continues (a prefill). The pages hear it as it goes (hub's Event); then run tells
-    /// them the turn's end, and the memories after it form.
-    fn turn(&self, text: Option<&str>) -> Result<(), String> {
-        if let Some(text) = text {
-            append(&self.s, &obj! {"participant" => "user", "content" => vec![obj! {"type" => "text", "text" => text}]}, &self.app.profile(self.name)?.config);
+    /// A turn from message `said` (or none), as the pages hear it: its start, the turn (hub's Event),
+    /// its end, which then goes to the session's partner (hand_over); then the memories after it form.
+    fn chat(&self, id: u64, stop: Sender<()>, said: Option<Value>) {
+        self.tell(Msg::Start(id, stop));
+        let start = self.s.count("messages");
+        let ended = self.turn(said);
+        self.event(Event::End(ended.clone().err()));
+        self.hand_over(start, ended);
+        if let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup) }
+    }
+
+    /// A chat turn: its message joins the log, then steps run until a reply calls no tools and the
+    /// partner has told the session nothing more (deliver). Without a message, the turn continues the
+    /// log as it is: after an interruption the context ends with the user's message or the tool
+    /// results, and after a reply cut short with that reply, which the Messages API continues (a
+    /// prefill).
+    fn turn(&self, said: Option<Value>) -> Result<(), String> {
+        if let Some(said) = said {
+            append(&self.s, &said, &self.app.profile(self.name)?.config);
         }
+        self.deliver()?;
         self.logged();
         for _ in 0..MAX_STEPS {
             if self.stopped() { return Err(STOPPED.into()) }
-            if !self.step()? { return Ok(()) }
+            let called = self.step()?;
+            if !self.deliver()? && !called { return Ok(()) }
         }
-        Err(format!("the turn stopped after {MAX_STEPS} steps"))
+        Err(out_of_steps())
+    }
+
+    /// What the session's partner has told it meanwhile joins the log, each as the partner's message;
+    /// the session's other jobs wait for the turn to end. Whether the partner told it anything.
+    fn deliver(&self) -> Result<bool, String> {
+        let mut heard = false;
+        while let Ok((id, job)) = self.jobs.try_recv() {
+            match job {
+                Job::Hear(Heard { from, text }) => {
+                    append(&self.s, &said(&from, text), &self.app.profile(self.name)?.config);
+                    heard = true;
+                }
+                job => self.later.borrow_mut().push_back((id, job)),
+            }
+        }
+        if heard { self.logged() }
+        Ok(heard)
+    }
+
+    /// The turn that started at message `start` and `ended` so, to the session's partner, if it has
+    /// one: if the turn ended by itself (or at its limit of steps), what it said and ran, while Auto is
+    /// on or when the partner is owed it (companion::owed); else Auto goes off for both, and the
+    /// partner, if owed an answer, hears why there's none.
+    fn hand_over(&self, start: u64, ended: Result<(), String>) {
+        let Ok(settings) = self.app.profile(self.name) else { return };
+        let Some(partner) = settings.partner() else { return };
+        let n = self.s.count("messages");
+        let turn: Vec<Value> = if n > start { self.s.span("messages", start, n - 1).collect() } else { vec![] };
+        let told = match ended {
+            Ok(()) => companion::ended(self.name, &turn),
+            Err(why) if why == out_of_steps() => format!("{}
+
+({why})", companion::ended(self.name, &turn)),
+            Err(why) => {
+                if settings.auto {
+                    let _ = self.app.ask_session(self.name, |reply| Msg::Auto(false, reply));
+                }
+                if !companion::owed(&turn, partner) { return }
+                format!("(its turn ended before it could answer: {why})")
+            }
+        };
+        if settings.auto || companion::owed(&turn, partner) {
+            self.app.ask_session(partner, |numbered| Msg::Job(Job::Hear(companion::heard(self.name, How::Ended, &told)), numbered));
+        }
     }
 
     /// One step: the context compiles and streams into a request, the reply streams to the pages and
