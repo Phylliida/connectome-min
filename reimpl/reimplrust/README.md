@@ -54,13 +54,14 @@ Settings are JSON files you can edit by hand, read again at each use, and only y
 since one holds the keys:
 
 - `ROOT/settings.json`: `providers`, each a name with a `base` URL, a `key` and the `models` the page
-  offers a session on it (the page's Settings edits them, and adds providers); `defaults`, what a
+  offers a session on it (the page's Settings edits them, adds providers and deletes them, all but
+  the one new sessions start on); `defaults`, what a
   new session starts with; `sandbox`, what a sandboxed command sees; and `search`, a SearXNG
   server's address (say `http://10.0.0.139:8288`), which gives sessions the `web_search` tool. The
   first run writes it with a provider named `default` for `https://api.anthropic.com` without a key,
   which the page then asks for, listing `claude-sonnet-5-5`, and defaults for a window of 90k tokens,
   30k of them reserved for the reply (and its reasoning: a reply that reaches its reserve stops
-  there).
+  there), and, on Linux, bash in the sandbox.
 - `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its
   `window`, `reserve` and `system` prompt, and the library's settings (`config`). A new session's

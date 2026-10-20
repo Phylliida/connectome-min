@@ -63,6 +63,9 @@ dialog .buttons small { margin-right: auto; }
 .model button { border: 0; background: none; padding: 0 6px; color: var(--muted); }
 .model button:hover { color: var(--warn); }
 .models input { flex: 1; width: auto; min-width: 180px; font-size: 12px; }
+.card .delete { padding: 5px; color: var(--muted); }
+.card .delete svg { width: 17px; height: 17px; }
+.card .delete:hover { color: var(--warn); border-color: var(--warn); }
 
 /* the sessions, grouped by workspace */
 #sessions a { display: block; padding: 4px 6px; border-radius: 6px; color: inherit; text-decoration: none; }
@@ -379,7 +382,8 @@ function Settings() {
 }
 
 // a provider's card: its base URL and its key (which the page never sees), saved by its button, and its
-// models, saved as each is added (Enter, or +) or taken off (×); without `p`, a new provider's, named
+// models, saved as each is added (Enter, or +) or taken off (×); and a button that deletes it, once the
+// user confirms; without `p`, a new provider's, named
 function Provider({ p }) {
   const card = p?.name ?? '';
   const save = async (e) => {
@@ -392,6 +396,7 @@ function Provider({ p }) {
     if (model && await provide(card, { name: card, models: [...p.models, model] })) input.value = '';
   };
   const enter = (e) => { if (e.key === 'Enter') { e.preventDefault(); add(e); } };
+  const forget = () => confirm(`Delete the provider ${card}? Sessions on it will need another.`) && provide(card, { name: card, delete: true });
   return html`<form class=${p ? 'card settings' : 'card settings adding'} data-provider=${card} onSubmit=${save}>
     <h3>${p ? p.name : 'New provider'}${p && !p.key && html`<small>no key</small>`}</h3>
     ${!p && html`<label>Name <input name="name" placeholder="openrouter" /></label>`}
@@ -403,7 +408,11 @@ function Provider({ p }) {
       <input name="model" placeholder="Add a model, as the provider names it" onKeyDown=${enter} />
       <button type="button" class="add" title="Add the model" aria-label="Add the model" onClick=${add}>+</button>
     </div>`}
-    <div class="buttons"><small>${page.settings.notes[card]}</small><button class="primary">${p ? 'Save' : 'Add provider'}</button></div>
+    <div class="buttons">
+      ${p && html`<button type="button" class="icon delete" title=${'Delete ' + card} aria-label=${'Delete ' + card} onClick=${forget}>${ICONS.trash()}</button>`}
+      <small>${page.settings.notes[card]}</small>
+      <button class="primary">${p ? 'Save' : 'Add provider'}</button>
+    </div>
   </form>`;
 }
 
@@ -454,7 +463,8 @@ function SayForm() {
 
 // the buttons' pictures (each drawn anew where it's used), in the text's color: a paper plane
 // flying off (send), a step after a trail of dots (go on), a stop sign (stop), a plus with a spark
-// (a new session), a lens (search), a fork whose tines branch like a log does (fork), and a gear (settings)
+// (a new session), a lens (search), a fork whose tines branch like a log does (fork), a gear (settings),
+// and a bin with its lid tipped open (delete)
 const ICONS = {
   send: () => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <path d="M21.5 2.5 6 9.4l5.3 3.3 3.3 5.3z" fill="currentColor" fill-opacity=".18" /><path d="M21.5 2.5 11.3 12.7" />
@@ -475,6 +485,10 @@ const ICONS = {
   gear: () => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true">
     <path d="M10.14 5.05 10.44 2.12h3.12l.3 2.93A7.2 7.2 0 0 1 15.6 5.76l2.28-1.85 2.21 2.21-1.85 2.28a7.2 7.2 0 0 1 .71 1.74l2.93.3v3.12l-2.93.3a7.2 7.2 0 0 1-.71 1.74l1.85 2.28-2.21 2.21-2.28-1.85a7.2 7.2 0 0 1-1.74.71l-.3 2.93h-3.12l-.3-2.93a7.2 7.2 0 0 1-1.74-.71l-2.28 1.85-2.21-2.21 1.85-2.28a7.2 7.2 0 0 1-.71-1.74l-2.93-.3v-3.12l2.93-.3a7.2 7.2 0 0 1 .71-1.74L3.91 6.12l2.21-2.21L8.4 5.76a7.2 7.2 0 0 1 1.74-.71z" fill="currentColor" fill-opacity=".14" />
     <circle cx="12" cy="12" r="2.9" /></svg>`,
+  trash: () => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M3.5 6.5h17M9.5 6.5V4.4c0-.6.5-1.1 1.1-1.1h2.8c.6 0 1.1.5 1.1 1.1v2.1" transform="rotate(-10 3.5 6.5)" />
+    <path d="M5.8 8.8l.9 10.9c.1 1 .9 1.8 1.9 1.8h6.8c1 0 1.8-.8 1.9-1.8l.9-10.9z" fill="currentColor" fill-opacity=".14" />
+    <path d="M10 12v6M14 12v6" /></svg>`,
 };
 
 // the log's messages, then the reply streaming in. A message's line (whose it is) shows only where the

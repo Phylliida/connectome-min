@@ -37,10 +37,18 @@ impl Settings {
     }
 
     /// A provider added, or its base URL or key changed, by what `v` gives that isn't blank, and its
-    /// models, if `v` lists them, those it lists (each once, in their order).
+    /// models, if `v` lists them, those it lists (each once, in their order); or, if `v` says delete,
+    /// deleted, unless new sessions start on it (sessions on it then need another).
     pub fn provide(&mut self, v: &Value) -> Result<(), String> {
         let given = |k: &str| v[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-        let p = self.providers.entry(given("name").ok_or("a provider's name")?).or_default();
+        let name = given("name").ok_or("a provider's name")?;
+        if v["delete"] == true {
+            if name == self.defaults.provider {
+                return Err(format!("new sessions start on {name}: name another in settings.json's defaults first"));
+            }
+            return self.providers.remove(&name).map(drop).ok_or(format!("no provider {name}"));
+        }
+        let p = self.providers.entry(name).or_default();
         (p.base, p.key) = (given("base").unwrap_or(std::mem::take(&mut p.base)), given("key").unwrap_or(std::mem::take(&mut p.key)));
         if let Some(models) = v.get("models") {
             let listed = models.as_array().ok_or("a provider's models, a list")?.iter().filter_map(Value::as_str).map(str::trim);
@@ -72,7 +80,7 @@ pub struct SessionSettings {
     #[default("default")] pub provider: String,
     #[default("claude-sonnet-5-5")] pub model: String,
     pub workspace: Option<PathBuf>,
-    pub sandbox: bool,
+    #[default(cfg!(target_os = "linux"))] pub sandbox: bool, // where bubblewrap runs
     pub allow: BTreeSet<String>,          // the tools that run without asking
     #[default(90000.0)] pub window: f64,  // tokens a request may take, the reply's included
     #[default(30000.0)] pub reserve: f64, // tokens for the reply (its reasoning too)

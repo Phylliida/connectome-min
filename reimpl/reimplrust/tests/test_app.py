@@ -10,7 +10,8 @@ and memory requests. Checked: every chat turn gets its reply; memories form and 
 to show them; the context stays within the window; the fork shares its parent's messages through the
 fork point, and its settings are its parent's; a provider saved from the page, and a model a session
 picks, reach the API, the key never the page or a session's file, in a file only its user can read,
-and the models it lists (each once) stay as they are when it's saved without them;
+and the models it lists (each once) stay as they are when it's saved without them; a provider is
+deleted, unless new sessions start on it;
 a session without settings says so, and one whose provider has gone shows its settings and takes
 another; a reply whose stream is cut off is an error, not a logged reply; a turn on a log the library
 can't read fails, and the session goes on once it's mended; a fork onto a session there is is refused;
@@ -287,6 +288,8 @@ def configure(root, base, window, recent, chunk):
     the tool definitions)."""
     path = Path(root, 'settings.json')
     everything = json.loads(path.read_text())
+    if everything['defaults']['sandbox'] != sys.platform.startswith('linux') or everything['providers']['default']['models'] != [everything['defaults']['model']]:
+        raise SystemExit(f'a first run wrote {everything["defaults"]["sandbox"]=} and {everything["providers"]["default"]["models"]=}')
     everything['providers']['default']['base'] = base
     everything['defaults'].update(model='mock', window=window, reserve=1000)
     everything['defaults']['config'].update(recent_window_tokens=recent, target_chunk_tokens=chunk)
@@ -841,6 +844,16 @@ def chatted(turns, tls, ca, baseline) -> str:
                 raise
         if next(p for p in call(port, '/api/settings')['providers'] if p['name'] == 'plain')['models'] != []:
             raise SystemExit('a provider without models in settings.json lists some')
+        call(port, '/api/settings', {'name': 'spare', 'base': 'https://spare.example'})
+        if 'spare' in [p['name'] for p in call(port, '/api/settings', {'name': 'spare', 'delete': True})['providers']]:
+            raise SystemExit('a provider deleted is still there')
+        for wrong in [{'name': 'spare', 'delete': True}, {'name': 'default', 'delete': True}]:   # one there isn't, and the one new sessions start on
+            try:
+                call(port, '/api/settings', wrong)
+                raise SystemExit(f'the settings took {wrong}')
+            except urllib.error.HTTPError as error:
+                if error.code != 400:
+                    raise
         Path(root, 'old').mkdir()                                       # a session without settings has none to run with
         if 'session_settings.json' not in (call(port, '/api/s/old')['problem'] or '') or call(port, '/api/s/old/messages') != []:
             raise SystemExit('a session without settings did not say so, or show its log')
