@@ -204,7 +204,6 @@ const page = {
   error: null,                            // why what the page last did failed
   broken: null,                           // why the session's files can't be read as they are
   notes: { session: '' },                 // under the session form: saved, or why not
-  tuned: 0,                               // the session form's saves, after each of which it starts again
   picked: null,                           // the provider chosen on the session form, until it starts again
   creating: null,                         // the new-session dialog, while it's open: {workspace chosen, error}
   settings: null,                         // the settings dialog, while it's open: {notes: under each card, by provider ('' the new one's), made: providers added}
@@ -323,7 +322,7 @@ const App = () => {
     <aside id="memory">
       <h2>Session</h2>
       <${Companion} />
-      <${SessionForm} key=${current() + '/' + page.tuned} />
+      <${SessionForm} key=${current()} />
       <h2>Context</h2>
       <${Stats} />
       <h2>Memory pyramid</h2>
@@ -492,11 +491,11 @@ function Provider({ p }) {
   </form>`;
 }
 
-// the session's main settings, as its file has them. A form's fields start from what the page shows and
-// are the user's from then on (default values: Preact sets `value` again at every draw), until the form
-// starts again (its key): another session, or a save. Its models are those of the provider chosen
-// (page.picked), the session's own first if its provider doesn't list it; a provider without any takes
-// a model typed.
+// the session's main settings, as its file has them, each saved as it changes (tune), into the session
+// the form is for: a choice at once, typing once it pauses or leaves its field. A form's fields start
+// from what the page shows and are the user's from then on (default values: Preact sets `value` again
+// at every draw), until the form starts again for another session (its key). Its models are those of the provider chosen (page.picked), the
+// session's own first if its provider doesn't list it; a provider without any takes a model typed.
 function SessionForm() {
   const s = state?.settings ?? {}, provider = page.picked ?? s.provider;
   const listed = page.providers.find((p) => p.name === provider)?.models ?? [];
@@ -505,7 +504,7 @@ function SessionForm() {
     page.picked = e.target.value;
     draw();
   };
-  return html`<form id="session" class="settings" onSubmit=${tune}>
+  return html`<form id="session" class="settings" data-session=${current()} onInput=${typing} onChange=${(e) => tune(e.target)} onSubmit=${(e) => e.preventDefault()}>
     <label>Provider <select name="provider" id="sprovider" onChange=${pick}>${page.providers.map((p) => html`<option selected=${p.name === s.provider}>${p.name}</option>`)}</select></label>
     <label>Model ${models.length ? html`<select name="model" key=${provider}>${models.map((m) => html`<option selected=${m === s.model}>${m}</option>`)}</select>`
       : html`<input name="model" defaultValue=${s.model ?? ''} placeholder="its name, as the provider has it" />`}</label>
@@ -514,8 +513,7 @@ function SessionForm() {
     <label>Window <input name="window" type="number" defaultValue=${s.window ?? ''} /></label>
     <label>Reply reserve <input name="reserve" type="number" defaultValue=${s.reserve ?? ''} /></label>
     <label>System prompt <textarea name="system" rows="2" defaultValue=${s.system ?? ''}></textarea></label>
-    <button>Save</button>
-    <small id="ssaved">${page.notes.session || 'The rest is in the session\'s session_settings.json.'}</small>
+    <small id="ssaved">${page.notes.session || 'Changes save as you make them. The rest is in the session\'s session_settings.json.'}</small>
   </form>`;
 }
 
@@ -804,14 +802,39 @@ async function provide(card, body) {
   } finally { draw(); }
 }
 
-async function tune(e) {
-  e.preventDefault();
-  const value = (el) => el.type === 'checkbox' ? el.checked : el.type === 'number' ? Number(el.value) : el.value || null;
+// typing in a field of the session form: it's saved once the typing pauses for PAUSE (or as it leaves
+// the field, tune); a choice is saved at once
+const PAUSE = 2500, pausing = new Map();
+function typing(e) {
+  const el = e.target;
+  if (el.tagName === 'SELECT' || el.type === 'checkbox') return;
+  clearTimeout(pausing.get(el));
+  pausing.set(el, setTimeout(() => tune(el), PAUSE));
+}
+
+// a field of the session form saved, alone, into the form's session, unless its file has it already: a
+// number once it is one, and a provider with the model its list starts on. The form may have gone, the
+// page on another session (a browser can tell its field it's left as it goes): then nothing on the page
+// says so.
+async function tune(el) {
+  clearTimeout(pausing.get(el));
+  const [form, value] = [el.form, el.type === 'checkbox' ? el.checked : el.type === 'number' ? (el.value.trim() ? Number(el.value) : NaN) : el.value || null];
+  const name = form?.id === 'session' ? form.dataset.session : null, shown = name === current();
+  if (!el.name || !name || shown && value === (state?.settings?.[el.name] ?? null)) return;
+  if (Number.isNaN(value)) {
+    if (shown) page.notes.session = `${el.closest('label').firstChild.textContent.trim()} needs a number.`;
+    return draw();
+  }
+  const change = el.name === 'provider' ? { provider: value, model: form.elements.model?.value || null } : { [el.name]: value };
+  if (shown) page.notes.session = 'Saving…';
+  draw();
   try {
-    state = await api(`/api/s/${current()}/settings`, Object.fromEntries([...e.target.elements].filter((el) => el.name).map((el) => [el.name, value(el)])));
-    [page.notes.session, page.tuned, page.picked] = ['Saved.', page.tuned + 1, null];
-  } catch (err) { page.notes.session = err.message; }
-  redraw();
+    const saved = await api(`/api/s/${name}/settings`, change);
+    if (name === current()) [state, page.notes.session] = [saved, 'Saved.'];
+  } catch (err) {
+    if (name === current()) page.notes.session = err.message;
+  }
+  draw();
 }
 
 // Auto turned on or off, for the session and its partner
