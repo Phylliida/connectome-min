@@ -134,9 +134,9 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
             companion::make(app, name, companion, goal).map(|()| Some(state(app, name, &s)))
         }
         ("POST", ["auto"]) => {
-            let on = body["on"] == true;
-            app.ask_session(name, |reply| Msg::Auto(on, reply))?;
-            if on { companion::kick_off(app, name)? }
+            if app.ask(|reply| Routed::Auto(name.into(), body["on"] == true, reply))? {
+                companion::kick_off(app, name)?;
+            }
             Ok(Some(state(app, name, &s)))
         }
         ("POST", ["approve"]) => {

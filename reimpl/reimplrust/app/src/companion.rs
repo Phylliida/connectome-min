@@ -161,7 +161,7 @@ pub fn tools(app: &App, me: &str, settings: &SessionSettings) -> Toolbox {
         let (hub, me, partner) = (app.hub.clone(), me.to_string(), partner.to_string());
         let finish = move |_: &Value, _: &dyn Fn() -> bool| {
             let (reply, answer) = channel();
-            hub.send(Routed::To(me.clone(), Msg::Auto(false, reply))).expect("the hub runs");
+            hub.send(Routed::Auto(me.clone(), false, reply)).expect("the hub runs");
             answer.recv().expect("the hub answers")?;
             Ok(format!("Auto is off. What you say now is the last that goes to {partner}; the user reads both your sessions.").into())
         };
@@ -170,9 +170,10 @@ pub fn tools(app: &App, me: &str, settings: &SessionSettings) -> Toolbox {
     Toolbox(tools)
 }
 
-/// `worker`'s companion made, as `v` gives it: its name and the user's goal. It starts with the
-/// worker's provider, model, window and library settings, no workspace, and the goal in its system
-/// prompt; the two are paired with Auto on, and the back-and-forth starts (kick_off).
+/// `worker`'s companion made, with its name and the user's goal. It starts with the worker's
+/// provider, model, window and library settings, no workspace, and the goal in its system prompt; the
+/// two are paired with Auto on, and the back-and-forth starts (kick_off), unless a turn of the
+/// worker's runs, whose end then goes to the companion.
 pub fn make(app: &App, worker: &str, name: &str, goal: &str) -> Result<(), String> {
     let own = app.profile(worker)?;
     if let Some(partner) = own.partner() {
@@ -181,12 +182,14 @@ pub fn make(app: &App, worker: &str, name: &str, goal: &str) -> Result<(), Strin
     std::fs::create_dir(app.root.join(name)).map_err(|e| format!("can't make {name}: {e}"))?;
     let first = SessionSettings { workspace: None, allow: BTreeSet::new(), system: Some(prompt(name, worker, goal)), companion: None, accompanies: Some(worker.into()), auto: true, ..own };
     settings::write(&app.profile_path(name), &first)?;
-    app.ask_session(worker, |reply| Msg::Pair(name.into(), reply))?;
-    kick_off(app, worker)
+    if app.ask_session(worker, |reply| Msg::Pair(name.into(), reply))? {
+        kick_off(app, worker)?;
+    }
+    Ok(())
 }
 
-/// Auto just on: unless a turn runs in either session (its end then goes to the other), the worker's
-/// last turn goes to its companion, which so starts the back-and-forth.
+/// The back-and-forth started, when the hub says it needs starting (Routed::Auto, Msg::Pair): the
+/// worker's last turn goes to its companion.
 pub fn kick_off(app: &App, name: &str) -> Result<(), String> {
     let me = app.profile(name)?;
     let (worker, companion) = match (&me.companion, &me.accompanies) {
@@ -194,9 +197,6 @@ pub fn kick_off(app: &App, name: &str) -> Result<(), String> {
         (_, Some(worker)) => (worker.clone(), name.to_string()),
         _ => return Err(format!("{name} has no companion")),
     };
-    if app.ask_session(&worker, Msg::Turning) || app.ask_session(&companion, Msg::Turning) {
-        return Ok(());
-    }
     let told = heard(&worker, How::Ended, &ended(&worker, &last_turn(&app.session(&worker))));
     app.ask_session(&companion, |numbered| Msg::Job(Job::Hear(told), numbered));
     Ok(())

@@ -849,6 +849,15 @@ def accompanied(tls, ca) -> str:
             raise SystemExit(f'Auto on sent the companion {last}')
         if call(port, '/api/s/pair')['settings'].get('auto') or call(port, '/api/s/pal')['settings'].get('auto') or len(log('pair')) != counts:
             raise SystemExit('a companion\'s failed turn left Auto on, or the session went on')
+        counts = len(log('pal'))                                        # Auto on while a turn runs: its end goes to the companion once
+        call(port, '/api/s/pair/say', {'text': 'echo call [["finish", {"pace": "slowly"}]]'})
+        time.sleep(0.3)
+        if call(port, '/api/s/pair/auto', {'on': True})['settings'].get('auto') is not True:
+            raise SystemExit('Auto did not go on during a turn')
+        quiet('pair', 'pal')
+        heard = [text for who, text in log('pal')[counts:] if who == 'pair']
+        if heard != ['pair ended its turn:\n\ncall [["finish", {"pace": "slowly"}]]'] or call(port, '/api/s/pal')['settings'].get('auto'):
+            raise SystemExit(f'Auto on during a turn: the companion heard {heard}')
         call(port, '/api/sessions', {'name': 'lone'})
         for path, wrong in [('pair/companion', {'name': 'pal2', 'goal': 'g'}), ('pal/companion', {'name': 'pal3', 'goal': 'g'}), ('lone/companion', {'name': 'pair', 'goal': 'g'}),
                             ('lone/companion', {'name': 'pal4'}), ('lone/auto', {'on': True})]:

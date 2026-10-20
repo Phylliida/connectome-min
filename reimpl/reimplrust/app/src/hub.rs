@@ -7,9 +7,10 @@ use connectome::json::Value;
 use serde::Serialize;
 use std::{collections::HashMap, sync::mpsc::{channel, Receiver, SendError, Sender}};
 
-/// What the hub is told: a message about a session, or a change to settings.json, answered with the
-/// settings it leaves.
-pub enum Routed { To(String, Msg), Provide(Value, Sender<Result<Settings, String>>) }
+/// What the hub is told: a message about a session; a change to settings.json, answered with the
+/// settings it leaves; or Auto turned on or off for a session and its partner, answered with whether
+/// the back-and-forth needs starting (auto).
+pub enum Routed { To(String, Msg), Provide(Value, Sender<Result<Settings, String>>), Auto(String, bool, Sender<Result<bool, String>>) }
 
 /// A job for a session's thread: a turn with a message, or without (None) one that continues the log;
 /// what its partner tells it (companion.rs), which joins a turn running between its steps, else starts
@@ -28,12 +29,13 @@ pub enum Msg {
     Job(Job, Sender<u64>),
     /// From the session's thread: a call waits for what the partner tells it next.
     Await(Sender<Heard>),
-    /// Auto turned on or off, for the session and its partner.
-    Auto(bool, Sender<Result<(), String>>),
-    /// The session's companion made (companion::make): the two are paired, Auto on.
-    Pair(String, Sender<Result<(), String>>),
-    /// Whether a turn runs and hasn't ended yet (its memories may form after it).
-    Turning(Sender<bool>),
+    /// The session's companion made (companion::make): the two are paired, Auto on; answered with
+    /// whether the back-and-forth needs starting (no turn here has yet to hand over its end).
+    Pair(String, Sender<Result<bool, String>>),
+    /// From the session's thread: its turn has ended, and is to be handed over; answered with whether
+    /// Auto is on now. The hub orders this and Auto's switching, so a turn's end goes to the partner
+    /// once: by the hand-over, or by the back-and-forth's start (auto).
+    Ended(Sender<bool>),
     /// A page that follows the session from now on, answered once it does: it hears the turn running
     /// so far first.
     Follow(Sender<Event>, Sender<()>),
@@ -103,8 +105,20 @@ pub fn hub(app: &'static App, inbox: Receiver<Routed>) {
         match routed {
             Routed::To(name, msg) => sessions.entry(name.clone()).or_insert_with(|| Live::start(app, &name)).handle(app, &name, msg),
             Routed::Provide(v, reply) => drop(reply.send(settings::change(&app.settings_path(), |all: &mut Settings| all.provide(&v)))),
+            Routed::Auto(name, on, reply) => drop(reply.send(auto(app, &sessions, &name, on))),
         }
     }
+}
+
+/// Auto turned on or off for `name` and its partner; whether the back-and-forth needs starting: Auto
+/// on while no turn in either has yet to hand over its end (one that has will hand it over itself).
+fn auto(app: &App, sessions: &HashMap<String, Live>, name: &str, on: bool) -> Result<bool, String> {
+    let partner = app.profile(name)?.partner().map(str::to_string).ok_or(format!("{name} has no companion"))?;
+    let set = |name: &str| settings::change(&app.profile_path(name), |s: &mut SessionSettings| { s.auto = on; Ok(()) });
+    set(name)?;
+    set(&partner)?;
+    let quiet = |name: &str| sessions.get(name).is_none_or(|live| !live.turning());
+    Ok(on && quiet(name) && quiet(&partner))
 }
 
 impl App {
@@ -138,7 +152,7 @@ struct Live {
 
 /// A turn as a page that comes in during it hears it first: its start, then the events since the log
 /// last grew (what the log holds, the page reads from it); the calls waiting for an answer; the
-/// session's thread's line, until the user stops the turn; and whether it has ended.
+/// session's thread's line, until the user stops the turn; and whether it has ended (Msg::Ended).
 struct Turn {
     events: Vec<Event>,
     asked: HashMap<String, (String, Sender<Result<(), String>>)>, // by call id: its tool, where to answer
@@ -162,19 +176,19 @@ impl Live {
                 Err(SendError(heard)) => self.handle(app, name, Msg::Job(Job::Hear(heard), reply)), // the call has stopped waiting
             },
             Msg::Await(waiting) => self.awaiting = Some(waiting),
-            Msg::Auto(on, reply) => {
-                let set = |name: &str| settings::change(&app.profile_path(name), |s: &mut SessionSettings| { s.auto = on; Ok(()) });
-                let partner = app.profile(name).and_then(|s| s.partner().map(str::to_string).ok_or(format!("{name} has no companion")));
-                let _ = reply.send(partner.and_then(|partner| set(name).and(set(&partner))).map(drop));
-            }
             Msg::Pair(companion, reply) => {
                 let paired = settings::change(&app.profile_path(name), |s: &mut SessionSettings| match s.partner() {
                     Some(partner) => Err(format!("{name} is paired with {partner} already")),
                     None => Ok((s.companion, s.auto) = (Some(companion), true)),
                 });
-                let _ = reply.send(paired.map(drop));
+                let _ = reply.send(paired.map(|_| !self.turning()));
             }
-            Msg::Turning(reply) => drop(reply.send(self.turn.as_ref().is_some_and(|t| !t.ended))),
+            Msg::Ended(reply) => {
+                if let Some(turn) = &mut self.turn {
+                    turn.ended = true;
+                }
+                let _ = reply.send(app.profile(name).is_ok_and(|s| s.auto));
+            }
             Msg::Job(job, reply) => {
                 self.numbered += 1;
                 let _ = self.jobs.send((self.numbered, job));
@@ -228,12 +242,7 @@ impl Live {
                 }
                 self.send(Event::Logged(n));
             }
-            Msg::Event(event) => {
-                if let (Event::End(_), Some(turn)) = (&event, &mut self.turn) {
-                    turn.ended = true;
-                }
-                self.send(event);
-            }
+            Msg::Event(event) => self.send(event),
             Msg::Ask { id, tool, answer } => {
                 if let Some(turn) = &mut self.turn {
                     turn.asked.insert(id.clone(), (tool, answer));
@@ -242,6 +251,9 @@ impl Live {
             }
         }
     }
+
+    /// Whether a turn runs that has yet to hand over its end.
+    fn turning(&self) -> bool { self.turn.as_ref().is_some_and(|t| !t.ended) }
 
     /// An event to the pages, kept for those that come later while a turn runs.
     fn send(&mut self, event: Event) {

@@ -8,7 +8,7 @@
 //! hub what the pages following the job see (Msg). The user can stop a turn: it ends where it is
 //! (Worker::stopped).
 
-use crate::{api::brief, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg}, llm::Llm, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
+use crate::{api::brief, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg, Routed}, llm::Llm, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{Host, Request, INTERRUPTED}, store::Session};
 use std::{cell::RefCell, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
@@ -167,8 +167,9 @@ impl Worker<'_> {
         self.tell(Msg::Start(id, stop));
         let start = self.s.count("messages");
         let ended = self.turn(said);
+        let auto = self.app.ask_session(self.name, Msg::Ended);
         self.event(Event::End(ended.clone().err()));
-        self.hand_over(start, ended);
+        self.hand_over(start, ended, auto);
         if let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup) }
     }
 
@@ -223,10 +224,10 @@ impl Worker<'_> {
     }
 
     /// The turn that started at message `start` and `ended` so, to the session's partner, if it has
-    /// one: if the turn ended by itself, what it said and ran, while Auto is
-    /// on or when the partner is owed it (companion::owed); else Auto goes off for both, and the
-    /// partner, if owed an answer, hears why there's none.
-    fn hand_over(&self, start: u64, ended: Result<(), String>) {
+    /// one: if the turn ended by itself, what it said and ran, if `auto` (Auto on as it ended) or the
+    /// partner is owed it (companion::owed); else Auto goes off for both, and the partner, if owed an
+    /// answer, hears why there's none.
+    fn hand_over(&self, start: u64, ended: Result<(), String>, auto: bool) {
         let Ok(settings) = self.app.profile(self.name) else { return };
         let Some(partner) = settings.partner() else { return };
         let n = self.s.count("messages");
@@ -234,14 +235,14 @@ impl Worker<'_> {
         let told = match ended {
             Ok(()) => companion::ended(self.name, &turn),
             Err(why) => {
-                if settings.auto {
-                    let _ = self.app.ask_session(self.name, |reply| Msg::Auto(false, reply));
+                if auto {
+                    let _ = self.app.ask(|reply| Routed::Auto(self.name.into(), false, reply));
                 }
                 if !companion::owed(&turn, partner) { return }
                 format!("(its turn ended before it could answer: {why})")
             }
         };
-        if settings.auto || companion::owed(&turn, partner) {
+        if auto || companion::owed(&turn, partner) {
             self.app.ask_session(partner, |numbered| Msg::Job(Job::Hear(companion::heard(self.name, How::Ended, &told)), numbered));
         }
     }
