@@ -34,7 +34,8 @@ most once a frame, its finished markdown blocks once. Opening a session shows it
 messages; scrolling up, two views from the top, loads the 200 before them, until the first, so
 they're there before the view gets to them, and the messages in view stay where they are as they go
 in above, even mid-scroll (the browser's scroll anchoring). The log follows a reply only while the
-view is at its end. The page shows the assistant's text as markdown, through marked and then
+view is at its end. A tab on each edge of the chat hides the side next to it, or shows it again, as
+this browser remembers. The page shows the assistant's text as markdown, through marked and then
 DOMPurify, which keeps only the HTML markdown makes, so a reply can neither run code on the page nor
 load anything; its math (`$…$` or `\(…\)` inline, `$$…$$` or `\[…\]` displayed) KaTeX sets in its
 own fonts, and highlight.js colors its code blocks. These, jsdiff for edits' diffs, Preact and htm

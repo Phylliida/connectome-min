@@ -24,6 +24,9 @@
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, sans-serif; }
 main { display: grid; grid-template-columns: 220px 1fr 360px; height: 100vh; }
+main.left-closed { grid-template-columns: 0 1fr 360px; }   /* a side hidden (its tab on the chat's edge shows it again) */
+main.right-closed { grid-template-columns: 220px 1fr 0; }
+main.left-closed.right-closed { grid-template-columns: 0 1fr 0; }
 aside, section { overflow: auto; padding: 16px; }
 aside { border-right: 1px solid var(--line); }
 #memory { border-left: 1px solid var(--line); border-right: 0; }
@@ -87,7 +90,13 @@ dialog .buttons small { margin-right: auto; }
 .group summary small { display: block; font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
 
 /* the chat: a line where the speaker changes, then each block a bubble, the user's on the right */
-#chat { display: flex; flex-direction: column; padding: 0; }
+#chat { display: flex; flex-direction: column; padding: 0; position: relative; grid-column: 2; }
+#memory { grid-column: 3; }
+.tab { position: absolute; top: 10px; z-index: 2; width: 16px; height: 44px; padding: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); }
+.tab.left { left: 0; border-left: 0; border-radius: 0 6px 6px 0; }
+.tab.right { right: 0; border-right: 0; border-radius: 6px 0 0 6px; }
+.tab svg { width: 12px; height: 12px; }
+.tab:hover { color: var(--accent); }
 #log { flex: 1; overflow: auto; padding: 16px; }
 .msg { position: relative; margin-top: 12px; }
 .earlier { text-align: center; font-size: 12px; color: var(--muted); min-height: 18px; overflow-anchor: none; }   /* never what the view keeps in place */
@@ -181,7 +190,8 @@ form textarea { resize: vertical; min-height: 42px; }
 pre#detail { white-space: pre-wrap; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; max-height: 40vh; overflow: auto; }
 
 @media (max-width: 900px) {
-  main { grid-template-columns: 1fr; height: auto; }
+  main, main.left-closed, main.right-closed, main.left-closed.right-closed { grid-template-columns: 1fr; height: auto; }
+  #chat, #memory { grid-column: auto; }
   #chat { height: 80vh; }
 }
 </style>
@@ -210,6 +220,7 @@ const page = {
   accompanying: null,                     // the dialog that makes the session's companion, while it's open: {error}
   detail: 'Select a memory or chunk.',    // the memory or chunk the pyramid last showed
   folded: new Set(),                      // the workspaces whose groups are folded, kept in this browser
+  panels: { left: true, right: true },    // which sides show, kept in this browser
   scroll: false,                          // whether the next draw takes the log to its end, wherever it's scrolled to
   keep: null,                             // the log's height, which the next draw adds what it puts above to (earlier messages, at its very top)
   earlier: null,                          // 'loading' while a page of the log's earlier messages loads
@@ -228,7 +239,10 @@ function draw() {
   frame = null;
   const log = document.getElementById('log');
   const following = page.scroll || (log && log.scrollHeight - log.scrollTop - log.clientHeight < 48);
-  render(html`<${App} />`, document.querySelector('main'));
+  const main = document.querySelector('main');
+  main.classList.toggle('left-closed', !page.panels.left);
+  main.classList.toggle('right-closed', !page.panels.right);
+  render(html`<${App} />`, main);
   const drawn = document.getElementById('log');
   if (page.keep != null) drawn.scrollTop = drawn.scrollHeight - page.keep;
   else if (following) drawn.scrollTop = drawn.scrollHeight;
@@ -302,10 +316,17 @@ function status() {
   return state?.refused ? ['The summarizer refused; memory formation is stopped until surgery.', true] : ['', false];
 }
 
+// a tab on the chat's edge that hides the side next to it, or shows it again
+function Tab({ side, what }) {
+  const open = page.panels[side];
+  return html`<button class=${'tab ' + side} id=${side + '-tab'} title=${(open ? 'Hide ' : 'Show ') + what} aria-label=${(open ? 'Hide ' : 'Show ') + what} aria-expanded=${open}
+    onClick=${() => panel(side, !open)}>${ICONS.chevron((side === 'left') === open ? 'left' : 'right')}</button>`;
+}
+
 const App = () => {
   const [line, warn] = status();
   return html`
-    <aside>
+    <aside hidden=${!page.panels.left}>
       <div class="top">
         <button id="new-session" class="new" onClick=${creating}>New session</button>
         <button id="open-settings" class="icon" title="Settings: providers and their models" aria-label="Settings" onClick=${opening}>${ICONS.gear()}</button>
@@ -315,11 +336,13 @@ const App = () => {
       <${Sessions} />
     </aside>
     <section id="chat">
+      <${Tab} side="left" what="the sessions" />
+      <${Tab} side="right" what="the session's settings and memory" />
       <${Log} />
       <div id="status" class=${warn ? 'warn' : ''}>${line}</div>
       <${SayForm} />
     </section>
-    <aside id="memory">
+    <aside id="memory" hidden=${!page.panels.right}>
       <h2>Session</h2>
       <${Companion} />
       <${SessionForm} key=${current()} />
@@ -548,8 +571,10 @@ function fit(box) {
 // the buttons' pictures (each drawn anew where it's used), in the text's color: a paper plane
 // flying off (send), a step after a trail of dots (go on), a stop sign (stop), a lens (search), a fork
 // whose tines branch like a log does (fork), a gear (settings), and a bin with its lid tipped open
-// (delete)
+// (delete), and a chevron (a side hidden or shown)
 const ICONS = {
+  chevron: (to) => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d=${to === 'left' ? 'M15 5l-7 7 7 7' : 'M9 5l7 7-7 7'} /></svg>`,
   send: () => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <path d="M21.5 2.5 6 9.4l5.3 3.3 3.3 5.3z" fill="currentColor" fill-opacity=".18" /><path d="M21.5 2.5 11.3 12.7" />
     <path d="M2.5 16.5 5.5 13.5M4.5 20.5l3.2-3.2M8.6 21.6l1.6-1.6" opacity=".5" /></svg>`,
@@ -769,6 +794,13 @@ async function listSessions() {
 async function loadProviders() {
   ({ providers: page.providers } = await api('/api/settings'));
   redraw();
+}
+
+// a side of the page hidden or shown, kept in this browser
+function panel(side, open) {
+  page.panels[side] = open;
+  try { localStorage.setItem('panels', JSON.stringify(page.panels)); } catch { /* no storage here: kept until the page reloads */ }
+  draw();
 }
 
 // a group of sessions folded or opened, kept in this browser
@@ -1028,6 +1060,7 @@ function grow(part, piece) {
 }
 
 try { page.folded = new Set(JSON.parse(localStorage.getItem('folded')) || []); } catch { /* no storage here: groups start open */ }
+try { Object.assign(page.panels, JSON.parse(localStorage.getItem('panels'))); } catch { /* no storage here: both sides show */ }
 window.onhashchange = () => {
   [page.notes.session, page.picked, page.live, page.error, page.accompanying, page.messages] = ['', null, null, null, null, []];
   listSessions();
