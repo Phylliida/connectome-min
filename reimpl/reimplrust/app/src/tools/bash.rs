@@ -82,7 +82,7 @@ fn run(dir: &Path, input: &Value, limit: Duration, sandbox: Option<&Sandbox>, st
 /// bubblewrap's arguments up to the command: a new PID namespace and session, /proc and /dev, the
 /// sandbox's paths that exist (read-only, then read-write), the workspace, the root they're mounted in
 /// made read-only, and the network unless the sandbox has none.
-fn bwrap(dir: &Path, b: &Sandbox) -> Vec<OsString> {
+pub fn bwrap(dir: &Path, b: &Sandbox) -> Vec<OsString> {
     let fixed = ["--die-with-parent", "--new-session", "--unshare-pid", "--proc", "/proc", "--dev-bind", "/dev", "/dev"].map(OsString::from);
     let paths = b.ro.iter().map(|p| ("--ro-bind-try", p)).chain(b.rw.iter().map(|p| ("--bind-try", p)));
     let binds = paths.flat_map(|(how, p)| [how.into(), expand(p).into(), expand(p).into()]);

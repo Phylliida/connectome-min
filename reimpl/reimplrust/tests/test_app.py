@@ -571,24 +571,35 @@ def tooled(tls, ca, baseline) -> str:
         time.sleep(max(0.0, started + 1.4 - time.monotonic()))
         if got['0']['content'] != '\n[killed after 0.4 s]' or Path(work, 'survived').exists():
             raise SystemExit(f'a sandboxed command past its timeout: {got}, or what it started outlived it')
-        call(port, '/api/s/tools/settings', {'sandbox': False})
-        os.symlink(root, Path(work, 'out'))                             # edits: a file made, its text replaced; refusals; ways out
-        edits = [{'path': 'notes/a.txt', 'old': '', 'new': 'one\ntwo\ntwo\n'}, {'path': 'notes/a.txt', 'old': 'one', 'new': 'uno'},
-                 {'path': 'notes/a.txt', 'old': 'two', 'new': 'dos'}, {'path': 'notes/a.txt', 'old': 'two', 'new': 'dos', 'all': True},
-                 {'path': 'notes/a.txt', 'old': 'three', 'new': 'x'}, {'path': 'notes/a.txt', 'old': '', 'new': 'x'},
-                 {'path': '../escaped', 'old': '', 'new': 'x'}, {'path': 'new/../../escaped', 'old': '', 'new': 'x'}, {'path': f'{root}/escaped', 'old': '', 'new': 'x'},
-                 {'path': 'out/escaped', 'old': '', 'new': 'x'}]
-        got = results('call ' + json.dumps([['edit', e] for e in edits]), asked=['edit'] * len(edits))
-        outcomes = [(got[str(k)]['content'], got[str(k)].get('is_error', False)) for k in range(len(edits))]
-        outside = lambda path: (f'{path} is outside the workspace, {work}', True)
-        expected = [('made notes/a.txt, 3 lines', False), ('edited notes/a.txt at line 1', False),
-                    ('the text to replace is in notes/a.txt 2 times: give more of it, around the change, or all', True), ('edited notes/a.txt in 2 places, the first at line 2', False),
-                    ("the text to replace isn't in notes/a.txt", True), ('notes/a.txt exists: give the text to replace in it', True), outside('../escaped'), outside('new/../../escaped'), outside(f'{root}/escaped'), outside('out/escaped')]
-        if outcomes != expected or Path(work, 'notes/a.txt').read_text() != 'uno\ndos\ndos\n' or Path(root, 'escaped').exists() or Path(work).parent.joinpath('escaped').exists():
-            raise SystemExit(f'edits: {outcomes}')
-        if [[tool, json.loads(given)] for tool, given in seen['calls']] != [['edit', e] for e in edits]:
-            raise SystemExit(f'the calls as the reply streamed them: {seen["calls"][:2]}')
+        os.symlink(root, Path(work, 'out'))                             # edits, in the sandbox and out of it: a file made, its text replaced; refusals; ways out
+        for sandboxed in (True, False):
+            call(port, '/api/s/tools/settings', {'sandbox': sandboxed})
+            shutil.rmtree(Path(work, 'notes'), ignore_errors=True)
+            edits = [{'path': 'notes/a.txt', 'old': '', 'new': 'one\ntwo\ntwo\n'}, {'path': 'notes/a.txt', 'old': 'one', 'new': 'uno'},
+                     {'path': 'notes/a.txt', 'old': 'two', 'new': 'dos'}, {'path': 'notes/a.txt', 'old': 'two', 'new': 'dos', 'all': True},
+                     {'path': 'notes/a.txt', 'old': 'three', 'new': 'x'}, {'path': 'notes/a.txt', 'old': '', 'new': 'x'},
+                     {'path': '../escaped', 'old': '', 'new': 'x'}, {'path': 'new/../../escaped', 'old': '', 'new': 'x'}, {'path': f'{root}/escaped', 'old': '', 'new': 'x'},
+                     {'path': 'out/escaped', 'old': '', 'new': 'x'}]
+            got = results('call ' + json.dumps([['edit', e] for e in edits]), asked=['edit'] * len(edits))
+            outcomes = [(got[str(k)]['content'], got[str(k)].get('is_error', False)) for k in range(len(edits))]
+            outside = lambda path: (f'{path} is outside the workspace, {work}', True)
+            expected = [('made notes/a.txt, 3 lines', False), ('edited notes/a.txt at line 1', False),
+                        ('the text to replace is in notes/a.txt 2 times: give more of it, around the change, or all', True), ('edited notes/a.txt in 2 places, the first at line 2', False),
+                        ("the text to replace isn't in notes/a.txt", True), ('notes/a.txt exists: give the text to replace in it', True), outside('../escaped'), outside('new/../../escaped'), outside(f'{root}/escaped'), outside('out/escaped')]
+            if outcomes != expected or Path(work, 'notes/a.txt').read_text() != 'uno\ndos\ndos\n' or Path(root, 'escaped').exists() or Path(work).parent.joinpath('escaped').exists():
+                raise SystemExit(f'edits{" in the sandbox" if sandboxed else ""}: {outcomes}')
+            if [[tool, json.loads(given)] for tool, given in seen['calls']] != [['edit', e] for e in edits]:
+                raise SystemExit(f'the calls as the reply streamed them: {seen["calls"][:2]}')
         os.remove(Path(work, 'out'))
+        call(port, '/api/sessions', {'name': 'reading', 'workspace': work})   # in the sandbox, a command reads the file, which says so when there's none
+        call(port, '/api/s/reading/settings', {'allow': ['edit']})
+        for sandboxed in (True, False):
+            call(port, '/api/s/reading/settings', {'sandbox': sandboxed})
+            say(port, 'reading', 'call ' + json.dumps([['edit', {'path': 'notes/none.txt', 'old': 'x', 'new': 'y'}]]))
+            missing = [b for m in call(port, '/api/s/reading/messages') for b in m['content'] if b['type'] == 'tool_result'][-1]['content']
+            if missing != (f'notes/none.txt: cat: {work}/notes/none.txt: No such file or directory' if sandboxed else 'notes/none.txt: No such file or directory (os error 2)'):
+                raise SystemExit(f'an edit of a file there isn\'t{", in the sandbox," if sandboxed else ""} said {missing!r}')
+            say(port, 'reading', 'echo next')                           # the mock answers results and a message together with a reply
         got = results('call [["hang", {}], ["picture", {}]]', asked=['hang'])
         if got['0']['content'] != 'MCP server first: tools/call timed out after 1 s' or got['1'].get('is_error'):
             raise SystemExit(f'a call past its timeout, then another of the same server: {got}')

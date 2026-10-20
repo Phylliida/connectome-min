@@ -85,12 +85,13 @@ since one holds the keys:
 Tools (`app/src/tools/`): the model can call `bash` (a command in a new shell in the session's
 workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in the workspace changed
 by replacing text in it, which must occur once unless the call says `all`, or made; its paths can't
-lead out of the workspace, through `..`, an absolute path or a link), `web_search` (when
-settings.json names a SearXNG server: a query asked through its JSON API, which its settings.yml
-must allow by listing `json` in `search.formats`, the pages found given back as text, each one's
-title, address, date when known and excerpt) and the tools of the MCP servers in `ROOT/mcp.json` (or
-`--mcp FILE`), listed all at once at startup (one whose tools can't be listed is stopped), in the
-usual format:
+lead out of the workspace, through `..`, an absolute path or a link; in the sandbox it reads and
+writes through commands run in bash's sandbox, so the kernel keeps it to what a sandboxed command
+may touch), `web_search` (when settings.json names a SearXNG server: a query asked through its JSON
+API, which its settings.yml must allow by listing `json` in `search.formats`, the pages found given
+back as text, each one's title, address, date when known and excerpt) and the tools of the MCP
+servers in `ROOT/mcp.json` (or `--mcp FILE`), listed all at once at startup (one whose tools can't
+be listed is stopped), in the usual format:
 
 ```json
 {"mcpServers": {"NAME": {"command": "...", "args": ["..."], "env": {"KEY": "..."}}}}

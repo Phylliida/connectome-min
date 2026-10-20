@@ -76,7 +76,7 @@ impl Host for Summarizer<'_> {
 pub fn toolbox(app: &App, workspace: Option<&Path>, sandbox: Option<Sandbox>, searching: Option<&str>) -> Toolbox {
     let why = "it has no workspace; the user can set one in the session's settings";
     let (bash, edit) = match workspace {
-        Some(dir) => (bash::tool(dir.into(), app.limit, sandbox), edit::tool(dir.into())),
+        Some(dir) => (bash::tool(dir.into(), app.limit, sandbox.clone()), edit::tool(dir.into(), app.limit, sandbox)),
         None => (bash::unavailable(why), edit::unavailable(why)),
     };
     let bash = if app.bash { bash } else { Toolbox::default() };
