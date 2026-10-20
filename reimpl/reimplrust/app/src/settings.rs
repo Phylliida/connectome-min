@@ -20,11 +20,12 @@ impl Settings {
     /// What settings.json starts as: a provider named default, Anthropic's API without a key yet, and
     /// new sessions on it (on the one model it lists) with a window of 90k tokens: the reply's reserve, `overhead`, which every
     /// request carries (the system prompt and tool definitions), and the context, which the library's
-    /// settings are sized for.
+    /// settings are sized for: its recent window a quarter of it (up to the library's 30k), its chunks a
+    /// third (up to 15k, five times the library's, so memories form less often and each covers more).
     pub fn first(overhead: f64) -> Settings {
         let (defaults, base) = (SessionSettings::default(), "https://api.anthropic.com".into());
-        let left = defaults.window - overhead - defaults.reserve; // the library's sizes below are its defaults, for contexts of 120k and more
-        let (recent_window_tokens, target_chunk_tokens) = ((left / 4.0).min(30000.0), (left / 16.0).min(3000.0));
+        let left = defaults.window - overhead - defaults.reserve;
+        let (recent_window_tokens, target_chunk_tokens) = ((left / 4.0).min(30000.0), (left / 3.0).min(15000.0));
         let config = Config { summary_participant: "assistant".into(), recent_window_tokens, target_chunk_tokens, compression_max_tokens: Some(8000.0), ..Config::default() };
         let providers = BTreeMap::from([("default".into(), Provider { base, key: String::new(), models: vec![defaults.model.clone()] })]);
         Settings { providers, defaults: SessionSettings { config, ..defaults }, sandbox: Sandbox::default(), search: None }

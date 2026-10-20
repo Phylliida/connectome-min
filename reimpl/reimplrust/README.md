@@ -61,7 +61,7 @@ since one holds the keys:
   first run writes it with a provider named `default` for `https://api.anthropic.com` without a key,
   which the page then asks for, listing `claude-sonnet-5-5`, and defaults for a window of 90k tokens,
   30k of them reserved for the reply (and its reasoning: a reply that reaches its reserve stops
-  there), and, on Linux, bash in the sandbox.
+  there), chunks of 15k tokens, and, on Linux, bash in the sandbox.
 - `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its
   `window`, `reserve` and `system` prompt, and the library's settings (`config`). A new session's

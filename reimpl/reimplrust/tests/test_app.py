@@ -291,8 +291,9 @@ def configure(root, base, window, recent, chunk):
     the tool definitions)."""
     path = Path(root, 'settings.json')
     everything = json.loads(path.read_text())
-    if everything['defaults']['sandbox'] != sys.platform.startswith('linux') or everything['providers']['default']['models'] != [everything['defaults']['model']]:
-        raise SystemExit(f'a first run wrote {everything["defaults"]["sandbox"]=} and {everything["providers"]["default"]["models"]=}')
+    if everything['defaults']['sandbox'] != sys.platform.startswith('linux') or everything['providers']['default']['models'] != [everything['defaults']['model']] \
+            or everything['defaults']['config']['target_chunk_tokens'] != 15000:
+        raise SystemExit(f'a first run wrote {everything["defaults"]["sandbox"]=}, {everything["providers"]["default"]["models"]=} and chunks of {everything["defaults"]["config"]["target_chunk_tokens"]}')
     everything['providers']['default']['base'] = base
     everything['defaults'].update(model='mock', window=window, reserve=1000)
     everything['defaults']['config'].update(recent_window_tokens=recent, target_chunk_tokens=chunk)
