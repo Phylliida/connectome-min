@@ -8,7 +8,7 @@
 //! hub what the pages following the job see (Msg). The user can stop a turn: it ends where it is
 //! (Worker::stopped).
 
-use crate::{api::brief, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg, Routed}, llm::Llm, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
+use crate::{api::brief, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{Host, Request, INTERRUPTED}, store::Session};
 use std::{cell::RefCell, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
@@ -65,8 +65,8 @@ impl Host for Summarizer<'_> {
         let model = if request.model.is_empty() { &self.setup.settings.model } else { &request.model };
         let none = request.tools.as_ref().map(|_| obj! {"type" => "none"});
         let head = sparse(obj! {"model" => model.as_str(), "max_tokens" => request.max_tokens, "tools" => request.tools.clone(), "tool_choice" => none});
-        let reply = self.setup.llm.messages(head, &request.messages, reader, |_| !(self.stopped)())?;
-        if (self.stopped)() { Err(INTERRUPTED.into()) } else { Ok(reply) }
+        let reply = self.setup.llm.messages(head, &request.messages, reader, |_| !(self.stopped)(), self.stopped, |_, _| {});
+        if (self.stopped)() { Err(INTERRUPTED.into()) } else { reply }
     }
 }
 
@@ -272,15 +272,21 @@ impl Worker<'_> {
         let turns = compiled.map_err(|r| refused(&r, &setup))?;
         if let Some(fold) = costs::fold(s) { self.event(Event::Fold(fold)) }
         let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.settings.system.as_deref(), "tools" => setup.definitions.clone()});
-        let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), |piece| {
+        let piece = |piece| {
             self.event(Event::Piece(piece));
             !self.stopped()
-        })?;
+        };
+        let retrying = |n, why: &str| self.event(Event::Retry { n, of: RETRIES.len(), why: why.into() });
+        let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), piece, &|| self.stopped(), retrying);
+        let reply = reply.map_err(|why| if self.stopped() { STOPPED.into() } else { why })?;
         self.spend(&setup, For::Reply);
         append(s, &obj! {"participant" => "assistant", "content" => reply["content"].clone()}, cfg);
         self.logged();
         let calls = reply["content"].arr().iter().filter(|b| b.kind() == "tool_use");
-        let run = |call| self.approve(&setup, call).map_or_else(|why| tools::result(call, Err(why.into())), |()| setup.tools.call(call, &|| self.stopped()));
+        let run = |call: &Value| self.approve(&setup, call).map_or_else(|why| tools::result(call, Err(why.into())), |()| {
+            self.event(Event::Running { id: call["id"].as_str().unwrap_or("").into(), tool: call["name"].as_str().unwrap_or("").into() });
+            setup.tools.call(call, &|| self.stopped())
+        });
         let results = calls.map(|call| if self.stopped() { tools::result(call, Err(STOPPED.into())) } else { run(call) });
         let results: Vec<Value> = results.inspect(|result| self.event(Event::Result(brief(result.clone())))).collect();
         let called = !results.is_empty();

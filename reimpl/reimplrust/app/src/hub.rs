@@ -86,6 +86,11 @@ pub enum Event {
     Approve(String),
     /// A page has answered whether the call with this id may run.
     Answered(String),
+    /// The reply's request failed in a way that may pass, and is tried again, the nth time of `of`:
+    /// what streamed of the reply so far is void.
+    Retry { n: usize, of: usize, why: String },
+    /// A call starts running: its id, and its tool.
+    Running { id: String, tool: String },
     /// A call's result: the tool_result block, brief (api::brief).
     Result(Value),
     /// Memories start or stop forming.

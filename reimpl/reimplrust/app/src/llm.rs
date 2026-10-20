@@ -2,11 +2,13 @@
 //! https://api.deepseek.com/anthropic, OpenRouter's https://openrouter.ai/api/v1, a local mock), over
 //! ureq with rustls and Mozilla's roots compiled in. The request body is written as it's produced and
 //! goes out in HTTP chunks, so a context streams from the session's files to the socket one block at a
-//! time; the reply streams back as server-sent events.
+//! time; the reply streams back as server-sent events. A request that fails in a way that may pass is
+//! tried again (RETRIES).
 
 use connectome::{blocks::Block, emit::Reader, json::{self, sparse, Json, Value}, obj, turns::Turn};
 use serde::{Deserialize, Serialize};
-use std::{cell::Cell, io::{self, BufRead, BufReader, BufWriter, Write}, iter::Sum, ops::Add};
+use crate::tools::POLL;
+use std::{cell::Cell, io::{self, BufRead, BufReader, BufWriter, Write}, iter::Sum, ops::Add, time::Duration};
 use ureq::tls::{PemItem, TlsConfig};
 
 pub struct Llm {
@@ -55,25 +57,55 @@ pub fn agent(ca: Option<&[u8]>) -> Result<ureq::Agent, String> {
     Ok(config.tls_config(tls.build()).build().into())
 }
 
+/// The waits before trying a request again, after a failure that may pass (Failed): 500 ms twice,
+/// then 2 s; so a request is tried six times at most.
+pub const RETRIES: [Duration; 5] = [Duration::from_millis(500), Duration::from_millis(500), Duration::from_secs(2), Duration::from_secs(2), Duration::from_secs(2)];
+
+/// Why a request failed, and whether the same request may yet get a reply (`passing`): it does after
+/// no answer, a stream cut off or garbled, an HTTP 408, 409, 425, 429 or 5xx, and an error event of
+/// overload, rate limit, timeout or the API's own; not after another HTTP status (a bad key, a request
+/// the API rejects), another error event, or a request this side couldn't write.
+#[derive(Debug, PartialEq)]
+pub struct Failed { pub why: String, pub passing: bool }
+
+impl From<String> for Failed {
+    fn from(why: String) -> Failed { Failed { why, passing: true } }
+}
+
+impl From<&str> for Failed {
+    fn from(why: &str) -> Failed { why.to_string().into() }
+}
+
+/// The error events after which a request may yet get a reply.
+const PASSING: [&str; 4] = ["overloaded_error", "rate_limit_error", "timeout_error", "api_error"];
+
 impl Llm {
     /// POSTs to {base}/v1/messages (or {base}/messages for a base that ends in /v1) `head`'s fields
     /// and `turns` as the messages, read through `reader` as they're written out, asking for a stream.
     /// Hands `piece` each piece of the reply as it arrives (Piece), and gives the whole reply as the
     /// library takes it: {stopReason, content, usage: {inputTokens, outputTokens}}. Once `piece`
-    /// answers false, the reply stops there: its stop reason "stopped", its calls left out.
-    pub fn messages(&self, mut head: Value, turns: &[Turn], reader: &mut Reader, mut piece: impl FnMut(Piece) -> bool) -> Result<Value, String> {
+    /// answers false, the reply stops there: its stop reason "stopped", its calls left out. A failure
+    /// that may pass is tried again (retried); what the attempt handed `piece` is then void, which
+    /// `retrying` hears first. Only a reply that comes whole counts toward what was spent.
+    pub fn messages(&self, mut head: Value, turns: &[Turn], reader: &mut Reader, mut piece: impl FnMut(Piece) -> bool, stopped: &dyn Fn() -> bool, retrying: impl FnMut(usize, &str)) -> Result<Value, String> {
+        head["stream"] = true.into();
+        retried(|| self.attempt(&head, turns, reader, &mut piece), stopped, retrying, std::thread::sleep)
+    }
+
+    /// One try of a request (messages).
+    fn attempt(&self, head: &Value, turns: &[Turn], reader: &mut Reader, piece: &mut impl FnMut(Piece) -> bool) -> Result<Value, Failed> {
         let base = self.base.trim_end_matches('/');
         let url = if base.ends_with("/v1") { format!("{base}/messages") } else { format!("{base}/v1/messages") };
         let request = self.agent.post(&url).header("x-api-key", &self.key).header("anthropic-version", "2023-06-01").header("content-type", "application/json");
-        head["stream"] = true.into();
+        let lasting = |why: String| Failed { why, passing: false };
         // the reader holds the session, so the body is written on this thread while ureq sends it on another
-        let (body, out) = io::pipe().map_err(|e| e.to_string())?;
+        let (body, out) = io::pipe().map_err(|e| lasting(e.to_string()))?;
         let response = std::thread::scope(|scope| {
             let sent = scope.spawn(|| request.send(ureq::SendBody::from_owned_reader(body)));
-            let written = write_body(BufWriter::new(out), &head, turns, reader); // the pipe closes as it returns
+            let written = write_body(BufWriter::new(out), head, turns, reader); // the pipe closes as it returns
             match (sent.join().expect("the sending thread"), written) {
-                (Err(e), _) => Err(format!("{url}: {e}")),
-                (_, Err(e)) => Err(format!("{url}: writing the request: {e}")),
+                (Err(e), _) => Err(Failed::from(format!("{url}: {e}"))),
+                (_, Err(e)) => Err(lasting(format!("{url}: writing the request: {e}"))),
                 (Ok(response), _) => Ok(response),
             }
         })?;
@@ -81,19 +113,46 @@ impl Llm {
         let mut body = response.into_body();
         if status != 200 {
             let text = body.read_to_string().unwrap_or_default();
-            return Err(format!("HTTP {status}: {}", text.chars().take(500).collect::<String>()));
+            let error = serde_json::from_str::<Value>(&text).ok().map(|mut v| v["error"].take()).filter(|e| e["message"].is_string());
+            let said = error.map_or_else(|| text.chars().take(500).collect(), |e| format!("{}: {}", e["type"].as_str().unwrap_or("error"), e["message"].as_str().unwrap_or("")));
+            let why = format!("HTTP {status}: {said}");
+            return Err(Failed { why, passing: matches!(status, 408 | 409 | 425 | 429 | 500..=599) });
         }
         // each event's data, until OpenRouter's [DONE] (it ends the stream as OpenAI's does, past message_stop)
         let lines = BufReader::new(body.into_reader()).lines().map(|line| line.map_err(|e| e.to_string()));
         let data = lines.filter_map(|line| line.map(|l| l.strip_prefix("data:").map(|d| d.trim().to_string())).transpose());
         let mut reply = Reply::default();
         for d in data.take_while(|d| d.as_deref() != Ok("[DONE]")) {
-            reply = reply.event(serde_json::from_str(&d?).map_err(|e| e.to_string())?, &mut piece)?;
+            reply = reply.event(serde_json::from_str(&d?).map_err(|e| e.to_string())?, piece)?;
             if reply.halted { break } // the connection goes with the response
         }
-        self.spent.set(self.spent.get() + reply.used);
-        reply.done()
+        let used = reply.used;
+        let done = reply.done()?;
+        self.spent.set(self.spent.get() + used);
+        Ok(done)
     }
+}
+
+/// `attempt`, tried until it succeeds, fails in a way that won't pass, or has failed once more than
+/// RETRIES has waits; `retrying` hears each retry (from 1) and why, then `wait` waits for it, a POLL
+/// at a time, and the user's stop (`stopped`) ends the waiting, failed.
+fn retried<T>(mut attempt: impl FnMut() -> Result<T, Failed>, stopped: &dyn Fn() -> bool, mut retrying: impl FnMut(usize, &str), wait: impl Fn(Duration)) -> Result<T, String> {
+    for (n, &pause) in RETRIES.iter().enumerate() {
+        match attempt() {
+            Err(Failed { why, passing: true }) => {
+                retrying(n + 1, &why);
+                let mut left = pause;
+                while !left.is_zero() {
+                    if stopped() { return Err(why) }
+                    let slice = left.min(POLL);
+                    wait(slice);
+                    left -= slice;
+                }
+            }
+            done => return done.map_err(|f| f.why),
+        }
+    }
+    attempt().map_err(|f| if f.passing { format!("{} (tried {} times)", f.why, RETRIES.len() + 1) } else { f.why })
 }
 
 /// A piece of a reply as it streams in: of its reasoning or its text, a call's tool as the call starts,
@@ -160,7 +219,7 @@ enum Delta {
 struct Reply { blocks: Vec<Content>, stop: Option<String>, used: Usage, halted: bool }
 
 impl Reply {
-    fn event(mut self, e: Streamed, show: &mut impl FnMut(Piece) -> bool) -> Result<Reply, String> {
+    fn event(mut self, e: Streamed, show: &mut impl FnMut(Piece) -> bool) -> Result<Reply, Failed> {
         match e {
             Streamed::MessageStart { message } => self.used(&message.usage),
             Streamed::ContentBlockStart { content_block } => {
@@ -196,7 +255,10 @@ impl Reply {
                 self.stop = delta.stop_reason;
                 self.used(&usage);
             }
-            Streamed::Error { error } => return Err(format!("{}: {}", if error.kind.is_empty() { "error" } else { &error.kind }, error.message)),
+            Streamed::Error { error } => {
+                let why = format!("{}: {}", if error.kind.is_empty() { "error" } else { &error.kind }, error.message);
+                return Err(Failed { why, passing: PASSING.contains(&error.kind.as_str()) });
+            }
             Streamed::Other => {}
         }
         Ok(self)
@@ -289,9 +351,33 @@ fn write_body(mut out: impl Write, head: &Value, turns: &[Turn], reader: &mut Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// What retried makes of attempts that fail `fails` times (in a way that may pass, or not), the
+    /// user stopping after `stop` retries: the outcome, the retries heard, and the time waited after each.
+    fn tried(fails: usize, passing: bool, stop: Option<usize>) -> (Result<usize, String>, Vec<usize>, Vec<Duration>) {
+        let (tries, heard, waits) = (Cell::new(0), RefCell::new(vec![]), RefCell::new(vec![]));
+        let attempt = || {
+            tries.set(tries.get() + 1);
+            if tries.get() <= fails { Err(Failed { why: format!("no {}", tries.get()), passing }) } else { Ok(tries.get()) }
+        };
+        let stopped = || stop.is_some_and(|n| heard.borrow().len() >= n);
+        let outcome = retried(attempt, &stopped, |n, _| { heard.borrow_mut().push(n); waits.borrow_mut().push(Duration::ZERO) }, |d| *waits.borrow_mut().last_mut().expect("a retry") += d);
+        (outcome, heard.into_inner(), waits.into_inner())
+    }
+
+    #[test]
+    fn a_failure_that_may_pass_is_tried_again() {
+        let (half, two) = (Duration::from_millis(500), Duration::from_secs(2));
+        assert_eq!(tried(0, true, None), (Ok(1), vec![], vec![]));
+        assert_eq!(tried(2, true, None), (Ok(3), vec![1, 2], vec![half, half]));
+        assert_eq!(tried(9, true, None), (Err("no 6 (tried 6 times)".into()), vec![1, 2, 3, 4, 5], vec![half, half, two, two, two]));
+        assert_eq!(tried(9, false, None), (Err("no 1".into()), vec![], vec![]));
+        assert_eq!(tried(9, true, Some(1)), (Err("no 1".into()), vec![1], vec![Duration::ZERO])); // a stop ends the wait
+    }
 
     /// A reply built from a stream's events, and the pieces it showed.
-    fn streamed(events: &[&str]) -> (Result<Reply, String>, Vec<String>) {
+    fn streamed(events: &[&str]) -> (Result<Reply, Failed>, Vec<String>) {
         let mut pieces = vec![];
         let reply = events.iter().try_fold(Reply::default(), |reply, e| reply.event(serde_json::from_str(e).expect("an event"), &mut |p| {
             pieces.push(json::to_string(&p));
@@ -354,7 +440,9 @@ mod tests {
     fn a_stream_can_fail() {
         let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":0}}}"#;
         let (reply, _) = streamed(&[start, r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#]);
-        assert_eq!(reply.err(), Some("overloaded_error: Overloaded".into()));
+        assert_eq!(reply.err(), Some(Failed { why: "overloaded_error: Overloaded".into(), passing: true }));
+        let (reply, _) = streamed(&[start, r#"{"type":"error","error":{"type":"invalid_request_error","message":"Too long"}}"#]);
+        assert_eq!(reply.err(), Some(Failed { why: "invalid_request_error: Too long".into(), passing: false }));
         let (reply, _) = streamed(&[start, r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#]);
         assert_eq!(reply.expect("a reply so far").done().err(), Some("the reply's stream ended before the reply did".into()));
     }

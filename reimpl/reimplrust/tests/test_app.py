@@ -52,7 +52,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
-seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': []}
+seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': []}
 
 
 class Mock(BaseHTTPRequestHandler):
@@ -106,9 +106,12 @@ class Mock(BaseHTTPRequestHandler):
         if messages[-1]['role'] == 'assistant':                    # a reply cut short, which this one goes on from
             seen['chat'] += 1
             blocks = [{'type': 'text', 'text': ' and so the story ends.'}]
-        elif 'fail once' in last and last not in seen['failed']:
+        elif 'fail once' in last and last not in seen['failed']:          # a failure that may pass: tried again
             seen['failed'].append(last)
             return self.answer(529, {'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'Overloaded'}})
+        elif 'refuse once' in last and last not in seen['failed']:        # one that won't
+            seen['failed'].append(last)
+            return self.answer(400, {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'Refused'}})
         elif last.startswith('echo '):                             # the message back, as the reply
             seen['chat'] += 1
             blocks = [{'type': 'text', 'text': last[len('echo '):]}]
@@ -139,7 +142,9 @@ class Mock(BaseHTTPRequestHandler):
             blocks = [{'type': 'thinking', 'thinking': 'Let me think about it.', 'signature': 'c2ln'}] * (seen['chat'] % 4 == 0) \
                 + [{'type': 'text', 'text': f'Reply {seen["chat"]}: ' + ' '.join(['words'] * 80)}]
         memory = 'memory' in last and ('Write the memory' in last or 'consolidate' in last)
-        self.stream(blocks, prompt, 0.25 if 'slowly' in last else 0.01 if memory else 0, stop, 'cut off please' in last)   # a memory takes a moment, as a page may see
+        cut = 'cut off once' in last and last not in seen['cut']
+        seen['cut'] += [last] * cut
+        self.stream(blocks, prompt, 0.25 if 'slowly' in last else 0.01 if memory else 0, stop, cut)   # a memory takes a moment, as a page may see
 
     def stream(self, blocks, input_tokens, pause, stop, cut=False):
         """The reply as server-sent events, its text in five pieces `pause` seconds apart and a tool
@@ -346,6 +351,10 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
                 times.append(time.monotonic())
             if 'result' in last:
                 seen['events'].append(last)
+            if 'retry' in last:
+                seen['retries'].append(last['retry'])
+            if 'running' in last:
+                seen['running'].append(last['running'])
             if 'spent' in last:
                 seen['costs'][name] = last['spent']
             if 'prompt' in last:
@@ -514,7 +523,10 @@ def tooled(tls, ca, baseline) -> str:
         state = call(port, '/api/s/tools')
         if (names := state['tools']) != ['bash', 'edit', 'fail', 'picture', 'hang', 'die', 'add'] or state['overhead'] < 2000:
             raise SystemExit(f'tools {names} ({state["overhead"]} tokens): expected bash, edit, the first server\'s but its add, then the second\'s wordy add')
+        ran = len(seen['running'])
         got = results('please use tools now', {'fail': 'deny', 'picture': 'always'}, ['add', 'fail', 'picture'])
+        if [(r['tool'], r['id'].split('-')[1]) for r in seen['running'][ran:]] != [('add', '0'), ('picture', '2'), ('nope', '3')]:   # the denied one never runs
+            raise SystemExit(f'the page heard calls running: {seen["running"][ran:]}')
         expected = {'0': [{'type': 'text', 'text': '5 (shadow)'}], '1': "the user didn't allow this call",
                     '2': [{'type': 'text', 'text': 'a picture:'}, {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': 'iVBORw0KGgo='}}],
                     '3': 'no tool nope'}
@@ -629,7 +641,7 @@ def tooled(tls, ca, baseline) -> str:
         outline = lambda events: [e for e in events if not {'text', 'thinking', 'message', 'state'} & set(e)]
         kinds = [next(iter(e)) for e in outline(late) if not {'logged', 'forming', 'spent', 'prompt'} & set(e)]
         if outline(first)[-len(outline(late)) + 1:] != outline(late)[1:] or not late[0]['state']['running'] or outline(late)[:2] != [{'turn': job[0]}, {'logged': state['messages'] + 2}] \
-                or 'approve' not in outline(late)[2] or kinds != ['turn', 'approve', 'answered', 'result', 'end', 'done'] or call(port, '/api/s/tools')['running']:
+                or 'approve' not in outline(late)[2] or kinds != ['turn', 'approve', 'answered', 'running', 'result', 'end', 'done'] or call(port, '/api/s/tools')['running']:
             raise SystemExit(f'a page that came in during the turn got {kinds} from {late[:3]}; the page that started it {len(first)} events, it {len(late)}')
         told = call(port, f'/api/s/tools/messages?from={state["messages"]}')
         if [m['participant'] for m in told] != ['user', 'assistant', 'user', 'assistant', 'user', 'assistant'] or words(told[4]) != queued:
@@ -839,12 +851,12 @@ def accompanied(tls, ca) -> str:
         if (pal := log('pal')[counts:]) != [('user', 'echo wait for it, slowly'), ('assistant', 'wait for it, slowly'), ('pair', 'pair sends you a message while it works:\n\necho also noted'), ('assistant', 'also noted')]:
             raise SystemExit(f'a message during a turn\'s last step: the companion\'s log went on {pal}')
         call(port, '/api/s/pair/settings', {'allow': ['bash']})
-        say(port, 'pair', 'call ' + json.dumps([['bash', {'command': 'echo fail once please'}]]).replace(' once', '\\u0020once'))   # the mock fails only the companion's request
+        say(port, 'pair', 'call ' + json.dumps([['bash', {'command': 'echo refuse once please'}]]).replace(' once', '\\u0020once'))   # the mock refuses only the companion's request
         settle(port, 'pair')
         counts = len(log('pair'))
         state = call(port, '/api/s/pair/auto', {'on': True})
         quiet('pair', 'pal')
-        last, ran = log('pal')[-1], 'What pair ran this turn: $ echo fail once please'
+        last, ran = log('pal')[-1], 'What pair ran this turn: $ echo refuse once please'
         if last[0] != 'pair' or not last[1].startswith('pair ended its turn:\n\nReply ') or not last[1].endswith(ran) or not state['settings'].get('auto'):
             raise SystemExit(f'Auto on sent the companion {last}')
         if call(port, '/api/s/pair')['settings'].get('auto') or call(port, '/api/s/pal')['settings'].get('auto') or len(log('pair')) != counts:
@@ -957,10 +969,10 @@ def chatted(turns, tls, ca, baseline) -> str:
         if after['total']['cost'] != before['total']['cost'] or after['total']['input'] <= before['total']['input']:
             raise SystemExit(f'a turn whose provider reports no cost: {before} then {after}')
         try:
-            say(port, 'branch', 'fail once, then go on')
+            say(port, 'branch', 'refuse once, then go on')
             raise SystemExit('a turn whose request failed went through')
         except SystemExit as failed:
-            if 'Overloaded' not in str(failed):
+            if 'Refused' not in str(failed):
                 raise
         say(port, 'branch', None)
         learnt = [json.loads(line)['multiplier'] for line in Path(root, 'branch', 'compiles.jsonl').read_text().splitlines()][-3:]
@@ -1036,10 +1048,10 @@ def chatted(turns, tls, ca, baseline) -> str:
         say(port, 'story', 'tell me a long story')
         say(port, 'story', None)                                        # the reply was cut short: it goes on
         try:
-            say(port, 'story', 'fail once please')
+            say(port, 'story', 'refuse once please')
             raise SystemExit('a turn whose request failed went through')
         except SystemExit as failed:
-            if 'Overloaded' not in str(failed):
+            if 'Refused' not in str(failed) or 'tried' in str(failed):
                 raise
         say(port, 'story', None)                                        # the request failed: the message gets its answer
         call(port, '/api/sessions', {'name': 'unpriced'})                # a model whose provider reports no cost: tokens, but no cost
@@ -1059,13 +1071,14 @@ def chatted(turns, tls, ca, baseline) -> str:
         except SystemExit as refused:
             if "The context doesn't fit" not in str(refused) or 'less 1000 for the reply' not in str(refused) or 'Raise the window' not in str(refused):
                 raise
-        call(port, '/api/sessions', {'name': 'cut'})
-        try:
-            say(port, 'cut', 'cut off please')
-            raise SystemExit('a reply whose stream was cut off went through')
-        except SystemExit as cut:
-            if 'ended before' not in str(cut) or [m['participant'] for m in call(port, '/api/s/cut/messages')] != ['user']:
-                raise
+        call(port, '/api/sessions', {'name': 'cut'})                     # a reply whose stream is cut off, then one whose request fails: each tried again
+        before, started = len(seen['retries']), time.monotonic()
+        say(port, 'cut', 'cut off once')
+        say(port, 'cut', 'fail once, then answer')
+        retries, logged = seen['retries'][before:], call(port, '/api/s/cut/messages')
+        if [(r['n'], r['of']) for r in retries] != [(1, 5), (1, 5)] or 'ended before' not in retries[0]['why'] or 'Overloaded' not in retries[1]['why'] \
+                or [m['participant'] for m in logged] != ['user', 'assistant'] * 2 or not all(words(m).startswith('Reply ') for m in logged[1::2]) or time.monotonic() - started < 1:
+            raise SystemExit(f'tried again: the page heard {retries}, the log holds {[(m["participant"], words(m)[:20]) for m in logged]}')
         call(port, '/api/sessions', {'name': 'mended'})
         say(port, 'mended', 'a first message')
         log = Path(root, 'mended', 'messages.jsonl')
@@ -1080,7 +1093,7 @@ def chatted(turns, tls, ca, baseline) -> str:
         log.write_bytes(kept)                                           # mended, the session's thread goes on
         say(port, 'mended', 'after the mend')
         told = [(m['participant'], words(m)[:16]) for m in call(port, '/api/s/story/messages')]
-        if told[:4] != [('user', 'tell me a long s'), ('assistant', 'Once upon a time'), ('assistant', ' and so the stor'), ('user', 'fail once please')] \
+        if told[:4] != [('user', 'tell me a long s'), ('assistant', 'Once upon a time'), ('assistant', ' and so the stor'), ('user', 'refuse once plea')] \
                 or told[4:] != [('assistant', told[4][1])] or not told[4][1].startswith('Reply') or seen['prefills'] != 1:
             raise SystemExit(f'continuing: the log holds {told}, {seen["prefills"]} requests went on from a reply')
         call(port, '/api/s/branch/settings', {'provider': 'default'})

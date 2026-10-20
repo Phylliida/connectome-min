@@ -22,12 +22,13 @@ autobiographical compaction) and a web app around it.
 The page draws itself with Preact, its templates written with htm, as a function of what it shows:
 the session as the server has it, its log's messages, and the turn it follows, which only the page's
 actions change. A turn it follows goes through phases the line under the chat shows (waiting for the
-model, streaming, asking whether a call may run, forming memories); its reply streams in below the
-log and is drawn at most once a frame, its finished markdown blocks once. The page shows the
-assistant's text as markdown, through marked and then DOMPurify, which keeps only the HTML markdown
-makes, so a reply can neither run code on the page nor load anything; its math (`$…$` or `\(…\)`
-inline, `$$…$$` or `\[…\]` displayed) KaTeX sets in its own fonts, and highlight.js colors its code
-blocks. These, jsdiff for edits' diffs, Preact and htm are in `app/vendor/` as published, built in.
+model, streaming, asking whether a call may run, running a call, which its card says too, its
+request tried again, and why, forming memories); its reply streams in below the log and is drawn at
+most once a frame, its finished markdown blocks once. The page shows the assistant's text as
+markdown, through marked and then DOMPurify, which keeps only the HTML markdown makes, so a reply
+can neither run code on the page nor load anything; its math (`$…$` or `\(…\)` inline, `$$…$$` or
+`\[…\]` displayed) KaTeX sets in its own fonts, and highlight.js colors its code blocks. These,
+jsdiff for edits' diffs, Preact and htm are in `app/vendor/` as published, built in.
 
 The page also shows what a session's requests have used, from the session's `costs.jsonl`
 (`costs.rs`): a record for each step's reply and each round of memories, `{id, for, used, total}`.
@@ -123,7 +124,12 @@ turn on it. Turning Auto on sends the session's last turn to the companion, unle
 either. A fork has no companion of its own.
 
 A turn takes steps, a model request each, as many as it takes until a reply calls no tools (or the
-user stops it). Every request carries the system prompt and the tool definitions, so their tokens
+user stops it). A request that fails in a way that may pass (no answer, a stream cut off, an HTTP
+408, 409, 425, 429 or 5xx, an error event of overload, rate limit, timeout or the API's own) is
+tried again, up to five times: 500 ms after, then 500 ms, then 2 s each; what streamed of the reply
+is dropped, and the page says why it's trying again. A failure that would come again (a bad key, a
+request the API rejects) isn't retried, and only a reply that comes whole counts toward the
+session's costs. Every request carries the system prompt and the tool definitions, so their tokens
 come out of the window the context compiles to, and out of the usage that calibrates prices; while
 calibration catches up with a request bigger than its estimate, the next context compiles that much
 smaller. Memory requests declare the same tools with tool choice "none", as the library does, so a

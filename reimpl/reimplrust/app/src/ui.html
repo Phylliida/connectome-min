@@ -131,6 +131,7 @@ dialog .buttons small { margin-right: auto; }
 .query { color: var(--ink); }
 .query svg { width: 13px; height: 13px; vertical-align: -2px; margin-right: 6px; color: var(--muted); }
 .ask { display: flex; gap: 6px; margin: 4px 0 6px; }
+.tool .running { font-size: 12px; color: var(--accent); margin: 4px 0; }
 
 /* the assistant's text as markdown */
 .md { white-space: normal; }
@@ -282,11 +283,17 @@ DOMPurify.addHook('afterSanitizeAttributes', (node) => node.tagName === 'A' && n
 function escape(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 
 // the line under the chat: what the turn the page follows waits for (its phase), else what failed or
-// keeps the session from running
-const PHASES = { waiting: 'Waiting for the model…', streaming: '', asking: 'Waiting for you to allow or deny the call…', running: 'Running…', denied: 'Denied.', forming: 'Forming memories…', stopping: 'Stopping…', ended: '' };
+// keeps the session from running. A call running says its tool (message, the partner it talks with),
+// and a request tried again says why.
+const PHASES = {
+  waiting: () => 'Waiting for the model…', streaming: () => '', asking: () => 'Waiting for you to allow or deny the call…', denied: () => 'Denied.',
+  running: ({ running }) => running?.tool === 'message' ? `Messaging ${state?.settings?.companion ?? state?.settings?.accompanies ?? 'its partner'}…` : `Running ${running?.tool ?? 'the call'}…`,
+  retrying: ({ retry: { n, of, why } }) => `${why.length > 160 ? why.slice(0, 160) + '…' : why}: trying again (${n} of ${of})…`,
+  forming: () => 'Forming memories…', stopping: () => 'Stopping…', ended: () => '',
+};
 function status() {
   if (page.error || page.broken) return [page.error || page.broken, true];
-  if (page.live) return [PHASES[page.live.phase], false];
+  if (page.live) return [PHASES[page.live.phase](page.live), false];
   if (state?.problem) return [state.problem, true];
   return state?.refused ? ['The summarizer refused; memory formation is stopped until surgery.', true] : ['', false];
 }
@@ -567,7 +574,7 @@ function Log() {
     if (!hidden) who = m.participant;
     const own = m.content.filter((b) => b.type === 'tool_use').map((b) => b.id);
     return [m.fold && html`<${FoldLine} key=${'fold-' + m.id} fold=${m.fold} />`,
-      html`<${Message} key=${m.id} m=${m} more=${more} hidden=${hidden} results=${own.map((id) => results.get(id))} asked=${own.map((id) => !!live?.asked.has(id))}
+      html`<${Message} key=${m.id} m=${m} more=${more} hidden=${hidden} results=${own.map((id) => results.get(id))} asked=${own.map((id) => !!live?.asked.has(id))} running=${own.map((id) => live?.running?.id === id)}
         joined=${m.content.map((b) => b.type === 'tool_result' && calls.has(b.toolUseId))} />`];
   });
   return html`<div id="log">${rows}${reply && reply.key > (messages.at(-1)?.id ?? -1) && [
@@ -592,7 +599,7 @@ const same = (a, b) => Object.keys({ ...a, ...b }).every((k) => a[k] === b[k] ||
 class Message extends Component {
   shouldComponentUpdate(next) { return !same(this.props, next); }
 
-  render({ m, more, hidden, results, asked, joined }) {
+  render({ m, more, hidden, results, asked, running, joined }) {
     const all = m.content.every((b) => b.type === 'tool_result'), calls = m.content.filter((b) => b.type === 'tool_use');
     const heard = m.participant !== 'user' && m.participant !== 'assistant';
     const block = (b, j) => {
@@ -600,7 +607,7 @@ class Message extends Component {
         case 'text': return heard ? html`<${Heard} text=${b.text} from=${m.participant} />`
           : m.participant === 'assistant' ? html`<div class="bubble md" data-kind="text" dangerouslySetInnerHTML=${{ __html: markdown(b.text) }} />` : html`<div class="bubble" data-kind="text">${b.text}</div>`;
         case 'thinking': return html`<${Thinking} text=${b.thinking} />`;
-        case 'tool_use': return html`<${Card} call=${b} result=${results[calls.indexOf(b)]} asking=${asked[calls.indexOf(b)]} />`;
+        case 'tool_use': return html`<${Card} call=${b} result=${results[calls.indexOf(b)]} asking=${asked[calls.indexOf(b)]} running=${running[calls.indexOf(b)]} />`;
         case 'tool_result': return joined[j] ? null : html`<${Card} result=${b} />`;   // its call isn't on the page
         default: return html`<div class="bubble" data-kind=${b.type}>${note(b)}</div>`;
       }
@@ -653,9 +660,9 @@ const views = {
 };
 
 // a call's card, open until its result joins it, then folded unless it shows a diff, with the buttons
-// that answer whether it may run while it's `asking`; a result without its call on the page is a card
-// of its own
-function Card({ call, result, asking }) {
+// that answer whether it may run while it's `asking`, and saying so while it's `running`; a result
+// without its call on the page is a card of its own
+function Card({ call, result, asking, running }) {
   const view = call && (views[call.name] ?? ((input) => [call.name, html`<pre>${JSON.stringify(input)}</pre>`]));
   const [head, body] = call ? view(call.input, result) : ['an earlier call'];
   const text = result && said(result), failed = result?.isError ? ' failed' : '';
@@ -664,6 +671,7 @@ function Card({ call, result, asking }) {
     <summary>${head}${result && html`<span class="out"> → ${text.split('\n')[0].slice(0, 100)}</span>`}</summary>
     ${body}
     ${asking && !result && html`<div class="ask">${answer('allow', 'Allow')}${answer('always', 'Always allow')}${answer('deny', 'Deny')}</div>`}
+    ${running && !result && html`<div class="running">running…</div>`}
     ${result && html`<pre class=${'result' + failed}>${text}</pre>`}
   </details>`;
 }
@@ -857,7 +865,8 @@ function subscribe() {
 // at which the page shows them in place of what it had; then each message as it joins the log, and each
 // turn from its start ({"turn"}) to its job's end ({"done"}). A turn (page.live) goes through phases,
 // which the line under the chat shows: waiting for the model, streaming, asking whether a call may run
-// (then running or denied, once answered), forming memories, ended. Its reply streams in below the log
+// (then running or denied, once answered), running a call, the request tried again, forming memories,
+// ended. Its reply streams in below the log
 // until the log has it. A stream that ends unasked (the server restarted) is followed again shortly.
 async function follow(name, signal) {
   let caught = [];   // the log's newest messages, until the page has caught up
@@ -881,7 +890,7 @@ async function follow(name, signal) {
       if (!s.running) page.live = null;
     },
     broken: (why) => { page.broken = why; },
-    turn: (job) => { [page.live, page.error] = [{ job, phase: 'waiting', reply: null, asked: new Set(), results: [], ended: false }, null]; },
+    turn: (job) => { [page.live, page.error] = [{ job, phase: 'waiting', reply: null, asked: new Set(), results: [], running: null, retry: null, ended: false }, null]; },
     done: () => {
       page.live = null;
       listSessions();
@@ -906,7 +915,16 @@ async function follow(name, signal) {
       page.live.asked.delete(id);
       if (page.live.phase === 'asking') page.live.phase = 'streaming';
     },
-    result: (b) => { page.live.results.push(b); },
+    running: (call) => { Object.assign(page.live, { phase: 'running', running: call }); },
+    // the reply's request failed and is tried again: what streamed of it is void
+    retry: (retry) => {
+      Object.assign(page.live, { phase: 'retrying', retry });
+      if (page.live.reply) page.live.reply.parts = [];
+    },
+    result: (b) => {
+      page.live.results.push(b);
+      if (page.live.running?.id === b.toolUseId) page.live.running = null;
+    },
     forming: (forming) => { page.live.phase = forming ? 'forming' : page.live.ended ? 'ended' : 'waiting'; },
     // the turn has ended (`why` it failed, if it did); its memories form after it
     end: (why) => {
