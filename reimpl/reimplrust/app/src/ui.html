@@ -38,24 +38,40 @@ input, textarea, select { width: 100%; background: var(--panel); border: 1px sol
 input[type=checkbox] { width: auto; }
 .settings { display: flex; flex-direction: column; gap: 6px; padding: 0; border: 0; }
 .settings label, .settings small, .legend, .msg .who { font-size: 12px; color: var(--muted); }
-.new { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; padding: 7px 10px; margin: 0 0 14px; }
+.top { display: flex; gap: 6px; margin: 0 0 14px; }
+.new { flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 7px 10px; }
 .new svg { width: 16px; height: 16px; color: var(--accent); }
+.top .icon svg { width: 18px; height: 18px; color: var(--muted); }
+.nokey { display: block; margin: -8px 0 14px; color: var(--warn); font-size: 12px; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 dialog { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--ink); padding: 18px 20px; width: min(480px, 92vw); }
 dialog::backdrop { background: rgb(0 0 0 / .35); }
 dialog .settings { gap: 10px; }
 dialog .settings small.warn { color: var(--warn); }
-dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+dialog .buttons { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 4px; }
+dialog .buttons small { margin-right: auto; }
 
-/* the sessions, grouped by workspace, and the providers */
+/* the settings: a card per provider, its models as chips */
+#settings { width: min(600px, 94vw); }
+#settings > small { display: block; margin: -2px 0 12px; color: var(--muted); font-size: 12px; }
+.card { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 0 0 12px; }
+.card.adding { border-style: dashed; }
+.card h3 { font-size: 14px; margin: 0; }
+.card h3 small { font-weight: normal; color: var(--warn); margin-left: 6px; }
+.models { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.model { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 1px 2px 1px 10px; background: var(--bg); font: 12px ui-monospace, monospace; }
+.model button { border: 0; background: none; padding: 0 6px; color: var(--muted); }
+.model button:hover { color: var(--warn); }
+.models input { flex: 1; width: auto; min-width: 180px; font-size: 12px; }
+
+/* the sessions, grouped by workspace */
 #sessions a { display: block; padding: 4px 6px; border-radius: 6px; color: inherit; text-decoration: none; }
 #sessions a.on { background: var(--panel); outline: 1px solid var(--line); }
 #sessions small { color: var(--muted); }
 .group { margin: 0 0 6px; }
-.group summary, .provider { cursor: pointer; padding: 4px 0; }
-.group summary { list-style: none; }   /* a click on the header folds its group; no arrow */
+.group summary { cursor: pointer; padding: 4px 0; list-style: none; }   /* a click on the header folds its group; no arrow */
 .group summary::-webkit-details-marker { display: none; }
-.group summary small, .provider small { display: block; font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.group summary small { display: block; font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
 
 /* the chat: a line where the speaker changes, then each block a bubble, the user's on the right */
 #chat { display: flex; flex-direction: column; padding: 0; }
@@ -169,10 +185,11 @@ const page = {
   live: null,                             // the turn running, as the page hears it (follow)
   error: null,                            // why what the page last did failed
   broken: null,                           // why the session's files can't be read as they are
-  notes: { session: '', provider: '' },   // under each form: saved, or why not
-  editing: { name: '', base: '', n: 0 },  // the provider form's fields, which it starts from again when n changes
+  notes: { session: '' },                 // under the session form: saved, or why not
   tuned: 0,                               // the session form's saves, after each of which it starts again
+  picked: null,                           // the provider chosen on the session form, until it starts again
   creating: null,                         // the new-session dialog, while it's open: {workspace chosen, error}
+  settings: null,                         // the settings dialog, while it's open: {notes: under each card, by provider ('' the new one's), made: providers added}
   detail: 'Select a memory or chunk.',    // the memory or chunk the pyramid last showed
   folded: new Set(),                      // the workspaces whose groups are folded, kept in this browser
   scroll: false,                          // whether the next draw takes the log to its end, wherever it's scrolled to
@@ -259,12 +276,13 @@ const App = () => {
   const [line, warn] = status();
   return html`
     <aside>
-      <button id="new-session" class="new" onClick=${creating}>${ICONS.plus()} New session</button>
+      <div class="top">
+        <button id="new-session" class="new" onClick=${creating}>${ICONS.plus()} New session</button>
+        <button id="open-settings" class="icon" title="Settings: providers and their models" aria-label="Settings" onClick=${opening}>${ICONS.gear()}</button>
+      </div>
+      ${page.providers.length > 0 && !page.providers.some((p) => p.key) && html`<small class="nokey">Add a provider's API key in Settings to chat.</small>`}
       <h2>Sessions</h2>
       <${Sessions} />
-      <h2>Providers</h2>
-      <${Providers} />
-      <${ProviderForm} key=${page.editing.n} />
     </aside>
     <section id="chat">
       <${Log} />
@@ -281,7 +299,8 @@ const App = () => {
       <${Pyramid} />
       <pre id="detail">${page.detail}</pre>
     </aside>
-    ${page.creating && html`<${NewSession} />`}`;
+    ${page.creating && html`<${NewSession} />`}
+    ${page.settings && html`<${Settings} />`}`;
 };
 
 // the sessions, grouped by workspace (those without one last)
@@ -346,29 +365,65 @@ function creating() {
   draw();
 }
 
-// the providers sessions choose from, each a base URL and a key the page never sees; a click on one edits it
-const Providers = () => html`<div id="providers">${page.providers.map((p) => html`
-  <div class="provider" onClick=${() => edit(p)}><b>${p.name}</b>${p.key ? '' : ' · no key'}<small>${p.base}</small></div>`)}</div>`;
+// the settings, in a dialog in the middle of the page (page.settings): a card per provider sessions
+// choose from, then one that adds a provider
+function Settings() {
+  const keyless = !page.providers.some((p) => p.key);
+  return html`<dialog id="settings" ref=${(d) => d && !d.open && d.showModal()} onClose=${() => { page.settings = null; draw(); }}>
+    <h2>Providers</h2>
+    <small>${keyless ? 'Add a provider\'s API key to chat. DeepSeek: https://api.deepseek.com/anthropic, OpenRouter: https://openrouter.ai/api/v1' : 'A session runs on a provider\'s API, on one of the models it lists.'}</small>
+    ${page.providers.map((p) => html`<${Provider} key=${p.name} p=${p} />`)}
+    <${Provider} key=${'new-' + page.settings.made} />
+    <div class="buttons"><button type="button" onClick=${(e) => e.target.closest('dialog').close()}>Done</button></div>
+  </dialog>`;
+}
 
-function ProviderForm() {
-  const hint = page.providers.some((p) => p.key) ? '' : 'Add a provider\'s API key to chat. DeepSeek: https://api.deepseek.com/anthropic, OpenRouter: https://openrouter.ai/api/v1';
-  return html`<form id="provider" class="settings" onSubmit=${provide}>
-    <label>Name <input id="pname" name="pname" defaultValue=${page.editing.name} placeholder="openrouter" /></label>
-    <label>Base URL <input id="base" name="base" defaultValue=${page.editing.base} placeholder="https://openrouter.ai/api/v1" /></label>
-    <label>API key <input id="key" name="key" type="password" autocomplete="off" placeholder="unchanged if empty" /></label>
-    <button>Save provider</button>
-    <small id="saved">${page.notes.provider || hint}</small>
+// a provider's card: its base URL and its key (which the page never sees), saved by its button, and its
+// models, saved as each is added (Enter, or +) or taken off (×); without `p`, a new provider's, named
+function Provider({ p }) {
+  const card = p?.name ?? '';
+  const save = async (e) => {
+    e.preventDefault();
+    const { name, base, key } = e.target.elements;
+    if (await provide(card, { name: p?.name ?? name.value, base: base.value, key: key.value })) e.target.reset();   // the key blank again
+  };
+  const add = async (e) => {
+    const input = e.target.closest('.models').querySelector('input'), model = input.value.trim();
+    if (model && await provide(card, { name: card, models: [...p.models, model] })) input.value = '';
+  };
+  const enter = (e) => { if (e.key === 'Enter') { e.preventDefault(); add(e); } };
+  return html`<form class=${p ? 'card settings' : 'card settings adding'} data-provider=${card} onSubmit=${save}>
+    <h3>${p ? p.name : 'New provider'}${p && !p.key && html`<small>no key</small>`}</h3>
+    ${!p && html`<label>Name <input name="name" placeholder="openrouter" /></label>`}
+    <label>Base URL <input name="base" defaultValue=${p?.base ?? ''} placeholder="https://openrouter.ai/api/v1" /></label>
+    <label>API key <input name="key" type="password" autocomplete="off" placeholder=${p?.key ? 'unchanged if empty' : ''} /></label>
+    ${p && html`<label>Models</label><div class="models">
+      ${p.models.map((m) => html`<span class="model" key=${m}>${m}<button type="button" title=${'Take ' + m + ' off the list'} aria-label=${'Take ' + m + ' off'}
+        onClick=${() => provide(card, { name: card, models: p.models.filter((x) => x !== m) })}>×</button></span>`)}
+      <input name="model" placeholder="Add a model, as the provider names it" onKeyDown=${enter} />
+      <button type="button" class="add" title="Add the model" aria-label="Add the model" onClick=${add}>+</button>
+    </div>`}
+    <div class="buttons"><small>${page.settings.notes[card]}</small><button class="primary">${p ? 'Save' : 'Add provider'}</button></div>
   </form>`;
 }
 
 // the session's main settings, as its file has them. A form's fields start from what the page shows and
 // are the user's from then on (default values: Preact sets `value` again at every draw), until the form
-// starts again (its key): another session, a save, or another provider to edit.
+// starts again (its key): another session, or a save. Its models are those of the provider chosen
+// (page.picked), the session's own first if its provider doesn't list it; a provider without any takes
+// a model typed.
 function SessionForm() {
-  const s = state?.settings ?? {};
+  const s = state?.settings ?? {}, provider = page.picked ?? s.provider;
+  const listed = page.providers.find((p) => p.name === provider)?.models ?? [];
+  const models = provider === s.provider && s.model && !listed.includes(s.model) ? [s.model, ...listed] : listed;
+  const pick = (e) => {
+    page.picked = e.target.value;
+    draw();
+  };
   return html`<form id="session" class="settings" onSubmit=${tune}>
-    <label>Provider <select name="provider" id="sprovider">${page.providers.map((p) => html`<option selected=${p.name === s.provider}>${p.name}</option>`)}</select></label>
-    <label>Model <input name="model" defaultValue=${s.model ?? ''} /></label>
+    <label>Provider <select name="provider" id="sprovider" onChange=${pick}>${page.providers.map((p) => html`<option selected=${p.name === s.provider}>${p.name}</option>`)}</select></label>
+    <label>Model ${models.length ? html`<select name="model" key=${provider}>${models.map((m) => html`<option selected=${m === s.model}>${m}</option>`)}</select>`
+      : html`<input name="model" defaultValue=${s.model ?? ''} placeholder="its name, as the provider has it" />`}</label>
     <label>Workspace <input name="workspace" defaultValue=${s.workspace ?? ''} placeholder="none: no bash" /></label>
     <label><input name="sandbox" type="checkbox" defaultChecked=${!!s.sandbox} /> bash in the sandbox</label>
     <label>Window <input name="window" type="number" defaultValue=${s.window ?? ''} /></label>
@@ -399,7 +454,7 @@ function SayForm() {
 
 // the buttons' pictures (each drawn anew where it's used), in the text's color: a paper plane
 // flying off (send), a step after a trail of dots (go on), a stop sign (stop), a plus with a spark
-// (a new session), a lens (search), and a fork whose tines branch like a log does (fork)
+// (a new session), a lens (search), a fork whose tines branch like a log does (fork), and a gear (settings)
 const ICONS = {
   send: () => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <path d="M21.5 2.5 6 9.4l5.3 3.3 3.3 5.3z" fill="currentColor" fill-opacity=".18" /><path d="M21.5 2.5 11.3 12.7" />
@@ -417,6 +472,9 @@ const ICONS = {
     <path d="M12 22v-8.5M12 13.5c0-3.2-5-3.4-5-7M12 13.5c0-3.2 5-3.4 5-7M12 13.5V6.5" />
     <circle cx="7" cy="4.6" r="1.8" fill="currentColor" stroke="none" /><circle cx="12" cy="4.2" r="1.8" fill="currentColor" stroke="none" />
     <circle cx="17" cy="4.6" r="1.8" fill="currentColor" stroke="none" /></svg>`,
+  gear: () => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true">
+    <path d="M10.14 5.05 10.44 2.12h3.12l.3 2.93A7.2 7.2 0 0 1 15.6 5.76l2.28-1.85 2.21 2.21-1.85 2.28a7.2 7.2 0 0 1 .71 1.74l2.93.3v3.12l-2.93.3a7.2 7.2 0 0 1-.71 1.74l1.85 2.28-2.21 2.21-2.28-1.85a7.2 7.2 0 0 1-1.74.71l-.3 2.93h-3.12l-.3-2.93a7.2 7.2 0 0 1-1.74-.71l-2.28 1.85-2.21-2.21 1.85-2.28a7.2 7.2 0 0 1-.71-1.74l-2.93-.3v-3.12l2.93-.3a7.2 7.2 0 0 1 .71-1.74L3.91 6.12l2.21-2.21L8.4 5.76a7.2 7.2 0 0 1 1.74-.71z" fill="currentColor" fill-opacity=".14" />
+    <circle cx="12" cy="12" r="2.9" /></svg>`,
 };
 
 // the log's messages, then the reply streaming in. A message's line (whose it is) shows only where the
@@ -609,22 +667,27 @@ function fold(workspace, folded) {
   redraw();
 }
 
-// a provider to edit: the form starts again from its name and base URL, its key blank
-function edit(p) {
-  page.editing = { name: p.name, base: p.base, n: page.editing.n + 1 };
-  redraw();
+// the settings dialog opened, the providers as settings.json has them now
+function opening() {
+  page.settings = { notes: {}, made: 0 };
+  draw();
+  loadProviders();
 }
 
-async function provide(e) {
-  e.preventDefault();
-  const { pname, base, key } = e.target.elements;
+// a provider saved as `body` gives it (Settings::provide in settings.rs), from `card` (its name, '' for
+// a new one's); whether it was, under the card it's on now (a new one's starts again)
+async function provide(card, body) {
+  const open = page.settings;
   try {
-    await api('/api/settings', { name: pname.value, base: base.value, key: key.value });
-    await loadProviders();
-    page.editing = { name: pname.value, base: base.value, n: page.editing.n + 1 };   // the key blank again
-    page.notes.provider = 'Saved.';
-  } catch (err) { page.notes.provider = err.message; }
-  redraw();
+    ({ providers: page.providers } = await api('/api/settings', body));
+    open.notes[card] = '';
+    open.notes[body.name.trim()] = 'Saved.';
+    if (!card) open.made++;
+    return true;
+  } catch (err) {
+    open.notes[card] = err.message;
+    return false;
+  } finally { draw(); }
 }
 
 async function tune(e) {
@@ -632,7 +695,7 @@ async function tune(e) {
   const value = (el) => el.type === 'checkbox' ? el.checked : el.type === 'number' ? Number(el.value) : el.value || null;
   try {
     state = await api(`/api/s/${current()}/settings`, Object.fromEntries([...e.target.elements].filter((el) => el.name).map((el) => [el.name, value(el)])));
-    [page.notes.session, page.tuned] = ['Saved.', page.tuned + 1];
+    [page.notes.session, page.tuned, page.picked] = ['Saved.', page.tuned + 1, null];
   } catch (err) { page.notes.session = err.message; }
   redraw();
 }
@@ -790,7 +853,7 @@ function grow(part, piece) {
 
 try { page.folded = new Set(JSON.parse(localStorage.getItem('folded')) || []); } catch { /* no storage here: groups start open */ }
 window.onhashchange = () => {
-  [page.notes.session, page.live, page.error] = ['', null, null];
+  [page.notes.session, page.picked, page.live, page.error] = ['', null, null, null];
   listSessions();
   subscribe();
 };

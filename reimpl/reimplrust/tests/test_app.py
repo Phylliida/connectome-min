@@ -9,7 +9,8 @@ with the user, empty content or blank text, more than four cache breakpoints) an
 and memory requests. Checked: every chat turn gets its reply; memories form and the context comes
 to show them; the context stays within the window; the fork shares its parent's messages through the
 fork point, and its settings are its parent's; a provider saved from the page, and a model a session
-picks, reach the API, the key never the page or a session's file, in a file only its user can read;
+picks, reach the API, the key never the page or a session's file, in a file only its user can read,
+and the models it lists (each once) stay as they are when it's saved without them;
 a session without settings says so, and one whose provider has gone shows its settings and takes
 another; a reply whose stream is cut off is an error, not a logged reply; a turn on a log the library
 can't read fails, and the session goes on once it's mended; a fork onto a session there is is refused;
@@ -822,11 +823,24 @@ def chatted(turns, tls, ca, baseline) -> str:
         shown, mode = call(port, '/api/settings')['providers'], os.stat(os.path.join(root, 'settings.json')).st_mode & 0o777
         listed = next((p for p in shown if p['name'] == 'plain'), None)
         kept, own = Path(root, 'settings.json').read_text(), Path(root, 'branch', 'session_settings.json').read_text()
-        if (seen['key'], seen['model']) != ('k-123', 'mock-2') or listed != {'name': 'plain', 'base': f'http://127.0.0.1:{plain_port}/v1', 'key': True} \
+        if (seen['key'], seen['model']) != ('k-123', 'mock-2') or listed != {'name': 'plain', 'base': f'http://127.0.0.1:{plain_port}/v1', 'key': True, 'models': []} \
                 or 'k-123' in json.dumps(shown) + own or 'k-123' not in kept or mode != 0o600:
             raise SystemExit(f'settings: the API saw key {seen["key"]!r} and model {seen["model"]!r}, the page sees {shown}, settings.json has mode {mode:o}')
-        if not next(p for p in call(port, '/api/settings', {'name': 'plain', 'base': f'http://127.0.0.1:{plain_port}/v1', 'key': ' '})['providers'] if p['name'] == 'plain')['key']:
-            raise SystemExit('a provider saved without a key lost the one it had')
+        call(port, '/api/settings', {'name': 'plain', 'models': [' mock-2', 'mock-3', 'mock-2', '']})   # each once, trimmed, blanks left out
+        if not (resaved := next(p for p in call(port, '/api/settings', {'name': 'plain', 'base': f'http://127.0.0.1:{plain_port}/v1', 'key': ' '})['providers'] if p['name'] == 'plain'))['key'] \
+                or resaved['models'] != ['mock-2', 'mock-3']:
+            raise SystemExit(f'a provider saved without a key or models lost them: {resaved}')
+        everything = json.loads(Path(root, 'settings.json').read_text())
+        del everything['providers']['plain']['models']                  # a provider written by hand lists none
+        Path(root, 'settings.json').write_text(json.dumps(everything))
+        try:
+            call(port, '/api/settings', {'name': 'plain', 'models': 'mock-2'})
+            raise SystemExit('a provider took models that are not a list')
+        except urllib.error.HTTPError as error:
+            if error.code != 400:
+                raise
+        if next(p for p in call(port, '/api/settings')['providers'] if p['name'] == 'plain')['models'] != []:
+            raise SystemExit('a provider without models in settings.json lists some')
         Path(root, 'old').mkdir()                                       # a session without settings has none to run with
         if 'session_settings.json' not in (call(port, '/api/s/old')['problem'] or '') or call(port, '/api/s/old/messages') != []:
             raise SystemExit('a session without settings did not say so, or show its log')

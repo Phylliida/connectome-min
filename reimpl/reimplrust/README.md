@@ -47,24 +47,27 @@ priced as the planner prices them.
 --release`.
 
 ```sh
-./target/release/connectome-web        # opens http://127.0.0.1:8080; add a provider's key in the page
+./target/release/connectome-web        # opens http://127.0.0.1:8080; add a provider's key in its Settings
 ```
 
 Settings are JSON files you can edit by hand, read again at each use, and only you can read them,
 since one holds the keys:
 
-- `ROOT/settings.json`: `providers`, each a name with a `base` URL and a `key`; `defaults`, what a
+- `ROOT/settings.json`: `providers`, each a name with a `base` URL, a `key` and the `models` the page
+  offers a session on it (the page's Settings edits them, and adds providers); `defaults`, what a
   new session starts with; `sandbox`, what a sandboxed command sees; and `search`, a SearXNG
   server's address (say `http://10.0.0.139:8288`), which gives sessions the `web_search` tool. The
   first run writes it with a provider named `default` for `https://api.anthropic.com` without a key,
-  which the page then asks for, and defaults for a window of 90k tokens, 30k of them reserved for
-  the reply (and its reasoning: a reply that reaches its reserve stops there). -
-  `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
+  which the page then asks for, listing `claude-sonnet-5-5`, and defaults for a window of 90k tokens,
+  30k of them reserved for the reply (and its reasoning: a reply that reaches its reserve stops
+  there).
+- `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its
   `window`, `reserve` and `system` prompt, and the library's settings (`config`). A new session's
   file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its
   parent's; a session without one has none to run with, and the page says so. The page edits the
-  main fields; `config.merge_threshold` can't change once memories have merged.
+  main fields, its model one its provider lists (or any, typed, for a provider that lists none);
+  `config.merge_threshold` can't change once memories have merged.
 
 Tools (`app/src/tools/`): the model can call `bash` (a command in a new shell in the session's
 workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in the workspace changed

@@ -3,6 +3,7 @@
 //! ROOT/settings.json is a Settings, each session's ROOT/NAME/session_settings.json a SessionSettings.
 
 use connectome::{config::Config, json::Value, obj};
+use itertools::Itertools;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use smart_default::SmartDefault;
 use std::{collections::{BTreeMap, BTreeSet}, io::Write, path::{Path, PathBuf}};
@@ -17,7 +18,7 @@ pub struct Settings {
 
 impl Settings {
     /// What settings.json starts as: a provider named default, Anthropic's API without a key yet, and
-    /// new sessions on it with a window of 90k tokens: the reply's reserve, `overhead`, which every
+    /// new sessions on it (on the one model it lists) with a window of 90k tokens: the reply's reserve, `overhead`, which every
     /// request carries (the system prompt and tool definitions), and the context, which the library's
     /// settings are sized for.
     pub fn first(overhead: f64) -> Settings {
@@ -25,21 +26,26 @@ impl Settings {
         let left = defaults.window - overhead - defaults.reserve; // the library's sizes below are its defaults, for contexts of 120k and more
         let (recent_window_tokens, target_chunk_tokens) = ((left / 4.0).min(30000.0), (left / 16.0).min(3000.0));
         let config = Config { summary_participant: "assistant".into(), recent_window_tokens, target_chunk_tokens, compression_max_tokens: Some(8000.0), ..Config::default() };
-        let providers = BTreeMap::from([("default".into(), Provider { base, key: String::new() })]);
+        let providers = BTreeMap::from([("default".into(), Provider { base, key: String::new(), models: vec![defaults.model.clone()] })]);
         Settings { providers, defaults: SessionSettings { config, ..defaults }, sandbox: Sandbox::default(), search: None }
     }
 
     /// The providers as the page sees them: never a key, only whether there is one.
     pub fn providers(&self) -> Value {
-        let shown = self.providers.iter().map(|(name, p)| obj! {"name" => name.as_str(), "base" => p.base.as_str(), "key" => !p.key.is_empty()});
+        let shown = self.providers.iter().map(|(name, p)| obj! {"name" => name.as_str(), "base" => p.base.as_str(), "key" => !p.key.is_empty(), "models" => p.models.clone()});
         obj! {"providers" => shown.collect::<Vec<_>>()}
     }
 
-    /// A provider added, or its base URL or key changed, by what `v` gives that isn't blank.
+    /// A provider added, or its base URL or key changed, by what `v` gives that isn't blank, and its
+    /// models, if `v` lists them, those it lists (each once, in their order).
     pub fn provide(&mut self, v: &Value) -> Result<(), String> {
         let given = |k: &str| v[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
         let p = self.providers.entry(given("name").ok_or("a provider's name")?).or_default();
         (p.base, p.key) = (given("base").unwrap_or(std::mem::take(&mut p.base)), given("key").unwrap_or(std::mem::take(&mut p.key)));
+        if let Some(models) = v.get("models") {
+            let listed = models.as_array().ok_or("a provider's models, a list")?.iter().filter_map(Value::as_str).map(str::trim);
+            p.models = listed.filter(|m| !m.is_empty()).unique().map(String::from).collect();
+        }
         if p.base.is_empty() { Err("a provider's base URL".into()) } else { Ok(()) }
     }
 }
@@ -48,6 +54,7 @@ impl Settings {
 pub struct Provider {
     pub base: String, // e.g. https://api.anthropic.com
     pub key: String,
+    #[serde(default)] pub models: Vec<String>, // what the page offers a session on it
 }
 
 /// What a sandboxed command sees besides its workspace: the paths in `ro` that exist, read-only, and
