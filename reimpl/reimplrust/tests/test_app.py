@@ -473,8 +473,9 @@ def tooled(tls, ca, baseline) -> str:
     the turn so far, then the rest as it happens, the same as the page that started it, and answers;
     a message sent meanwhile waits for the turn; a page following no turn gets nothing. Every call gets its result,
     in the log and on the page; the requests fit the window with the tool definitions counted, which
-    leave the price multiplier near a session's without them (from `baseline`); once a turn never stops
-    calling tools; and memories of the calls form with the tools declared but not callable."""
+    leave the price multiplier near a session's without them (from `baseline`); a turn that never stops
+    calling tools runs on past 64 steps until the user stops it, memories forming between its steps;
+    and memories of the calls form with the tools declared but not callable."""
     port, root, work, fake, window, mock_port = free_port(), tempfile.mkdtemp(), tempfile.mkdtemp(), str(HERE / 'fake_mcp.py'), 12000, free_port()
     mock = serve(mock_port, tls)
     servers = {'first': {'command': sys.executable, 'args': [fake]}, 'second': {'command': sys.executable, 'args': [fake, '--shadow', '--wordy']},
@@ -702,12 +703,21 @@ def tooled(tls, ca, baseline) -> str:
                          ('1. Bees\nhttps://example.com/bees\n2026-07-27 · All about bees.\n\n2. Wasps\nhttps://example.com/wasps\nLess about bees.', False)] \
                 or 'search.formats' not in found[2][0] or not found[2][1] or found[3][0].count('https://example.com/') != 20 or seen['asked'][-4:] != ['web_search'] * 4:
             raise SystemExit(f'web_search gave {found}, the server asked {seen.get("searched")!r}')
-        try:
-            say(port, 'tools', 'use tools forever', {'add': 'always'})
-            raise SystemExit('a turn that never stops calling tools ended')
-        except SystemExit as stopped:
-            if 'stopped after 64 steps' not in str(stopped):
-                raise
+        r, events = following(port, 'tools')                            # a turn that never stops calling tools runs on until the user stops it
+        with r:
+            next(events)
+            job, results, ends = call(port, '/api/s/tools/say', {'text': 'use tools forever'})['job'], 0, []
+            for e in events:
+                if 'approve' in e:
+                    call(port, '/api/s/tools/approve', {'id': e['approve'], 'answer': 'always'})
+                results += 'result' in e
+                if 'result' in e and results == 70:                     # its first step calls four tools, each after one: 67 steps
+                    call(port, '/api/s/tools/stop', {})
+                ends += [e['end']] if 'end' in e else []
+                if e.get('done') == job:
+                    break
+        if results < 70 or ends != ['Stopped by the user.']:
+            raise SystemExit(f'a turn that never stops calling tools ended {ends} after {results} results')
         settle(port, 'tools')
         compiles = [json.loads(line) for line in Path(root, 'tools', 'compiles.jsonl').read_text().splitlines()]
         if (escalated := sum(c['escalated'] for c in compiles)) > 2:

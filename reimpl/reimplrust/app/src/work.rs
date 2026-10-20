@@ -13,12 +13,6 @@ use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::
 use connectome::{memory::{Host, Request, INTERRUPTED}, store::Session};
 use std::{cell::RefCell, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
 
-/// Steps a turn may take, a model request each, before it stops.
-const MAX_STEPS: usize = 64;
-
-/// A turn's end when it reaches MAX_STEPS.
-fn out_of_steps() -> String { format!("the turn stopped after {MAX_STEPS} steps") }
-
 /// A message from `who` of `text`, as the log keeps it.
 fn said(who: &str, text: String) -> Value { obj! {"participant" => who, "content" => vec![obj! {"type" => "text", "text" => text}]} }
 
@@ -175,8 +169,8 @@ impl Worker<'_> {
         if let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup) }
     }
 
-    /// A chat turn: its message joins the log, then steps run until a reply calls no tools and the
-    /// partner has told the session nothing more (deliver). Without a message, the turn continues the
+    /// A chat turn: its message joins the log, then steps run, as many as it takes, until a reply calls
+    /// no tools and the partner has told the session nothing more (deliver), or the user stops it. Without a message, the turn continues the
     /// log as it is: after an interruption the context ends with the user's message or the tool
     /// results, and after a reply cut short with that reply, which the Messages API continues (a
     /// prefill).
@@ -186,12 +180,11 @@ impl Worker<'_> {
         }
         self.deliver()?;
         self.logged();
-        for _ in 0..MAX_STEPS {
+        loop {
             if self.stopped() { return Err(STOPPED.into()) }
             let called = self.step()?;
             if !self.deliver()? && !called { return Ok(()) }
         }
-        Err(out_of_steps())
     }
 
     /// What the session's partner has told it meanwhile joins the log, each as the partner's message;
@@ -212,7 +205,7 @@ impl Worker<'_> {
     }
 
     /// The turn that started at message `start` and `ended` so, to the session's partner, if it has
-    /// one: if the turn ended by itself (or at its limit of steps), what it said and ran, while Auto is
+    /// one: if the turn ended by itself, what it said and ran, while Auto is
     /// on or when the partner is owed it (companion::owed); else Auto goes off for both, and the
     /// partner, if owed an answer, hears why there's none.
     fn hand_over(&self, start: u64, ended: Result<(), String>) {
@@ -222,9 +215,6 @@ impl Worker<'_> {
         let turn: Vec<Value> = if n > start { self.s.span("messages", start, n - 1).collect() } else { vec![] };
         let told = match ended {
             Ok(()) => companion::ended(self.name, &turn),
-            Err(why) if why == out_of_steps() => format!("{}
-
-({why})", companion::ended(self.name, &turn)),
             Err(why) => {
                 if settings.auto {
                     let _ = self.app.ask_session(self.name, |reply| Msg::Auto(false, reply));
