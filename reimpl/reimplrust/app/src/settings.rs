@@ -98,7 +98,8 @@ impl SessionSettings {
 
     /// These settings as what `v` gives changes them: any of their fields, and any of config's. The
     /// provider must be one of `all`'s, a workspace given a directory that exists (absolute, a leading
-    /// ~/ the home directory, no trailing /), and merge_threshold as it was once memories have `merged`.
+    /// ~/ the home directory, no trailing /), and once memories have `merged`, merge_threshold as it was
+    /// and merge_by_count not turned on (merging by count after merging by tokens would misread them).
     pub fn tuned(&self, v: &Value, merged: bool, all: &Settings) -> Result<SessionSettings, String> {
         let mut new = serde_json::to_value(self).expect("settings are JSON");
         for (k, x) in v.as_object().into_iter().flatten() {
@@ -120,6 +121,9 @@ impl SessionSettings {
         }
         if merged && new.config.merge_threshold != self.config.merge_threshold {
             return Err("merge_threshold stays as it is once memories have merged".into());
+        }
+        if merged && new.config.merge_by_count && !self.config.merge_by_count {
+            return Err("merge_by_count can't go on once memories have merged by tokens".into());
         }
         Ok(new)
     }

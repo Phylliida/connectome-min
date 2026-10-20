@@ -5,9 +5,15 @@ autobiographical compaction) and a web app around it.
 
 - `connectome/`: the library, over serde_json (with smart-default and itertools). A session is
   append-only JSONL files on disk (`store.rs`), in the same format the Python port writes, so either
-  can carry on from the other's files. A compile plans the context from prices and block shapes only
-  (`emit::select`), and an `emit::Reader` reads each block from disk as the caller writes the
-  request, so neither a session nor a context is held in memory.
+  can carry on from the other's files while memories merge by count. One thing differs from the
+  port: by default a merge takes the fewest memories of the layer below, at least two, that hold
+  `target_chunk_tokens`, as chunks close, so a merge's request stays about the same size however
+  long memories are, and its record says what it merged (`merges`). `merge_by_count` merges
+  `merge_threshold` at a time, as the port does (the differential test runs that way); a memory
+  without `merges` is read as such a group, so a session that merged by count goes on by tokens from
+  where it was. A compile plans the context from prices and block shapes only (`emit::select`), and
+  an `emit::Reader` reads each block from disk as the caller writes the request, so neither a
+  session nor a context is held in memory.
 - `connectome/src/bin/replay.rs`: replays a scripted session, for the tests.
 - `app/`: `connectome-web`, a chat with a model whose context the library manages, in one web page
   that shows the memory pyramid and what the context shows, and forks a session at any message. It
@@ -73,7 +79,8 @@ since one holds the keys:
   file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its
   parent's; a session without one has none to run with, and the page says so. The page edits the
   main fields, its model one its provider lists (or any, typed, for a provider that lists none);
-  `config.merge_threshold` can't change once memories have merged.
+  `config.merge_threshold` can't change once memories have merged, nor `config.merge_by_count` turn
+  on.
 
 Tools (`app/src/tools/`): the model can call `bash` (a command in a new shell in the session's
 workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in the workspace changed

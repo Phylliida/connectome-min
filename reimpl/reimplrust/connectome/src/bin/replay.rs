@@ -15,7 +15,7 @@ use connectome::drive::step;
 use connectome::emit::Reader;
 use connectome::json::{self, Json, Value};
 use connectome::memory::{Host, Request};
-use connectome::planner::{plan, Node};
+use connectome::planner::{plan, Fixed, Node};
 use connectome::store::Session;
 use std::io::Read;
 use std::path::Path;
@@ -54,10 +54,10 @@ fn plans() {
     let out = cases.arr().iter().map(|case| {
         let nodes = |v: &Value| v.arr().iter().map(|n| (n.arr()[0].u64(), n.arr()[1].u64())).collect::<Vec<Node>>();
         let have: Vec<u64> = case["have"].arr().iter().map(Value::u64).collect();
-        let cfg = Config { merge_threshold: case["k"].u64(), slack: case["slack"].as_f64().unwrap(), unfold_below: case["unfold_below"].as_f64().unwrap(), ..Config::default() };
+        let cfg = Config { slack: case["slack"].as_f64().unwrap(), unfold_below: case["unfold_below"].as_f64().unwrap(), ..Config::default() };
         let salt = case["salt"].u64();
         let exists = |(level, id): Node| have.get(level as usize).is_some_and(|&n| id < n);
-        let planned = plan(nodes(&case["frontier"]), |n| cost(n, salt), exists, case["fixed"].as_f64().unwrap(), case["W"].as_f64().unwrap(), &cfg);
+        let planned = plan(nodes(&case["frontier"]), |n| cost(n, salt), exists, case["fixed"].as_f64().unwrap(), case["W"].as_f64().unwrap(), &Fixed(case["k"].u64()), &cfg);
         Value::Array(planned.into_iter().map(|(l, i)| Value::Array(vec![l.into(), i.into()])).collect())
     });
     println!("{}", json::to_string(&Value::Array(out.collect())));
@@ -70,7 +70,7 @@ fn main() {
     }
     let script = json::parse(&std::fs::read(&args[1]).expect("script")).expect("script JSON");
     let dir = Path::new(&args[2]);
-    let cfg: Config = serde_json::from_value(script["config"].clone()).expect("config");
+    let cfg = Config { merge_by_count: true, ..serde_json::from_value(script["config"].clone()).expect("config") }; // as the Python port merges
     let tools = Some(script["tools"].clone()).filter(|t| *t != Value::Null);
     let mut host = Scripted { tools, replies: script["replies"].arr().iter(), events: vec![], now: 0 };
     let mut session = Session::open(dir.join(script["start"].as_str().unwrap_or("main")));

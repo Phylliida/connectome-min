@@ -16,7 +16,7 @@
 
 use crate::{blocks::{reasoning, shape, At, Block}, chunking::{close_chunks, live_price, open_start, priced, stripped_raw, tail_start}, config::Config};
 use crate::{estimate::Calibration, js::{digest, js_len, js_trim, py_round}, json::{Json, Value}, obj, planner::{chunks, plan, Node}, segment::budget};
-use crate::{store::Session, turns::{pair_tools, say, split, text, Turn, DROPPED}};
+use crate::{memory::Recorded, store::Session, turns::{pair_tools, say, split, text, Turn, DROPPED}};
 use std::{cell::RefCell, collections::HashMap, ops::Range};
 
 /// An OverBudgetError: the compile renders nothing and commits nothing.
@@ -40,7 +40,8 @@ pub fn select(session: &Session, w: f64, calibration: Calibration, cfg: &Config)
         })
     };
     let shown: Vec<Node> = last["frontier"].arr().iter().map(|n| (n.arr()[0].u64(), n.arr()[1].u64())).collect();
-    let covered = shown.last().map_or(0, |&node| chunks(node, cfg.merge_threshold).end);
+    let groups = Recorded::new(session, cfg);
+    let covered = shown.last().map_or(0, |&node| chunks(node, &groups).end);
     let frontier: Vec<Node> = shown.into_iter().chain((covered..held(0)).map(|j| (0, j))).collect();
     let (tail, loose) = (tail_start(session, m, cfg), open_start(session)..session.count("messages"));
     let (mut admit, live) = (budget(cfg.max_live_images, cfg.max_live_image_bytes), tail..loose.end);
@@ -49,7 +50,7 @@ pub fn select(session: &Session, w: f64, calibration: Calibration, cfg: &Config)
         if live.contains(&i) { live_price(&p, m, &mut admit) } else { py_round(stripped_raw(&p) * m) }
     };
     let fixed = loose.clone().rev().map(price).fold(0.0, |a, x| a + x);
-    let frontier = plan(frontier, cost, |(n, p)| p < held(n), fixed, w, cfg);
+    let frontier = plan(frontier, cost, |(n, p)| p < held(n), fixed, w, &groups, cfg);
     let total = fixed + frontier.iter().map(|&n| cost(n)).fold(0.0, |a, x| a + x);
     let limit = (w * (1.0 + cfg.over_budget_grace)).floor();
     if total > limit {

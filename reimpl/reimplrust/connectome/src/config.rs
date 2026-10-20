@@ -16,7 +16,8 @@ pub struct Config {
     // planning (planner.rs)
     #[default(0.1)] pub slack: f64,                                  // folding over W stops at the target, W * (1 - slack)
     #[default(0.8)] pub unfold_below: f64,                           // below W * unfold_below, unfold toward the target
-    #[default(6)] pub merge_threshold: u64,                          // mergeThreshold: memories per merge, 2 or more; fixed for a session
+    #[default(6)] pub merge_threshold: u64,                          // mergeThreshold: memories per merge by count, 2 or more, and per merge a memory records none of; fixed for a session
+    pub merge_by_count: bool,                                        // merge merge_threshold memories at a time, as the library does, not the fewest (2 or more) that hold target_chunk_tokens; on only from a session's start
     #[default(0.02)] pub over_budget_grace: f64,                     // overBudgetGraceRatio
     // rendering
     #[default("What do you remember from earlier?")] pub summary_label: String, // summaryContextLabel

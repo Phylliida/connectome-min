@@ -5,7 +5,7 @@
 //! this server never approves), since a POST can change where the key goes.
 
 use crate::{companion, costs::{self, Compile, Fold, Spent}, hub::{Event, Job, Msg, Routed}, settings::{self, SessionSettings}, work::Setup, App};
-use connectome::{json::{self, sparse, Json, Value}, obj, store::Session};
+use connectome::{config::Config, json::{self, sparse, Json, Value}, memory::Recorded, obj, planner::chunks, store::Session};
 use serde::{Serialize, Serializer};
 use std::{collections::{BTreeSet, HashMap}, net::TcpStream, path::Path, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
 use std::{any::Any, panic::{catch_unwind, AssertUnwindSafe}};
@@ -177,6 +177,7 @@ struct State<'a> {
     tools: Vec<&'a str>,
     overhead: f64,
     problem: Option<&'a str>,
+    covers: Vec<Vec<(u64, u64)>>,
 }
 
 /// A session's State, as JSON.
@@ -194,8 +195,16 @@ fn state(app: &App, name: &str, s: &Session) -> Value {
         tools: setup.as_ref().map_or(vec![], |x| x.tools.asking()),
         overhead: setup.as_ref().map_or(0.0, |x| x.overhead),
         problem: setup.as_ref().err().map(String::as_str),
+        covers: app.profile(name).map_or(vec![], |own| covers(s, &own.config)),
     };
     serde_json::to_value(state).expect("a state is JSON")
+}
+
+/// The chunks each memory above L1 covers, by layer from 2: its first, and the one after its last.
+fn covers(s: &Session, cfg: &Config) -> Vec<Vec<(u64, u64)>> {
+    let groups = Recorded::new(s, cfg);
+    let layer = |n: u64| (0..s.count(&format!("layer{n}"))).map(|p| chunks((n, p), &groups)).map(|c| (c.start, c.end)).collect::<Vec<_>>();
+    (2..).map(layer).take_while(|covered| !covered.is_empty()).collect()
 }
 
 /// Every session: its name, messages, the session it forked from, its workspace, and its companion or

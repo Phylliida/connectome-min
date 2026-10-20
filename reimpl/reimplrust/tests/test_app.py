@@ -935,6 +935,14 @@ def chatted(turns, tls, ca, baseline) -> str:
         levels = {level for level, _ in state['frontier'] or []}
         if len(state['layers']) < 3 or not levels - {0}:
             raise SystemExit(f'memories did not form or show: layers {state["layers"]}, frontier {state["frontier"]}')
+        target = state['settings']['config']['target_chunk_tokens']    # each merge: the fewest of the layer below, at least two, that hold a chunk's tokens, run after run
+        for n in range(2, len(state['layers'])):
+            runs = [tuple(m['merges']) for m in layers[n]]
+            held = lambda a, b: sum(m['tokens'] for m in layers[n - 1][a:b + 1])
+            covered = [(a, b + 1) if n == 2 else (state['covers'][n - 3][a][0], state['covers'][n - 3][b][1]) for a, b in runs]
+            if [a for a, _ in runs] != [0] + [b + 1 for _, b in runs[:-1]] or any(b <= a or held(a, b) < target or held(a, b - 1) >= target for a, b in runs) \
+                    or [tuple(c) for c in state['covers'][n - 2]] != covered:
+                raise SystemExit(f'L{n} merged {runs} of memories of {[m["tokens"] for m in layers[n - 1]][:12]} tokens (a chunk {target}), covering {state["covers"][n - 2][:6]}')
         call(port, '/api/s/main/settings', {'system': 'You are being tested.'})
         if (made := call(port, '/api/s/main/fork', {'at': 20, 'name': 'branch'})).get('messages') != 21:   # the fork as the page then shows it
             raise SystemExit(f'the fork answered {str(made)[:80]}, not its state with 21 messages')
