@@ -52,7 +52,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
-seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': []}
+seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': [], 'planned': {}, 'passbacks': 0}
+PONDERED = 'I weighed what this stretch should keep. '   # what a memory's summarizer thinks first: never sent again
 
 
 class Mock(BaseHTTPRequestHandler):
@@ -126,7 +127,7 @@ class Mock(BaseHTTPRequestHandler):
                 return self.problem(f'a memory request may call tools: tool_choice {request.get("tool_choice")}')
             seen['memory'] += 1
             seen['tool memories'] += any(b['type'] == 'tool_use' for m in messages for b in m['content'])
-            blocks = [{'type': 'text', 'text': f'I remember stretch {seen["memory"]}: the user talked about ' + ' '.join(['things'] * 60)}]
+            blocks = [{'type': 'thinking', 'thinking': PONDERED * 40, 'signature': 'bWVt'}, {'type': 'text', 'text': f'I remember stretch {seen["memory"]}: the user talked about ' + ' '.join(['things'] * 60)}]
         elif 'use tools' in last or last.startswith('call ') or results and 'forever' in asked:
             seen['chat'] += 1
             seen['results'].append(results)
@@ -134,6 +135,10 @@ class Mock(BaseHTTPRequestHandler):
                 [['add', {'a': 2, 'b': 3}], ['fail', {}], ['picture', {}], ['nope', {}]]
             blocks = [{'type': 'text', 'text': 'Calling tools.'}] + [{'type': 'tool_use', 'id': f'call{seen["chat"]}-{k}', 'name': name, 'input': args}
                                                                    for k, (name, args) in enumerate(calls)]
+            if 'reasoned' in last:                                 # reasoning first, which must come back with the calls (thinking mode)
+                planned = {'type': 'thinking', 'thinking': f'Planning the calls of reply {seen["chat"]}.', 'signature': f'c2ln{seen["chat"]}'}
+                seen['planned'][f'call{seen["chat"]}-0'] = planned
+                blocks.insert(0, planned)
             stop = 'tool_use'
         else:
             seen['chat'] += 1
@@ -234,6 +239,14 @@ def invalid(request) -> str | None:
         return f'a tool without a name or input_schema: {tools}'
     if (request.get('tool_choice') or {'type': 'auto'}).get('type') not in ('auto', 'any', 'none', 'tool'):
         return f'tool_choice {request["tool_choice"]}'
+    if PONDERED in json.dumps(messages):
+        return 'a memory\'s reasoning went into a request'
+    chat = (request.get('tool_choice') or {}).get('type') != 'none'   # a memory's request replays turns without their reasoning
+    for m in messages if chat else []:
+        planned = [seen['planned'][b['id']] for b in m['content'] if b['type'] == 'tool_use' and b['id'] in seen['planned']]
+        if planned and m['content'][0] != planned[0]:
+            return f'the reasoning before tool calls didn\'t come back first, as it was: {m["content"][:2]}'
+        seen['passbacks'] += bool(planned)
     for m, after in zip(messages, messages[1:] + [{'content': []}]):
         uses, answered = [b['id'] for b in m['content'] if b['type'] == 'tool_use'], [b['tool_use_id'] for b in after['content'] if b['type'] == 'tool_result']
         if sorted(uses) != sorted(answered):
@@ -698,6 +711,10 @@ def tooled(tls, ca, baseline) -> str:
         if not last()['content'][0]['content'].endswith('[stopped by the user]') or 'late' in last()['content'][0]['content'] or took > 0.6:   # --tool-timeout is 1 s
             raise SystemExit(f'a command stopped as it ran gave {last()["content"]}, the turn ending {took:.1f} s on')
         say(port, 'halt', 'echo next')                                  # the mock answers results and a message together with a reply
+        passbacks = seen['passbacks']                                   # a reply's reasoning before its calls goes back with them, as it was
+        say(port, 'halt', 'call ' + json.dumps([['bash', {'command': 'echo reasoned'}]]))
+        if seen['passbacks'] <= passbacks:
+            raise SystemExit('the reasoning before a reply\'s calls never went back with them')
         heard, took = stopped('call ' + json.dumps([['hang', {}]]), running('hang'))   # an MCP call running is left
         if 'stopped by the user' not in last()['content'][0]['content'] or took > 0.6:
             raise SystemExit(f'an MCP call stopped as it ran gave {last()["content"]}, the turn ending {took:.1f} s on')

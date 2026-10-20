@@ -302,6 +302,7 @@ impl Content {
 
 /// A block of the library's as the API takes it, its content moved, not copied.
 fn to_api(mut b: Value, cache: bool) -> Value {
+    let reasoning = REASONING.contains(&b.kind());
     let mut out = match b.kind() {
         "tool_use" => obj! {"type" => "tool_use", "id" => b["id"].take(), "name" => b["name"].take(), "input" => b["input"].take()},
         "tool_result" => {
@@ -315,30 +316,50 @@ fn to_api(mut b: Value, cache: bool) -> Value {
             let source = &mut b["source"];
             obj! {"type" => "image", "source" => obj! {"type" => "base64", "media_type" => source["mediaType"].take(), "data" => source["data"].take()}}
         }
+        "thinking" => {
+            let thinking = match b["thinking"].take() { Value::Null => "".into(), thinking => thinking }; // a model's that shows none: its signature carries it
+            sparse(obj! {"type" => "thinking", "thinking" => thinking, "signature" => b["signature"].take()})
+        }
+        "redacted_thinking" => obj! {"type" => "redacted_thinking", "data" => b["data"].take()},
         _ => obj! {"type" => "text", "text" => b["text"].take()},
     };
-    if cache {
+    if cache && !reasoning { // the API takes no cache_control on reasoning
         out["cache_control"] = obj! {"type" => "ephemeral"};
     }
     out
 }
 
-/// The block types a request carries; reasoning, documents and the rest stay in the log.
+/// The block types a request carries; documents and the rest stay in the log.
 const SENT: [&str; 4] = ["text", "tool_use", "tool_result", "image"];
+
+/// Reasoning, which a request carries only on the assistant's turns that call tools (write_body).
+const REASONING: [&str; 2] = ["thinking", "redacted_thinking"];
+
+/// A turn's blocks a request carries: its kinds SENT, not blank, and if `reasoning` its reasoning.
+fn carried(t: &Turn, reasoning: bool) -> Vec<&Block> {
+    t.content.iter().filter(|b| if REASONING.contains(&b.kind.as_str()) { reasoning } else { SENT.contains(&b.kind.as_str()) && !b.blank }).collect()
+}
 
 /// `head`'s fields, then the turns as the API's messages: the assistant's turns speak as the assistant,
 /// everyone else's (the user's, the Context Manager's) as the user; a role's consecutive turns join;
-/// blocks the request doesn't carry and blank text are left out, and a turn left empty goes. A turn's
-/// cache breakpoint marks its last block.
+/// blocks the request doesn't carry and blank text are left out, and a turn left empty goes. An
+/// assistant's turn that calls tools carries its reasoning back as the reply gave it, signatures and
+/// all (as DeepSeek's thinking mode requires, and Claude's tool use), unless it's joined to another
+/// turn, which would change the reply's shape (the API rejects altered reasoning). A turn's cache
+/// breakpoint marks its last block.
 fn write_body(mut out: impl Write, head: &Value, turns: &[Turn], reader: &mut Reader) -> io::Result<()> {
-    let sent = turns.iter().map(|t| (t, t.content.iter().filter(|b| SENT.contains(&b.kind.as_str()) && !b.blank).collect::<Vec<_>>()));
-    let turns: Vec<(&Turn, Vec<&Block>)> = sent.filter(|(_, blocks)| !blocks.is_empty()).collect();
+    let turns: Vec<(&Turn, Vec<&Block>)> = turns.iter().map(|t| (t, carried(t, false))).filter(|(_, blocks)| !blocks.is_empty()).collect();
     let head = json::to_string(head);
     write!(out, "{},\"messages\":[", &head[..head.len() - 1])?; // the head's fields without its closing brace
     for (i, run) in turns.chunk_by(|(a, _), (b, _)| (a.participant == "assistant") == (b.participant == "assistant")).enumerate() {
         let role = if run[0].0.participant == "assistant" { "assistant" } else { "user" };
         write!(out, "{}{{\"role\":\"{role}\",\"content\":[", if i > 0 { "," } else { "" })?;
-        let blocks = run.iter().flat_map(|(t, blocks)| blocks.iter().enumerate().map(move |(j, &b)| (b, t.mark && j + 1 == blocks.len())));
+        let calls = |t: &Turn| role == "assistant" && run.len() == 1 && t.content.iter().any(|b| b.kind == "tool_use");
+        let blocks = run.iter().flat_map(|(t, blocks)| {
+            let blocks = if calls(t) { carried(t, true) } else { blocks.clone() };
+            let last = blocks.len();
+            blocks.into_iter().enumerate().map(move |(j, b)| (b, t.mark && j + 1 == last))
+        });
         for (j, (b, mark)) in blocks.enumerate() {
             out.write_all(if j > 0 { b"," } else { b"" })?;
             json::write(&to_api(reader.load(b), mark), &mut out)?;

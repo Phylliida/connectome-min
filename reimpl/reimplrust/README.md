@@ -143,7 +143,10 @@ user stops it). A request that fails in a way that may pass (no answer, a stream
 tried again, up to five times: 500 ms after, then 500 ms, then 2 s each; what streamed of the reply
 is dropped, and the page says why it's trying again. A failure that would come again (a bad key, a
 request the API rejects) isn't retried, and only a reply that comes whole counts toward the
-session's costs. Every request carries the system prompt and the tool definitions, so their tokens
+session's costs. A reply that calls tools goes back in later requests with its reasoning as it came,
+signatures and all, as DeepSeek's thinking mode requires (without it the model reasons from scratch
+at each step); other replies' reasoning, and the reasoning that wrote a memory, stay in the log and
+are never sent. Every request carries the system prompt and the tool definitions, so their tokens
 come out of the window the context compiles to, and out of the usage that calibrates prices; while
 calibration catches up with a request bigger than its estimate, the next context compiles that much
 smaller. Memory requests declare the same tools with tool choice "none", as the library does, so a
