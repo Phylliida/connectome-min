@@ -349,7 +349,7 @@ const App = () => {
       <h2>Context</h2>
       <${Stats} />
       <h2>Memory pyramid</h2>
-      <div class="legend">Each row up merges runs of the row below, each about a chunk's worth of tokens; bottom row is chunks of raw messages. Outlined: what the context shows. Click for its text.</div>
+      <div class="legend">Each row up merges runs of the row below, each about a chunk's worth of tokens, or, when the context can't fold enough, the oldest leftovers of several rows; bottom row is chunks of raw messages. Outlined: what the context shows. Click for its text.</div>
       <${Pyramid} />
       <pre id="detail">${page.detail}</pre>
     </aside>

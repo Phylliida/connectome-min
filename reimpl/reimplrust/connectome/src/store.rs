@@ -6,9 +6,10 @@
 //!   layer0.jsonl     chunks, in log order: {id, first, last, raw} (message ids; raw = uncalibrated price)
 //!   layer<n>.jsonl   memories of level n, in order: {id, first, last, text, blocks, tokens, provenance,
 //!                    recall, merges?}. Layer 1's entry p summarizes chunk p; layer n+1's entry p
-//!                    merges layer n's entries from its `merges`' first to its last, or, without
-//!                    `merges` (merged by count), p*k .. p*k+k-1 (k = merge_threshold, fixed for a
-//!                    session).
+//!                    merges layer n's entries from its `merges`' first to its last, or, lifted,
+//!                    for each [layer, first, last] in `merges`, that layer's entries first to last
+//!                    (layer n's first, then lower layers'), or, without `merges` (merged by count),
+//!                    p*k .. p*k+k-1 (k = merge_threshold, fixed for a session).
 //!   compiles.jsonl   one record per compile: the frontier shown, calibration, cache keys, escalation
 //!   attempts.jsonl   memory attempts that failed: {id, target, messages, outcome}
 //!

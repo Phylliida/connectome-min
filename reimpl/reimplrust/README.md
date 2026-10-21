@@ -8,10 +8,14 @@ autobiographical compaction) and a web app around it.
   can carry on from the other's files while memories merge by count. One thing differs from the
   port: by default a merge takes the fewest memories of the layer below, at least two, that hold
   `target_chunk_tokens`, as chunks close, so a merge's request stays about the same size however
-  long memories are, and its record says what it merged (`merges`). `merge_by_count` merges
-  `merge_threshold` at a time, as the port does (the differential test runs that way); a memory
-  without `merges` is read as such a group, so a session that merged by count goes on by tokens from
-  where it was. A compile plans the context from prices and block shapes only (`emit::select`), and
+  long memories are, and its record says what it merged (`merges`). And where the library only
+  merges within a layer, a compile that can't fold enough lifts: each layer keeps memories no merge
+  has taken yet, short of a group, and with enough layers those and the tail outgrow the window with
+  nothing left to fold, so the oldest of them past the top layer's, across layers, the fewest that
+  hold `target_chunk_tokens`, merge into a memory one layer above the highest it takes (`memory.rs`,
+  `lifted`). `merge_by_count` merges `merge_threshold` at a time and never lifts, as the port does
+  (the differential test runs that way); a memory without `merges` is read as such a group, so a
+  session that merged by count goes on by tokens from where it was. A compile plans the context from prices and block shapes only (`emit::select`), and
   an `emit::Reader` reads each block from disk as the caller writes the request, so neither a
   session nor a context is held in memory.
 - `connectome/src/bin/replay.rs`: replays a scripted session, for the tests.

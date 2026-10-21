@@ -21,10 +21,12 @@ gets a failed call, the request still declaring bash; a turn continues without a
 cut short going on from its text and a turn whose request failed answering the message it had;
 another site's page can't change the settings; a server whose certificate names another
 host gets nothing; the model's tool calls, through MCP servers, get their results and form
-memories; and the app's peak memory doesn't grow with the contexts it streams.
+memories; the app's peak memory doesn't grow with the contexts it streams; and in a window too
+small for a memory no merge has taken on each layer and the tail, the oldest of them merge across
+layers (lifted), and every turn still gets its reply.
 
-The three parts (the chat, the tool calls, the large contexts) run at once, in processes of their
-own, each with its own mock; the first to fail stops the rest.
+The five parts (the chat, the tool calls, the large contexts, the companion, the lifted memories)
+run at once, in processes of their own, each with its own mock; the first to fail stops the rest.
 
     python3 tests/test_app.py [turns]
 """
@@ -52,6 +54,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
+LIFTED = 2300   # lifted's window: without lifting, its context stops fitting by the 31st turn
 seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': [], 'planned': {}, 'passbacks': 0}
 PONDERED = 'I weighed what this stretch should keep. '   # what a memory's summarizer thinks first: never sent again
 
@@ -430,6 +433,56 @@ def chat(port, name, turns, start, window=WINDOW):
         if state['prompt'] != seen['prompts'][name]:                         # the last reply's, though memories' requests come after it
             raise SystemExit(f'turn {t}: the last prompt {state["prompt"]}, the last reply\'s {seen["prompts"][name]}')
     return state
+
+
+def misgrouped(state, layers) -> str | None:
+    """Why a session's merges aren't as memory formation makes them, if they aren't: each the fewest
+    memories, at least two, that hold a chunk's tokens, of the layer below, or, lifted, of runs of
+    several layers below, the highest first, side by side; each layer's merged memories its oldest,
+    each merged once; each memory covering the chunks its members do."""
+    target, covers, taken = state['settings']['config']['target_chunk_tokens'], state['covers'], set()
+    chunks = lambda level, j: (j, j + 1) if level == 1 else tuple(covers[level - 2][j])
+    for n in range(2, len(layers)):
+        for p, m in enumerate(layers[n]):
+            runs = m['merges'] if isinstance(m['merges'][0], list) else [[n - 1, *m['merges']]]
+            members = [(level, j) for level, a, b in runs for j in range(a, b + 1)]
+            tokens, spans = [layers[level][j]['tokens'] for level, j in members], [chunks(*node) for node in members]
+            if runs[0][0] != n - 1 or [r[0] for r in runs] != sorted({r[0] for r in runs}, reverse=True) or len(members) < 2 or sum(tokens) < target \
+                    or sum(tokens[:-1]) >= target or any(a[1] != b[0] for a, b in zip(spans, spans[1:])) or tuple(covers[n - 2][p]) != (spans[0][0], spans[-1][1]) or taken & set(members):
+                return f'L{n} {p} merged {runs}, memories of {tokens} tokens (a chunk {target}) covering {spans}, as L{n} covers {covers[n - 2][p]}'
+            taken |= set(members)
+    for level in range(1, len(layers)):
+        if (merged := sorted(j for k, j in taken if k == level)) != list(range(len(merged))):
+            return f'L{level}\'s merged memories {merged[:12]} are not its oldest'
+    return None
+
+
+def lifted(tls, ca) -> str:
+    """A session whose memories are large beside its chunks, so they merge two at a time, a layer
+    forms every few turns and each keeps a memory no merge has taken: in a window too small for those
+    and the tail, the oldest of them merge across layers (lifted), and every turn still gets its
+    reply."""
+    port, root, mock_port = free_port(), tempfile.mkdtemp(), free_port()
+    mock = serve(mock_port, tls)
+    app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--no-bash', '--no-open'], stderr=subprocess.PIPE, text=True)
+    try:
+        for _ in range(100):
+            try:
+                call(port, '/api/sessions')
+                break
+            except OSError:
+                time.sleep(0.05)
+        configure(root, f'https://localhost:{mock_port}', LIFTED, 400, 200)
+        call(port, '/api/sessions', {'name': 'lifted'})
+        state = chat(port, 'lifted', 60, 0, LIFTED)
+        layers = [call(port, f'/api/s/lifted/layer/{n}?from=0') for n in range(len(state['layers']))]
+        lifts = [(n, m['merges']) for n in range(2, len(layers)) for m in layers[n] if isinstance(m['merges'][0], list)]
+        if (why := misgrouped(state, layers)) or not lifts:
+            raise SystemExit(why or f'no memories lifted in a window of {LIFTED}: layers {state["layers"]}, frontier {state["frontier"]}')
+        return f'{len(lifts)} lifted merges (the first L{lifts[0][0]} of {lifts[0][1]}), layers {state["layers"]}, frontier {state["frontier"]}'
+    finally:
+        app.terminate()
+        mock.shutdown()
 
 
 def streamed_large(tls, ca) -> str:
@@ -963,14 +1016,8 @@ def chatted(turns, tls, ca, baseline) -> str:
         levels = {level for level, _ in state['frontier'] or []}
         if len(state['layers']) < 3 or not levels - {0}:
             raise SystemExit(f'memories did not form or show: layers {state["layers"]}, frontier {state["frontier"]}')
-        target = state['settings']['config']['target_chunk_tokens']    # each merge: the fewest of the layer below, at least two, that hold a chunk's tokens, run after run
-        for n in range(2, len(state['layers'])):
-            runs = [tuple(m['merges']) for m in layers[n]]
-            held = lambda a, b: sum(m['tokens'] for m in layers[n - 1][a:b + 1])
-            covered = [(a, b + 1) if n == 2 else (state['covers'][n - 3][a][0], state['covers'][n - 3][b][1]) for a, b in runs]
-            if [a for a, _ in runs] != [0] + [b + 1 for _, b in runs[:-1]] or any(b <= a or held(a, b) < target or held(a, b - 1) >= target for a, b in runs) \
-                    or [tuple(c) for c in state['covers'][n - 2]] != covered:
-                raise SystemExit(f'L{n} merged {runs} of memories of {[m["tokens"] for m in layers[n - 1]][:12]} tokens (a chunk {target}), covering {state["covers"][n - 2][:6]}')
+        if why := misgrouped(state, layers):
+            raise SystemExit(why)
         call(port, '/api/s/main/settings', {'system': 'You are being tested.'})
         if (made := call(port, '/api/s/main/fork', {'at': 20, 'name': 'branch'})).get('messages') != 21:   # the fork as the page then shows it
             raise SystemExit(f'the fork answered {str(made)[:80]}, not its state with 21 messages')
@@ -1177,7 +1224,7 @@ def main(turns=60):
     forked = multiprocessing.get_context('fork')
     done, baseline = forked.Queue(), forked.Queue()
     parts = {'chat': lambda: chatted(turns, (cert, key), ca, baseline), 'tools': lambda: tooled((cert, key), ca, baseline), 'large': lambda: streamed_large((cert, key), ca),
-             'companion': lambda: accompanied((cert, key), ca)}
+             'companion': lambda: accompanied((cert, key), ca), 'lifted': lambda: lifted((cert, key), ca)}
     running = [forked.Process(target=part, args=(name, run, done)) for name, run in parts.items()]
     summaries, totals, failure = {}, {'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0}, None
     try:
@@ -1202,7 +1249,7 @@ def main(turns=60):
         print(failure)
         return 1
     print(f'{totals["chat"]} chat turns and {totals["memory"]} memory requests; {summaries["chat"]}; {totals["bytes"] // 1024} KB of requests streamed '
-          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}')
+          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}')
     return 0
 
 

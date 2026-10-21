@@ -5,7 +5,13 @@
 //!   - else the next merge at the lowest level: layer n+1's next entry, once the entries of layer n no
 //!     memory has merged yet have closed a group (closed): the fewest, at least two, that hold
 //!     target_chunk_tokens, as chunks close; or under merge_by_count, as the library merges, k of
-//!     them (k = merge_threshold). A merged memory's record says what it merged (Recorded).
+//!     them (k = merge_threshold). A merged memory's record says what it merged (Recorded);
+//!   - else, when the last compile couldn't fold enough and not under merge_by_count, a lifted merge,
+//!     which the library doesn't make (it merges only within a layer). Each layer keeps the entries
+//!     no memory has merged, short of a group, and with enough layers those and the tail outgrow the
+//!     window, with nothing left to fold. A lifted merge takes the oldest of them past the top
+//!     layer's, across layers, the fewest, at least two, that hold target_chunk_tokens, into a memory
+//!     one layer above the highest it takes, so it waits with that layer's (lifted).
 //!
 //! A memory asks the summarizer what the agent saw before the stretch, replayed (a recall pair for each
 //! unmerged memory the recall budget fits, newest first), then the stretch and an instruction. A
@@ -21,7 +27,7 @@
 
 use crate::{blocks::{reasoning, At, Block}, chunking::priced, config::Config, emit::{answer, recall_tokens, recalled, Reader}, js::{digest, is_js_space, js_len, js_round, js_trim}};
 use crate::{json::{sparse, Json, Value}, obj, planner::{chunks, Fixed, Groups, Node}, store::Session, turns::{cap_images, normalize, say, strip_reasoning, Turn, LABEL}};
-use std::{cell::RefCell, collections::HashMap, ops::Range};
+use std::{cell::RefCell, collections::HashMap};
 
 const MARKER: &str = "System: You will soon form a new memory, get ready. The messages that follow are the slice of \
 recent experience you are about to compress. After them, write the memory in your own voice.";
@@ -81,7 +87,7 @@ pub const INTERRUPTED: &str = "interrupted";
 /// call or none may be tried; the error a failed call gave, if one did.
 pub fn drive(session: &Session, host: &mut dyn Host, cfg: &Config) -> Option<String> {
     loop {
-        let (level, p) = due(session, cfg).filter(|&target| !blocked(session, target, cfg))?;
+        let ((level, p), members) = due(session, cfg).filter(|&(target, _)| !blocked(session, target, cfg))?;
         if level == 1
             && let Some(stub) = quiet(session, p, cfg)
         {
@@ -89,7 +95,7 @@ pub fn drive(session: &Session, host: &mut dyn Host, cfg: &Config) -> Option<Str
             continue;
         }
         // an L1 waits while it carries tool blocks and the host has declared no tools
-        let request = if level == 1 { l1_request(session, p, host, cfg)? } else { merge_request(session, level, p, host, cfg) };
+        let request = if level == 1 { l1_request(session, p, host, cfg)? } else { merge_request(session, level, &members, host, cfg) };
         let (outcome, error) = match host.complete(&request, &mut Reader::new(session, true)) {
             Err(error) if error == INTERRUPTED => return None,
             Err(error) => ("retry", Some(error)),
@@ -97,7 +103,7 @@ pub fn drive(session: &Session, host: &mut dyn Host, cfg: &Config) -> Option<Str
             Ok(response) => match usable(&response) {
                 None => ("retry", None),
                 Some(text) => {
-                    session.append(&format!("layer{level}"), written(session, level, p, &request, &response, text, cfg));
+                    session.append(&format!("layer{level}"), written(session, level, &members, &request, &response, text, cfg));
                     return None;
                 }
             },
@@ -107,21 +113,26 @@ pub fn drive(session: &Session, host: &mut dyn Host, cfg: &Config) -> Option<Str
     }
 }
 
-/// The memory to form next: the next L1, else the lowest level's next merge.
-fn due(session: &Session, cfg: &Config) -> Option<(u64, u64)> {
+/// The memory to form next, and what it holds: the next L1 (its chunk), else the lowest level's next
+/// merge, else, when the last compile couldn't fold enough, a lifted merge.
+fn due(session: &Session, cfg: &Config) -> Option<(Node, Vec<Node>)> {
     let (groups, count) = (Recorded::new(session, cfg), |n: u64| session.count(&format!("layer{n}")));
-    let holdback = if session.last("compiles").is_some_and(|c| c["escalated"] == true) { 0 } else { cfg.l1_holdback_chunks };
-    let merge = || (1..).take_while(|&n| count(n) >= 2).find(|&n| closed(session, n, &groups, cfg).is_some()).map(|n| (n + 1, count(n + 1)));
-    (count(1) < count(0).saturating_sub(holdback)).then(|| (1, count(1))).or_else(merge)
+    let escalated = session.last("compiles").is_some_and(|c| c["escalated"] == true);
+    let holdback = if escalated { 0 } else { cfg.l1_holdback_chunks };
+    let next = |members: Vec<Node>| ((members[0].0 + 1, count(members[0].0 + 1)), members);
+    let merge = || (1..).take_while(|&n| count(n) > 0).find_map(|n| closed(session, n, &groups, cfg)).map(next);
+    let lift = || (escalated && !cfg.merge_by_count).then(|| lifted(session, cfg)).flatten().map(next);
+    (count(1) < count(0).saturating_sub(holdback)).then(|| next(vec![(0, count(1))])).or_else(merge).or_else(lift)
 }
 
 /// The session's memories as their records group them: a merged memory's `merges`, the first and
-/// last entry it merged of the layer below; one without merged by count (merge_by_count, as the
-/// library does), its group of merge_threshold. Records never change, so what it reads it keeps.
+/// last entry it merged of the layer below, or, lifted, [layer, first, last] for each layer's run it
+/// merged, the highest first; one without merged by count (merge_by_count, as the library does), its
+/// group of merge_threshold. Records never change, so what it reads it keeps.
 pub struct Recorded<'s> {
     session: &'s Session,
     k: u64,
-    read: RefCell<HashMap<Node, Range<u64>>>,
+    read: RefCell<HashMap<Node, Vec<Node>>>,
 }
 
 impl<'s> Recorded<'s> {
@@ -131,12 +142,17 @@ impl<'s> Recorded<'s> {
 }
 
 impl Groups for Recorded<'_> {
-    fn members(&self, (n, p): Node) -> Range<u64> {
+    fn members(&self, (n, p): Node) -> Vec<Node> {
         if let Some(read) = self.read.borrow().get(&(n, p)) {
             return read.clone();
         }
         let merges = self.session.read(&format!("layer{n}"), p)["merges"].clone();
-        let members = match merges.arr() { [first, last] => first.u64()..last.u64() + 1, _ => Fixed(self.k).members((n, p)) };
+        let run = |level: u64, first: &Value, last: &Value| (first.u64()..=last.u64()).map(move |j| (level, j));
+        let members = match merges.arr() {
+            [] => Fixed(self.k).members((n, p)),
+            [first, last] if !first.is_array() => run(n - 1, first, last).collect(),
+            runs => runs.iter().flat_map(|r| run(r.arr()[0].u64(), &r.arr()[1], &r.arr()[2])).collect(),
+        };
         self.read.borrow_mut().insert((n, p), members.clone());
         members
     }
@@ -145,41 +161,53 @@ impl Groups for Recorded<'_> {
         let (mut low, mut high) = (0, self.session.count(&format!("layer{}", n + 1))); // to the first group that starts after j
         while low < high {
             let mid = (low + high) / 2;
-            if self.members((n + 1, mid)).start <= j { low = mid + 1 } else { high = mid }
+            if self.members((n + 1, mid))[0].1 <= j { low = mid + 1 } else { high = mid }
         }
-        (low > 0 && self.members((n + 1, low - 1)).start == j).then_some((n + 1, low - 1))
+        (low > 0 && self.members((n + 1, low - 1))[0].1 == j).then(|| (n + 1, low - 1))
     }
 }
 
-/// The first entry of layer n no memory of layer n+1 has merged.
+/// The first entry of layer n no memory has merged: the first past the chunks the layers above cover,
+/// since each merge takes the oldest entries no memory has merged (a lifted one, of several layers).
 fn open(session: &Session, n: u64, groups: &Recorded) -> u64 {
-    let merged = session.count(&format!("layer{}", n + 1));
-    if merged == 0 { 0 } else { groups.members((n + 1, merged - 1)).end }
+    let count = |m: u64| session.count(&format!("layer{m}"));
+    let covered = (n + 1..).take_while(|&m| count(m) > 0).map(|m| chunks((m, count(m) - 1), groups).end).max().unwrap_or(0);
+    let (mut low, mut high) = (0, count(n));
+    while low < high {
+        let mid = (low + high) / 2;
+        if chunks((n, mid), groups).start < covered { low = mid + 1 } else { high = mid }
+    }
+    low
 }
 
 /// The group layer n+1's next memory merges, once it has closed: of the entries of layer n no memory
 /// has merged, the fewest, at least two, that hold target_chunk_tokens; under merge_by_count,
 /// merge_threshold of them.
-fn closed(session: &Session, n: u64, groups: &Recorded, cfg: &Config) -> Option<Range<u64>> {
+fn closed(session: &Session, n: u64, groups: &Recorded, cfg: &Config) -> Option<Vec<Node>> {
     let (start, count) = (open(session, n, groups), session.count(&format!("layer{n}")));
     if cfg.merge_by_count {
-        return (start + cfg.merge_threshold <= count).then(|| start..start + cfg.merge_threshold);
+        return (start + cfg.merge_threshold <= count).then(|| (start..start + cfg.merge_threshold).map(|j| (n, j)).collect());
     }
     let mut held = 0.0;
     let full = |i: &u64| {
         held += session.read(&format!("layer{n}"), *i)["tokens"].as_f64().unwrap();
         *i > start && held >= cfg.target_chunk_tokens
     };
-    (start..count).find(full).map(|last| start..last + 1)
+    (start..count).find(full).map(|last| (start..=last).map(|j| (n, j)).collect())
 }
 
-/// The entries of layer level-1 that layer level's entry p merged, or, the next, merges.
-fn merged(session: &Session, (level, p): Node, groups: &Recorded, cfg: &Config) -> Range<u64> {
-    if p < session.count(&format!("layer{level}")) {
-        groups.members((level, p))
-    } else {
-        closed(session, level - 1, groups, cfg).expect("its group has closed")
-    }
+/// The group a lifted memory merges: of the memories no memory has merged, oldest first, past the top
+/// layer's, the fewest, at least two, that hold target_chunk_tokens.
+fn lifted(session: &Session, cfg: &Config) -> Option<Vec<Node>> {
+    let waiting = unmerged(session, u64::MAX, cfg);
+    let top = waiting.first()?.0.0;
+    let below: Vec<(Node, f64)> = waiting.into_iter().skip_while(|&((level, _), _)| level == top).collect();
+    let mut held = 0.0;
+    let last = below.iter().enumerate().position(|(i, &(_, tokens))| {
+        held += tokens;
+        i > 0 && held >= cfg.target_chunk_tokens
+    })?;
+    Some(below[..=last].iter().map(|&(node, _)| node).collect())
 }
 
 /// Memory formation stops at a refusal: nothing is tried after one, so it stays the attempts log's
@@ -193,7 +221,7 @@ fn blocked(session: &Session, (level, p): (u64, u64), cfg: &Config) -> bool {
 
 /// The stub for a chunk of text blocks only under min_chunk_chars of trimmed text.
 fn quiet(session: &Session, p: u64, cfg: &Config) -> Option<Value> {
-    let (first, last) = span(session, 1, p, cfg);
+    let (first, last) = span(session, &[(0, p)], cfg);
     let text = |b: &Value| (b.kind() == "text").then(|| js_len(js_trim(b["text"].as_str().unwrap_or(""))));
     let chars: usize = session.span("messages", first, last).map(|m| m["content"].arr().iter().map(text).sum::<Option<usize>>()).sum::<Option<usize>>()?;
     (chars < cfg.min_chunk_chars).then(|| memory(first, last, &QUIET.replace("{n}", &(last - first + 1).to_string()), Value::Null, 40.0, Value::Null, cfg))
@@ -202,27 +230,34 @@ fn quiet(session: &Session, p: u64, cfg: &Config) -> Option<Value> {
 /// compressChunkHierarchical's request for chunk p, or None to defer it while the host has declared
 /// no tools and the request carries tool blocks, which a provider takes only with their tools.
 fn l1_request(session: &Session, p: u64, host: &dyn Host, cfg: &Config) -> Option<Request> {
-    let (first, last) = span(session, 1, p, cfg);
+    let (first, last) = span(session, &[(0, p)], cfg);
     let task = [vec![say(MARKER)], raw(session, first, last), vec![say(&INSTRUCTION.replace("{target}", &number(cfg.summary_target_tokens)))]];
     let request = ask(session, first, task.concat(), host, cfg);
     let tools_used = request.messages.iter().flat_map(|t| &t.content).any(|b| b.kind == "tool_use" || b.kind == "tool_result");
     (host.tools().is_some_and(|tools| !tools.arr().is_empty()) || !tools_used).then_some(request)
 }
 
-/// executeMerge's request for layer `level`'s entry p: the run one level deeper (an L1 run's
-/// messages raw, a higher run's children as recall pairs), then the merge instruction.
-fn merge_request(session: &Session, level: u64, p: u64, host: &dyn Host, cfg: &Config) -> Request {
-    let (groups, below, (first, last)) = (Recorded::new(session, cfg), level - 1, span(session, level, p, cfg));
-    let (mut shown, seen) = if below == 1 {
-        (raw(session, first, last), "the slices of recent experience above (raw conversation)".to_string())
-    } else {
-        let run = merged(session, (level, p), &groups, cfg); // its entries of layer below, then theirs
-        let children: Vec<Node> = (groups.members((below, run.start)).start..groups.members((below, run.end - 1)).end).map(|id| (below - 1, id)).collect();
-        (pairs(session, &children, cfg), format!("the L{} memories above", below - 1))
+/// executeMerge's request for a memory of layer `level` that merges `members`: what they hold, one
+/// level deeper (an L1's chunk's messages raw, a higher memory's members as recall pairs), then the
+/// merge instruction.
+fn merge_request(session: &Session, level: u64, members: &[Node], host: &dyn Host, cfg: &Config) -> Request {
+    let groups = Recorded::new(session, cfg);
+    let deeper: Vec<Node> = members.iter().flat_map(|&(n, id)| if n == 1 { vec![(0, id)] } else { groups.members((n, id)) }).collect();
+    let mut shown: Vec<Turn> = deeper.chunk_by(|a, b| (a.0 == 0) == (b.0 == 0)).flat_map(|run| match run[0].0 {
+        0 => { let (first, last) = span(session, run, cfg); raw(session, first, last) }
+        _ => pairs(session, run, cfg),
+    }).collect();
+    let mut names: Vec<String> = deeper.iter().filter(|&&(n, _)| n > 0).map(|&(n, _)| format!("L{n}")).collect();
+    names.dedup();
+    let names = match names.split_last() { Some((last, [])) => last.clone(), Some((last, rest)) => format!("{} and {last}", rest.join(", ")), None => String::new() };
+    let seen = match (names.is_empty(), deeper.iter().any(|&(n, _)| n == 0)) {
+        (true, _) => "the slices of recent experience above (raw conversation)".to_string(),
+        (false, false) => format!("the {names} memories above"),
+        (false, true) => format!("the {names} memories and the slices of recent experience (raw conversation) above"),
     };
     let instruction = MERGE_INSTRUCTION.replace("{seen}", &seen).replace("{level}", &level.to_string()).replace("{target}", &number(cfg.summary_target_tokens));
     shown.push(say(&instruction));
-    ask(session, first, shown, host, cfg)
+    ask(session, span(session, members, cfg).0, shown, host, cfg)
 }
 
 /// The request for `task`: recall pairs, oldest first, for the newest unmerged memories before
@@ -308,32 +343,30 @@ fn strip_thinking(text: &str) -> &str {
 
 /// The memory a reply wrote: its text, its reasoning and text blocks if it reasoned
 /// (captureResponseContent), its output tokens (else chars/3), the hash of its request as planned,
-/// and, merged by tokens, the first and last entry it merged.
-fn written(session: &Session, level: u64, p: u64, request: &Request, response: &Value, text: String, cfg: &Config) -> Value {
-    let ((first, last), content) = (span(session, level, p, cfg), response["content"].arr());
+/// and, merged by tokens, what it merged: the first and last entry of the layer below, or, lifted,
+/// [layer, first, last] for each layer's run.
+fn written(session: &Session, level: u64, members: &[Node], request: &Request, response: &Value, text: String, cfg: &Config) -> Value {
+    let ((first, last), content) = (span(session, members, cfg), response["content"].arr());
     let out = response["usage"]["outputTokens"].as_f64();
     let blocks = content.iter().any(|b| reasoning(b.kind())).then(|| content.iter().filter(|b| reasoning(b.kind()) || b.kind() == "text").cloned().collect::<Vec<_>>());
     let tokens = out.filter(|&o| o > 0.0).unwrap_or_else(|| (js_len(&text) as f64 / 3.0).ceil());
     let provenance = obj! {"stopReason" => "end_turn", "requestHash" => digest(&request.value(|b| b.at.value())), "model" => cfg.compression_model.as_str()};
     let mut record = memory(first, last, &text, blocks.into(), tokens, provenance, cfg);
     if level >= 2 && !cfg.merge_by_count {
-        let run = merged(session, (level, p), &Recorded::new(session, cfg), cfg);
-        record["merges"] = vec![run.start, run.end - 1].into();
+        let runs: Vec<&[Node]> = members.chunk_by(|a, b| a.0 == b.0).collect();
+        record["merges"] = match runs.as_slice() {
+            [run] => vec![run[0].1, run[run.len() - 1].1].into(),
+            runs => Value::Array(runs.iter().map(|run| vec![run[0].0, run[0].1, run[run.len() - 1].1].into()).collect()),
+        };
     }
     record
 }
 
-/// The first and last message of the stretch layer `level`'s entry p covers (or, the next, will):
-/// from its first chunk's to its last's.
-fn span(session: &Session, level: u64, p: u64, cfg: &Config) -> (u64, u64) {
+/// The first and last message of the stretch `members` cover: from its first chunk's to its last's.
+fn span(session: &Session, members: &[Node], cfg: &Config) -> (u64, u64) {
     let groups = Recorded::new(session, cfg);
-    let covered = if level <= 1 {
-        p..p + 1
-    } else {
-        let run = merged(session, (level, p), &groups, cfg);
-        chunks((level - 1, run.start), &groups).start..chunks((level - 1, run.end - 1), &groups).end
-    };
-    (session.read("layer0", covered.start)["first"].u64(), session.read("layer0", covered.end - 1)["last"].u64())
+    let (first, last) = (chunks(members[0], &groups).start, chunks(members[members.len() - 1], &groups).end - 1);
+    (session.read("layer0", first)["first"].u64(), session.read("layer0", last)["last"].u64())
 }
 
 fn memory(first: u64, last: u64, text: &str, blocks: Value, tokens: f64, provenance: Value, cfg: &Config) -> Value {
@@ -350,7 +383,8 @@ fn number(n: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drive::append;
+    use crate::{drive::{append, current}, emit::select};
+    use serde_json::json;
 
     /// A host that gives every request the same answer, and counts them.
     struct Answering(Result<Value, String>, usize);
@@ -360,6 +394,23 @@ mod tests {
             self.1 += 1;
             self.0.clone()
         }
+    }
+
+    /// Messages of 60 words, the speakers taking turns, until `chunks` more chunks have closed, each
+    /// memory due forming as they do if `form`.
+    fn grow(session: &Session, host: &mut Answering, chunks: u64, form: bool, cfg: &Config) {
+        let goal = session.count("layer0") + chunks;
+        while session.count("layer0") < goal {
+            let said = session.count("messages");
+            append(session, &obj! {"participant" => if said % 2 == 0 { "user" } else { "assistant" }, "content" => vec![obj! {"type" => "text", "text" => format!("message {said}: {}", "words ".repeat(60))}]}, cfg);
+            while form && due(session, cfg).is_some() {
+                assert_eq!(drive(session, host, cfg), None);
+            }
+        }
+    }
+
+    fn memory_of_30_tokens() -> Answering {
+        Answering(Ok(obj! {"stopReason" => "end_turn", "content" => vec![obj! {"type" => "text", "text" => "a memory"}], "usage" => obj! {"outputTokens" => 30.0}}), 0)
     }
 
     #[test]
@@ -384,19 +435,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let session = Session::open(&dir);
         let by_count = Config { target_chunk_tokens: 50.0, recent_window_tokens: 50.0, l1_holdback_chunks: 0, merge_threshold: 4, merge_by_count: true, ..Config::default() };
-        let reply = obj! {"stopReason" => "end_turn", "content" => vec![obj! {"type" => "text", "text" => "a memory"}], "usage" => obj! {"outputTokens" => 30.0}};
-        let mut host = Answering(Ok(reply), 0);
-        let mut said = 0;
-        let mut grow = |chunks: u64, cfg: &Config| {
-            let goal = session.count("layer0") + chunks;
-            while session.count("layer0") < goal {
-                append(&session, &obj! {"participant" => if said % 2 == 0 { "user" } else { "assistant" }, "content" => vec![obj! {"type" => "text", "text" => format!("message {said}: {}", "words ".repeat(60))}]}, cfg);
-                said += 1;
-                while due(&session, cfg).is_some() {
-                    assert_eq!(drive(&session, &mut host, cfg), None);
-                }
-            }
-        };
+        let mut host = memory_of_30_tokens();
+        let mut grow = |chunks: u64, cfg: &Config| grow(&session, &mut host, chunks, true, cfg);
         let count = |n: u64| session.count(&format!("layer{n}"));
         let merges = |n: u64| (0..count(n)).map(|p| session.read(&format!("layer{n}"), p)["merges"].clone()).collect::<Vec<_>>();
         let runs = |n: u64, from: usize| merges(n)[from..].iter().map(|m| (m.arr()[0].u64(), m.arr()[1].u64())).collect::<Vec<_>>();
@@ -408,7 +448,8 @@ mod tests {
         grow(5, &by_tokens);
         assert_eq!((runs(2, 2), runs(3, 0)), (vec![(8, 9), (10, 11), (12, 13), (14, 15)], vec![(0, 1), (2, 3), (4, 5)]));
         let groups = Recorded::new(&session, &by_tokens);
-        assert_eq!((groups.members((2, 1)), groups.members((3, 1)), groups.parent((2, 2)), groups.parent((2, 3))), (4..8, 2..4, Some((3, 1)), None));
+        let nodes = |level: u64, ids: std::ops::Range<u64>| ids.map(|j| (level, j)).collect::<Vec<Node>>();
+        assert_eq!((groups.members((2, 1)), groups.members((3, 1)), groups.parent((2, 2)), groups.parent((2, 3))), (nodes(1, 4..8), nodes(2, 2..4), Some((3, 1)), None));
         assert_eq!((chunks((3, 0), &groups), chunks((3, 1), &groups)), (0..8, 8..12));
         let l3 = session.read("layer3", 1);
         assert_eq!((l3["first"].u64(), l3["last"].u64()), (session.read("layer0", 8)["first"].u64(), session.read("layer0", 11)["last"].u64()));
@@ -417,6 +458,53 @@ mod tests {
         let before = count(2) as usize;
         grow(4, &tiny);
         assert_eq!(runs(2, before), [(16, 17), (18, 19)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_context_that_cant_fold_enough_lifts_the_oldest_memories() {
+        let dir = std::env::temp_dir().join(format!("connectome-lifted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let session = Session::open(&dir);
+        let cfg = Config { target_chunk_tokens: 50.0, recent_window_tokens: 50.0, l1_holdback_chunks: 0, ..Config::default() };
+        let mut host = memory_of_30_tokens();
+        let count = |n: u64| session.count(&format!("layer{n}"));
+        // memories of 30 tokens merge two at a time, so eleven chunks leave L4 0, L2 4 and L1 10 unmerged
+        grow(&session, &mut host, 11, true, &cfg);
+        assert_eq!((1..6).map(count).collect::<Vec<_>>(), [11, 5, 2, 1, 0]);
+        assert_eq!(due(&session, &cfg), None);
+        // a window nothing fits: the compile folds all it can and escalates
+        let floor = || select(&session, 1.0, current(&session), &cfg).expect_err("over the window").actual;
+        let before = floor();
+        assert_eq!(due(&session, &Config { merge_by_count: true, ..cfg.clone() }), None);   // as the library: nothing to merge
+        assert_eq!(due(&session, &cfg), Some(((3, 2), vec![(2, 4), (1, 10)])));   // past the top layer's, into one above the highest
+        assert_eq!(lifted(&session, &Config { target_chunk_tokens: 10.0, ..cfg.clone() }), Some(vec![(2, 4), (1, 10)]));   // two at least
+        // its request: what each merged, one level deeper (L2 4's L1s as recall pairs, L1 10's chunk raw)
+        let request = merge_request(&session, 3, &[(2, 4), (1, 10)], &host, &cfg).value(|b| b.at.value()).to_string();
+        let at = |needle: &str| request.find(needle).unwrap_or_else(|| panic!("{needle} is not in {request}"));
+        let chunk = format!("[\"messages\",{},0]", session.read("layer0", 10)["first"].u64());
+        let order = [at("Recall memory L1-8."), at("Recall memory L1-9."), at(&chunk), at("the L1 memories and the slices of recent experience (raw conversation) above")];
+        assert!(order.is_sorted() && at("a single L3 memory") > order[3], "{request}");
+        assert_eq!(drive(&session, &mut host, &cfg), None);
+        assert_eq!(session.read("layer3", 2)["merges"], json!([[2, 4, 4], [1, 10, 10]]));
+        let groups = Recorded::new(&session, &cfg);
+        assert_eq!((groups.members((3, 2)), chunks((3, 2), &groups), groups.parent((2, 4))), (vec![(2, 4), (1, 10)], 8..11, Some((3, 2))));
+        let after = floor();
+        assert!(after < before, "lifting freed nothing: {before} tokens, then {after}");
+        assert!(select(&session, after, current(&session), &cfg).is_ok());
+        assert_eq!((session.last("compiles").unwrap()["frontier"].clone(), due(&session, &cfg)), (json!([[4, 0], [3, 2]]), None));
+        // escalated again, two chunks on: their L1s and the merge they close come first, from the first
+        // L1 the lift didn't take; then a lift, which closes a merge of the top layer's
+        grow(&session, &mut host, 2, false, &cfg);
+        floor();
+        let mut formed = vec![];
+        while let Some(memory) = due(&session, &cfg) {
+            formed.push(memory);
+            assert_eq!(drive(&session, &mut host, &cfg), None);
+        }
+        let l1 = |p: u64| ((1, p), vec![(0, p)]);
+        assert_eq!(formed, [l1(11), l1(12), ((2, 5), vec![(1, 11), (1, 12)]), ((4, 1), vec![(3, 2), (2, 5)]), ((5, 0), vec![(4, 0), (4, 1)])]);
+        assert_eq!((session.read("layer2", 5)["merges"].clone(), Recorded::new(&session, &cfg).parent((1, 11))), (json!([11, 12]), Some((2, 5))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
