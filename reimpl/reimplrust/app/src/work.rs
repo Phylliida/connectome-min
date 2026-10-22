@@ -10,7 +10,7 @@
 
 use crate::{api::brief, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
-use connectome::{memory::{Host, Request, INTERRUPTED}, store::Session};
+use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, store::Session};
 use std::{cell::RefCell, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
 
 /// A message from `who` of `text`, as the log keeps it.
@@ -56,6 +56,16 @@ impl Setup {
 struct Summarizer<'a> {
     setup: &'a Setup,
     stopped: tools::Stopped<'a>,
+    ended: Option<(String, f64)>, // how its last reply ended, and the tokens it had
+}
+
+/// What forming memories came to: one formed (or a stub), none could, a reply without a memory in it or
+/// a refusal (why), or a call that failed (why).
+enum Formed {
+    Memory,
+    Nothing,
+    Unused(String),
+    Failed(String),
 }
 
 impl Host for Summarizer<'_> {
@@ -66,6 +76,7 @@ impl Host for Summarizer<'_> {
         let none = request.tools.as_ref().map(|_| obj! {"type" => "none"});
         let head = sparse(obj! {"model" => model.as_str(), "max_tokens" => request.max_tokens, "tools" => request.tools.clone(), "tool_choice" => none});
         let reply = self.setup.llm.messages(head, &request.messages, reader, |_| !(self.stopped)(), self.stopped, |_, _| {});
+        self.ended = reply.as_ref().ok().map(|r| (r["stopReason"].as_str().unwrap_or("nothing").to_string(), request.max_tokens));
         if (self.stopped)() { Err(INTERRUPTED.into()) } else { reply }
     }
 }
@@ -92,9 +103,10 @@ fn refused(r: &Refusal, setup: &Setup) -> String {
         return format!("{} ({:.0} tokens, of {:.0})", r.stage, r.actual, r.budget);
     }
     let ((memories, remembered), (unformed, waiting)) = (r.memories, r.unformed);
+    let (memories, unformed) = (if memories == 1 { "1 memory".into() } else { format!("{memories} memories") }, if unformed == 1 { "1 chunk".into() } else { format!("{unformed} chunks") });
     format!("The context doesn't fit: folded as far as it can be, it takes {:.0} tokens, and the window leaves it {:.0} ({:.0}, less {:.0} for the reply and {:.0} for the tools and system prompt). \
-        It holds {memories} memories ({remembered:.0} tokens), {unformed} chunks raw that have no memory yet ({waiting:.0}), {:.0} tokens of messages not yet in a chunk (one closes at config.target_chunk_tokens, now {:.0}, of text), \
-        and the {:.0} most recent kept raw (config.recent_window_tokens, now {:.0}). Raise the window, lower the reply reserve, or make chunks or the recent window smaller.",
+        It holds {memories} ({remembered:.0} tokens), {unformed} raw that have no memory yet ({waiting:.0}), {:.0} tokens of messages not yet in a chunk (one closes at config.target_chunk_tokens, now {:.0}, of text), \
+        and the {:.0} most recent kept raw (the raw tail, config.recent_window_tokens, now {:.0}). Raise the window, lower the reply reserve, or make chunks or the recent window smaller.",
         r.actual, r.budget, s.window, s.reserve, setup.overhead, r.open, s.config.target_chunk_tokens, r.tail, s.config.recent_window_tokens)
 }
 
@@ -173,7 +185,7 @@ impl Worker<'_> {
         let auto = self.app.ask_session(self.name, Msg::Ended);
         self.event(Event::End(ended.clone().err()));
         self.hand_over(start, ended, auto);
-        if let Ok(setup) = Setup::new(self.app, self.name) { let _ = self.form(&setup); }
+        if let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup); }
     }
 
     /// A chat turn: the log mended if the server stopped in a step (mend), its message joins the log,
@@ -274,12 +286,15 @@ impl Worker<'_> {
         // memories it waits for form at once, as many as it takes: while one forms, and while memories can make
         // the room (the messages no chunk holds yet and the tail fit without them); if they can't, it goes as it
         // is, if the window takes it
+        // (a reply without a memory is tried again, attempt_limit times since the log grew, and then a lift goes
+        // past it; a call that fails would fail again)
         let mut failed = None;
         while let Err(r) = &compiled && r.actual > r.budget && r.open + r.tail <= r.budget {
             match self.form(&setup) {
-                Ok(true) => compiled = select(s, &fit, current(s), cfg),
-                Ok(false) => break,
-                Err(why) => {
+                Formed::Memory => compiled = select(s, &fit, current(s), cfg),
+                Formed::Unused(why) => failed = Some(why),
+                Formed::Nothing => break,
+                Formed::Failed(why) => {
                     failed = Some(why);
                     break;
                 }
@@ -289,7 +304,8 @@ impl Worker<'_> {
             compiled = select(s, &Fit { reach: false, ..fit }, current(s), cfg);
         }
         if self.stopped() { return Err(STOPPED.into()) } // before the request
-        let turns = compiled.map_err(|r| refused(&r, &setup) + &failed.map_or(String::new(), |why| format!(" A memory it waits for failed: {why}")))?;
+        let explained = |r: Refusal| refused(&r, &setup) + &failed.or_else(|| stalled(s, cfg)).map_or(String::new(), |why| format!(" A memory it waits for doesn't form: {why}."));
+        let turns = compiled.map_err(explained)?;
         if let Some(fold) = costs::fold(s) { self.event(Event::Fold(fold)) }
         let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.settings.system.as_deref(), "tools" => setup.definitions.clone()});
         let piece = |piece| {
@@ -316,7 +332,7 @@ impl Worker<'_> {
         }
         if self.stopped() { return Err(STOPPED.into()) }
         if !called { return Ok(false) }
-        let _ = self.form(&setup);
+        self.form(&setup);
         Ok(true)
     }
 
@@ -333,14 +349,24 @@ impl Worker<'_> {
         answered.recv_timeout(APPROVAL_WAIT).unwrap_or_else(|_| Err(DENIED.into()))
     }
 
-    /// Memories form (memory::drive), the pages told while they do; none once the turn is stopped:
-    /// whether any formed, or why the one tried failed.
-    fn form(&self, setup: &Setup) -> Result<bool, String> {
-        if self.stopped() { return Ok(false) }
+    /// Memories form (memory::drive), the pages told while they do; none once the turn is stopped.
+    fn form(&self, setup: &Setup) -> Formed {
+        if self.stopped() { return Formed::Nothing }
         self.event(Event::Forming(true));
-        let formed = drive(&self.s, &mut Summarizer { setup, stopped: &|| self.stopped() }, &setup.settings.config);
-        if let Err(error) = &formed {
-            eprintln!("{}: forming a memory: {error}", self.name);
+        let tried = self.s.count("attempts");
+        let mut summarizer = Summarizer { setup, stopped: &|| self.stopped(), ended: None };
+        let formed = match drive(&self.s, &mut summarizer, &setup.settings.config) {
+            Err(why) => Formed::Failed(why),
+            Ok(_) if self.s.count("attempts") > tried => Formed::Unused(match summarizer.ended {
+                Some((ended, _)) if ended == "refusal" => "the summarizer refused to write it, and memories stop forming until that's mended".into(),
+                Some((ended, max)) if ended == "max_tokens" => format!("the summarizer's reply ran out of its {max} tokens, its reasoning included, before it wrote the memory (config.compression_max_tokens)"),
+                ended => format!("the summarizer's reply ended ({}) without a memory in it", ended.map_or("nothing".into(), |(ended, _)| ended)),
+            }),
+            Ok(true) => Formed::Memory,
+            Ok(false) => Formed::Nothing,
+        };
+        if let Formed::Unused(why) | Formed::Failed(why) = &formed {
+            eprintln!("{}: forming a memory: {why}", self.name);
         }
         self.spend(setup, For::Memories);
         self.event(Event::Forming(false));

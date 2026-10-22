@@ -535,6 +535,8 @@ function SessionForm() {
     <label><input name="sandbox" type="checkbox" defaultChecked=${!!s.sandbox} /> bash in the sandbox</label>
     <label>Window <input name="window" type="number" defaultValue=${s.window ?? ''} /></label>
     <label>Reply reserve <input name="reserve" type="number" defaultValue=${s.reserve ?? ''} /></label>
+    <label title="The newest this many tokens of the context stay as they were, never folded">Raw tail
+      <input name="config.recent_window_tokens" type="number" defaultValue=${s.config?.recent_window_tokens ?? ''} /></label>
     <label title="Past this many tokens of prompt, the context folds into memories, waiting for them if it must">Fold above
       <input name="fold_above" type="number" data-optional="1" defaultValue=${s.fold_above ?? ''} placeholder="the window, less the reply" /></label>
     <label title="Folding goes down to this many tokens of prompt, so it doesn't fold again at every step">Fold down to
@@ -849,19 +851,21 @@ function typing(e) {
 }
 
 // a field of the session form saved, alone, into the form's session, unless its file has it already: a
-// number once it is one (an optional one, blank, unset), and a provider with the model its list starts on. The form may have gone, the
+// number once it is one (an optional one, blank, unset), a provider with the model its list starts on, and
+// a field named config.x as config's x. The form may have gone, the
 // page on another session (a browser can tell its field it's left as it goes): then nothing on the page
 // says so.
 async function tune(el) {
   clearTimeout(pausing.get(el));
   const [form, value] = [el.form, el.type === 'checkbox' ? el.checked : el.type === 'number' ? (el.value.trim() ? Number(el.value) : el.dataset.optional ? null : NaN) : el.value || null];
   const name = form?.id === 'session' ? form.dataset.session : null, shown = name === current();
-  if (!el.name || !name || shown && value === (state?.settings?.[el.name] ?? null)) return;
+  const path = el.name.split('.');
+  if (!el.name || !name || shown && value === (path.reduce((o, k) => o?.[k], state?.settings) ?? null)) return;
   if (Number.isNaN(value)) {
     if (shown) page.notes.session = `${el.closest('label').firstChild.textContent.trim()} needs a number.`;
     return draw();
   }
-  const change = el.name === 'provider' ? { provider: value, model: form.elements.model?.value || null } : { [el.name]: value };
+  const change = el.name === 'provider' ? { provider: value, model: form.elements.model?.value || null } : path.reduceRight((v, k) => ({ [k]: v }), value);
   if (shown) page.notes.session = 'Saving…';
   draw();
   try {

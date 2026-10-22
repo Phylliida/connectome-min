@@ -55,7 +55,7 @@ HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
 LIFTED = 2300   # lifted's window: without lifting, its context stops fitting by the 31st turn
-seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': [], 'planned': {}, 'passbacks': 0, 'forgetful': False}
+seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': [], 'planned': {}, 'passbacks': 0, 'forgetful': False, 'long-winded': False}
 PONDERED = 'I weighed what this stretch should keep. '   # what a memory's summarizer thinks first: never sent again
 
 
@@ -133,6 +133,8 @@ class Mock(BaseHTTPRequestHandler):
             seen['memory'] += 1
             seen['tool memories'] += any(b['type'] == 'tool_use' for m in messages for b in m['content'])
             blocks = [{'type': 'thinking', 'thinking': PONDERED * 40, 'signature': 'bWVt'}, {'type': 'text', 'text': f'I remember stretch {seen["memory"]}: the user talked about ' + ' '.join(['things'] * 60)}]
+            if seen['long-winded']:                                # its tokens run out while it thinks
+                blocks, stop = blocks[:1], 'max_tokens'
         elif 'use tools' in last or last.startswith('call ') or results and 'forever' in asked:
             seen['chat'] += 1
             seen['results'].append(results)
@@ -490,6 +492,18 @@ def lifted(tls, ca) -> str:
         after = chat(port, 'backlog', 1, 12, 3000)['layers']
         if sum(before[1:]) or sum(after[1:]) <= 3:
             raise SystemExit(f'a turn that waited for its memories found layers {before} and left {after}')
+        call(port, '/api/sessions', {'name': 'pondering'})               # a summarizer whose tokens run out while it thinks: the turn
+        call(port, '/api/s/pondering/settings', {'window': LIFTED})     # that waits for its memories says why they don't form
+        seen['long-winded'] = True
+        try:
+            for t in range(40):
+                say(port, 'pondering', f'Message {t}: ' + ' '.join(f'word{t % 7}' for _ in range(150)))
+                settle(port, 'pondering')
+            raise SystemExit('a session whose memories never formed fit its window for 40 turns')
+        except SystemExit as stopped:
+            if "The context doesn't fit" not in str(stopped) or 'A memory it waits for doesn\'t form: the summarizer\'s reply ran out of its' not in str(stopped):
+                raise
+        seen['long-winded'] = False
         call(port, '/api/sessions', {'name': 'banded'})                  # a band in a big window: past fold_above it folds, down to fold_to
         for wrong in ({'fold_above': 19500}, {'fold_above': 4000, 'fold_to': 4500}):
             try:

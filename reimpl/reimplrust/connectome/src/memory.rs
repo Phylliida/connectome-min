@@ -11,7 +11,8 @@
 //!     no memory has merged, short of a group, and with enough layers those and the tail outgrow the
 //!     window, with nothing left to fold. A lifted merge takes the oldest of them past the top
 //!     layer's, across layers, the fewest, at least two, that hold target_chunk_tokens, into a memory
-//!     one layer above the highest it takes, so it waits with that layer's (lifted).
+//!     one layer above the highest it takes, so it waits with that layer's (lifted). A memory held back
+//!     (blocked) holds back those after it, but not a lift, which goes ahead past it.
 //!
 //! A memory asks the summarizer what the agent saw before the stretch, replayed (a recall pair for each
 //! unmerged memory the recall budget fits, newest first), then the stretch and an instruction. A
@@ -88,7 +89,7 @@ pub const INTERRUPTED: &str = "interrupted";
 pub fn drive(session: &Session, host: &mut dyn Host, cfg: &Config) -> Result<bool, String> {
     let mut formed = false;
     loop {
-        let Some(((level, p), members)) = due(session, cfg).filter(|&(target, _)| !blocked(session, target, cfg)) else { return Ok(formed) };
+        let Some(((level, p), members)) = next(session, cfg) else { return Ok(formed) };
         if level == 1
             && let Some(stub) = quiet(session, p, cfg)
         {
@@ -115,16 +116,49 @@ pub fn drive(session: &Session, host: &mut dyn Host, cfg: &Config) -> Result<boo
     }
 }
 
+/// The memory to form now: the one due, unless it's held back; then a lift past it, if one is due.
+fn next(session: &Session, cfg: &Config) -> Option<(Node, Vec<Node>)> {
+    let first = due(session, cfg)?;
+    if !blocked(session, first.0, cfg) {
+        return Some(first);
+    }
+    lift(session, cfg).filter(|&(target, _)| !blocked(session, target, cfg))
+}
+
+/// Why the memory due doesn't form, if it's held back: memories stopped forming at a refusal, or it
+/// failed attempt_limit times since the log last grew.
+pub fn stalled(session: &Session, cfg: &Config) -> Option<String> {
+    let ((level, p), _) = due(session, cfg).filter(|&(target, _)| blocked(session, target, cfg))?;
+    let which = if level == 1 { format!("the memory of chunk {p}") } else { format!("the next L{level} memory") };
+    Some(match session.last("attempts").is_some_and(|a| a["outcome"] == "refusal") {
+        true => format!("memories stopped forming when the summarizer refused one, and {which} waits for that to be mended"),
+        false => format!("{which} failed {} times since the log last grew", cfg.attempt_limit),
+    })
+}
+
 /// The memory to form next, and what it holds: the next L1 (its chunk), else the lowest level's next
-/// merge, else, when the last compile couldn't fold enough, a lifted merge.
+/// merge, else a lift.
 fn due(session: &Session, cfg: &Config) -> Option<(Node, Vec<Node>)> {
     let (groups, count) = (Recorded::new(session, cfg), |n: u64| session.count(&format!("layer{n}")));
-    let escalated = session.last("compiles").is_some_and(|c| c["escalated"] == true);
-    let holdback = if escalated { 0 } else { cfg.l1_holdback_chunks };
-    let next = |members: Vec<Node>| ((members[0].0 + 1, count(members[0].0 + 1)), members);
-    let merge = || (1..).take_while(|&n| count(n) > 0).find_map(|n| closed(session, n, &groups, cfg)).map(next);
-    let lift = || (escalated && !cfg.merge_by_count).then(|| lifted(session, cfg)).flatten().map(next);
-    (count(1) < count(0).saturating_sub(holdback)).then(|| next(vec![(0, count(1))])).or_else(merge).or_else(lift)
+    let holdback = if escalated(session) { 0 } else { cfg.l1_holdback_chunks };
+    let merge = || (1..).take_while(|&n| count(n) > 0).find_map(|n| closed(session, n, &groups, cfg)).map(|m| into(session, m));
+    (count(1) < count(0).saturating_sub(holdback)).then(|| into(session, vec![(0, count(1))])).or_else(merge).or_else(|| lift(session, cfg))
+}
+
+/// A lifted merge, when the last compile couldn't fold enough, not under merge_by_count.
+fn lift(session: &Session, cfg: &Config) -> Option<(Node, Vec<Node>)> {
+    (escalated(session) && !cfg.merge_by_count).then(|| lifted(session, cfg)).flatten().map(|m| into(session, m))
+}
+
+/// Whether the last compile couldn't fold enough.
+fn escalated(session: &Session) -> bool {
+    session.last("compiles").is_some_and(|c| c["escalated"] == true)
+}
+
+/// The memory `members` make: the next of the layer above the highest of them.
+fn into(session: &Session, members: Vec<Node>) -> (Node, Vec<Node>) {
+    let level = members[0].0 + 1;
+    ((level, session.count(&format!("layer{level}"))), members)
 }
 
 /// The session's memories as their records group them: a merged memory's `merges`, the first and
@@ -507,6 +541,27 @@ mod tests {
         let l1 = |p: u64| ((1, p), vec![(0, p)]);
         assert_eq!(formed, [l1(11), l1(12), ((2, 5), vec![(1, 11), (1, 12)]), ((4, 1), vec![(3, 2), (2, 5)]), ((5, 0), vec![(4, 0), (4, 1)])]);
         assert_eq!((session.read("layer2", 5)["merges"].clone(), Recorded::new(&session, &cfg).parent((1, 11))), (json!([11, 12]), Some((2, 5))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lift_goes_past_a_memory_that_keeps_failing() {
+        let dir = std::env::temp_dir().join(format!("connectome-stalled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let session = Session::open(&dir);
+        let cfg = Config { target_chunk_tokens: 50.0, recent_window_tokens: 50.0, l1_holdback_chunks: 0, ..Config::default() };
+        let mut host = memory_of_30_tokens();
+        grow(&session, &mut host, 11, true, &cfg);
+        grow(&session, &mut host, 1, false, &cfg); // chunk 11, its memory not yet formed
+        assert!(select(&session, &Fit::library(1.0, &cfg), current(&session), &cfg).is_err());
+        let mut failing = Answering(Err("down".into()), 0);
+        for _ in 0..cfg.attempt_limit {
+            assert_eq!(drive(&session, &mut failing, &cfg), Err("down".into()));
+        }
+        assert_eq!(stalled(&session, &cfg), Some("the memory of chunk 11 failed 3 times since the log last grew".into()));
+        assert_eq!(next(&session, &Config { merge_by_count: true, ..cfg.clone() }), None);   // the library waits
+        assert_eq!(next(&session, &cfg), Some(((3, 2), vec![(2, 4), (1, 10)])));
+        assert_eq!((drive(&session, &mut host, &cfg), session.count("layer3")), (Ok(true), 3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

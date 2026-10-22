@@ -13,7 +13,7 @@ autobiographical compaction) and a web app around it.
   has taken yet, short of a group, and with enough layers those and the tail outgrow the window with
   nothing left to fold, so the oldest of them past the top layer's, across layers, the fewest that
   hold `target_chunk_tokens`, merge into a memory one layer above the highest it takes (`memory.rs`,
-  `lifted`). `merge_by_count` merges `merge_threshold` at a time and never lifts, as the port does
+  `lifted`), even past a memory that keeps failing, which would hold back any other. `merge_by_count` merges `merge_threshold` at a time and never lifts, as the port does
   (the differential test runs that way); a memory without `merges` is read as such a group, so a
   session that merged by count goes on by tokens from where it was. A compile plans the context from prices and block shapes only (`emit::select`), and
   an `emit::Reader` reads each block from disk as the caller writes the request, so neither a
@@ -85,7 +85,7 @@ since one holds the keys:
   to `config.slack` under that), its `system` prompt, and the library's settings (`config`). A new session's
   file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its
   parent's; a session without one has none to run with, and the page says so. The page edits the
-  main fields, each saved alone as it changes (a choice at once, typing once it pauses for 2.5 s or
+  main fields and the raw tail (`config.recent_window_tokens`: the newest tokens, never folded), each saved alone as it changes (a choice at once, typing once it pauses for 2.5 s or
   leaves the field, a number only once it is one), its model one its provider lists (or any, typed,
   for a provider that lists none); `config.merge_threshold` can't change once memories have merged,
   nor `config.merge_by_count` turn on; `fold_to` stays at most `fold_above`, and that at most
@@ -149,7 +149,9 @@ user stops it). After a step that called tools, and after the turn, the next mem
 `fold_above` the context doesn't fold; past it, it folds down to `fold_to`, and waits for the memories
 that takes: they form, as many as it takes, until it gets there, or none can form, or memories couldn't
 make the room (the tail and the messages no chunk holds yet are over `fold_to` alone). Then it goes as
-it is if the window takes it, and a context the window can't take says what it holds. A request that fails in a way that may pass (no answer, a stream cut off, an HTTP
+it is if the window takes it, and a context the window can't take says what it holds, and why a
+memory it waits for doesn't form (its call failed, the summarizer's reply ran out of tokens or had no
+memory in it, or it failed `config.attempt_limit` times since the log last grew). A request that fails in a way that may pass (no answer, a stream cut off, an HTTP
 408, 409, 425, 429 or 5xx, an error event of overload, rate limit, timeout or the API's own) is
 tried again, up to five times: 500 ms after, then 500 ms, then 2 s each; what streamed of the reply
 is dropped, and the page says why it's trying again. A failure that would come again (a bad key, a
