@@ -385,7 +385,7 @@ fn number(n: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{drive::{append, current}, emit::select};
+    use crate::{drive::{append, current}, emit::{select, Fit}};
     use serde_json::json;
 
     /// A host that gives every request the same answer, and counts them.
@@ -476,7 +476,7 @@ mod tests {
         assert_eq!((1..6).map(count).collect::<Vec<_>>(), [11, 5, 2, 1, 0]);
         assert_eq!(due(&session, &cfg), None);
         // a window nothing fits: the compile folds all it can and escalates
-        let floor = || select(&session, 1.0, current(&session), &cfg).expect_err("over the window").actual;
+        let floor = || select(&session, &Fit::library(1.0, &cfg), current(&session), &cfg).expect_err("over the window").actual;
         let before = floor();
         assert_eq!(due(&session, &Config { merge_by_count: true, ..cfg.clone() }), None);   // as the library: nothing to merge
         assert_eq!(due(&session, &cfg), Some(((3, 2), vec![(2, 4), (1, 10)])));   // past the top layer's, into one above the highest
@@ -493,7 +493,7 @@ mod tests {
         assert_eq!((groups.members((3, 2)), chunks((3, 2), &groups), groups.parent((2, 4))), (vec![(2, 4), (1, 10)], 8..11, Some((3, 2))));
         let after = floor();
         assert!(after < before, "lifting freed nothing: {before} tokens, then {after}");
-        assert!(select(&session, after, current(&session), &cfg).is_ok());
+        assert!(select(&session, &Fit::library(after, &cfg), current(&session), &cfg).is_ok());
         assert_eq!((session.last("compiles").unwrap()["frontier"].clone(), due(&session, &cfg)), (json!([[4, 0], [3, 2]]), None));
         // escalated again, two chunks on: their L1s and the merge they close come first, from the first
         // L1 the lift didn't take; then a lift, which closes a merge of the top layer's

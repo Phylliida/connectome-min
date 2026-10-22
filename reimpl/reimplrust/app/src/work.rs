@@ -9,7 +9,7 @@
 //! (Worker::stopped).
 
 use crate::{api::brief, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
-use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
+use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{Host, Request, INTERRUPTED}, store::Session};
 use std::{cell::RefCell, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
 
@@ -261,23 +261,32 @@ impl Worker<'_> {
         // how much bigger that context was than its compile thought, in a sample calibration learns
         // from: calibration takes steps to catch up, and the context compiles that much smaller meanwhile
         let lag = reported.map(|u| u / last.armed).filter(|r| (1.0..=1.8).contains(r)).unwrap_or(1.0);
-        // what the context compiles to: the window less what every request carries and the reply, smaller by
-        // the lag, so the request and its answer fit even at the library's grace over budget
-        let w = (setup.settings.window - setup.overhead - reserve) / lag / (1.0 + cfg.over_budget_grace);
-        let mut compiled = select(s, w, reported.map_or(last, |u| last.observe(u)), cfg);
-        // a refusal escalates the session, so the memories the context waits for form at once, as many as it takes
-        // to fit: while one forms, and while memories can make the room (the messages no chunk holds yet and the
-        // tail fit without them)
+        // what the context may take: the window less what every request carries and the reply, smaller by the
+        // lag, so the request and its answer fit even at the library's grace over budget
+        let room = (setup.settings.window - setup.overhead - reserve) / lag / (1.0 + cfg.over_budget_grace);
+        // past fold_above (a prompt, so less what every request carries, and the lag) it folds, down to fold_to
+        let context = |prompt: f64| ((prompt - setup.overhead) / lag).min(room);
+        let over = setup.settings.fold_above.map_or(room, context);
+        let to = setup.settings.fold_to.map_or(over * (1.0 - cfg.slack), |to| context(to).min(over));
+        let fit = Fit { over, to, limit: (room * (1.0 + cfg.over_budget_grace)).floor(), reach: true };
+        let mut compiled = select(s, &fit, reported.map_or(last, |u| last.observe(u)), cfg);
+        // a context that folds (past fold_above) short of fold_to is refused, which escalates the session, so the
+        // memories it waits for form at once, as many as it takes: while one forms, and while memories can make
+        // the room (the messages no chunk holds yet and the tail fit without them); if they can't, it goes as it
+        // is, if the window takes it
         let mut failed = None;
         while let Err(r) = &compiled && r.actual > r.budget && r.open + r.tail <= r.budget {
             match self.form(&setup) {
-                Ok(true) => compiled = select(s, w, current(s), cfg),
+                Ok(true) => compiled = select(s, &fit, current(s), cfg),
                 Ok(false) => break,
                 Err(why) => {
                     failed = Some(why);
                     break;
                 }
             }
+        }
+        if let Err(r) = &compiled && r.actual > r.budget {
+            compiled = select(s, &Fit { reach: false, ..fit }, current(s), cfg);
         }
         if self.stopped() { return Err(STOPPED.into()) } // before the request
         let turns = compiled.map_err(|r| refused(&r, &setup) + &failed.map_or(String::new(), |why| format!(" A memory it waits for failed: {why}")))?;

@@ -6,7 +6,7 @@
 //!      at that size if it plus the reserve fits the routed window (compile);
 //!   4. memories form until one makes a call or none is due (drive).
 
-use crate::{chunking::close_chunks, config::Config, emit::{select, Refusal}, estimate::Calibration, json::Value, memory::Host, obj, store::Session, turns::Turn};
+use crate::{chunking::close_chunks, config::Config, emit::{select, Fit, Refusal}, estimate::Calibration, json::Value, memory::Host, obj, store::Session, turns::Turn};
 pub use crate::memory::drive;
 
 /// The messages the log gained, the last step's usage (None without a new report), the compile and
@@ -36,8 +36,8 @@ pub fn current(session: &Session) -> Calibration {
 /// compileFolds: maxTokens `budget`, reserveForResponse `reserve`; a refusal for size whose total
 /// fits `window` is retried once at that total.
 pub fn compile(session: &Session, budget: f64, reserve: f64, window: f64, calibration: Calibration, cfg: &Config) -> Result<Vec<Turn>, Refusal> {
-    match crate::emit::select(session, budget - reserve, calibration, cfg) {
-        Err(r) if r.actual > r.budget && r.actual + reserve <= window => select(session, (r.actual + reserve) - reserve, calibration, cfg),
+    match select(session, &Fit::library(budget - reserve, cfg), calibration, cfg) {
+        Err(r) if r.actual > r.budget && r.actual + reserve <= window => select(session, &Fit::library((r.actual + reserve) - reserve, cfg), calibration, cfg),
         result => result,
     }
 }

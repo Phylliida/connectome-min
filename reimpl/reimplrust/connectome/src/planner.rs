@@ -5,7 +5,7 @@
 //! chunk p. Levels fall toward the present: old content coarse, new content fine. A change re-reads
 //! everything after it, so a plan keeps the carried frontier and changes it only at the edges of a
 //! band, each time where the change starts latest:
-//!   over W         fold until the total is at most the target, W * (1 - slack): each time, the
+//!   over W         fold until the total is at most the target (the library's W * (1 - slack)): each time, the
 //!                  lowest level's oldest complete group: raw chunk j into memory (1, j), or the
 //!                  nodes a memory merged, adjacent in the frontier, into it
 //!   under the low  after a fold, or below W * unfold_below: replace the newest memory with what it
@@ -39,9 +39,10 @@ impl Groups for Fixed {
 }
 
 /// fixed: the tokens outside the frontier (the open run and the tail).
-pub fn plan(frontier: Vec<Node>, cost: impl Fn(Node) -> f64, exists: impl Fn(Node) -> bool, fixed: f64, w: f64, groups: &impl Groups, cfg: &Config) -> Vec<Node> {
+#[allow(clippy::too_many_arguments)]
+pub fn plan(frontier: Vec<Node>, cost: impl Fn(Node) -> f64, exists: impl Fn(Node) -> bool, fixed: f64, w: f64, target: f64, groups: &impl Groups, cfg: &Config) -> Vec<Node> {
     let total = |f: &[Node]| fixed + f.iter().map(|&n| cost(n)).fold(0.0, |a, x| a + x);
-    let (target, mut f) = (w * (1.0 - cfg.slack), frontier);
+    let mut f = frontier;
     let folded = total(&f) > w;
     while folded && total(&f) > target && let Some(folds) = fold(&f, &exists, groups) {
         f = folds;

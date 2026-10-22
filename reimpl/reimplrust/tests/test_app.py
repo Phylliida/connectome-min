@@ -490,8 +490,22 @@ def lifted(tls, ca) -> str:
         after = chat(port, 'backlog', 1, 12, 3000)['layers']
         if sum(before[1:]) or sum(after[1:]) <= 3:
             raise SystemExit(f'a turn that waited for its memories found layers {before} and left {after}')
+        call(port, '/api/sessions', {'name': 'banded'})                  # a band in a big window: past fold_above it folds, down to fold_to
+        for wrong in ({'fold_above': 19500}, {'fold_above': 4000, 'fold_to': 4500}):
+            try:
+                call(port, '/api/s/banded/settings', {'window': 20000, **wrong})
+                raise SystemExit(f'the settings took {wrong} in a window of 20000, 1000 of it the reply\'s')
+            except urllib.error.HTTPError as error:
+                if error.code != 400 or 'fold_' not in json.loads(error.read())['error']:
+                    raise SystemExit(f'{wrong} got {error.code}')
+        overhead, contexts = call(port, '/api/s/banded/settings', {'window': 20000, 'fold_above': 4000, 'fold_to': 2000})['overhead'], []   # the tools and system prompt
+        for t in range(40):
+            contexts.append(chat(port, 'banded', 1, t, 20000)['armed'])
+        folds = [i for i in range(1, len(contexts)) if contexts[i] < contexts[i - 1]]
+        if max(contexts) > 4000 - overhead or not folds or any(contexts[i] > 2000 - overhead for i in folds) or len(folds) > len(contexts) // 4:
+            raise SystemExit(f'contexts in a band of 2000 to 4000 tokens of prompt: {contexts}, folding at {folds}')
         return f'{len(lifts)} lifted merges (the first L{lifts[0][0]} of {lifts[0][1]}), layers {state["layers"]}, frontier {state["frontier"]}; ' \
-               f'a turn waited for {sum(after[1:])} memories'
+               f'a turn waited for {sum(after[1:])} memories; contexts in a band of 2000 to 4000 folded {len(folds)} times in 40 turns'
     finally:
         app.terminate()
         mock.shutdown()

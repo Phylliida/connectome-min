@@ -19,6 +19,25 @@ use crate::{estimate::Calibration, js::{digest, js_len, js_trim, py_round}, json
 use crate::{memory::Recorded, store::Session, turns::{pair_tools, say, split, text, Turn, DROPPED}};
 use std::{cell::RefCell, collections::HashMap, ops::Range};
 
+/// What a compile fits the context to, in tokens: past `over` it folds, down to `to` where it can, and
+/// at its most folded past `limit` it's refused; and if `reach`, refused as well when it folds and can't
+/// get down to `to`.
+#[derive(Clone, Copy, Debug)]
+pub struct Fit {
+    pub over: f64,
+    pub to: f64,
+    pub limit: f64,
+    pub reach: bool,
+}
+
+impl Fit {
+    /// The library's for a budget W: folding past W, down to W * (1 - slack), refused past W plus the
+    /// grace.
+    pub fn library(w: f64, cfg: &Config) -> Fit {
+        Fit { over: w, to: w * (1.0 - cfg.slack), limit: (w * (1.0 + cfg.over_budget_grace)).floor(), reach: false }
+    }
+}
+
 /// An OverBudgetError: the compile renders nothing and commits nothing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Refusal {
@@ -35,7 +54,7 @@ pub struct Refusal {
 }
 
 /// The plan: the turns of the context, their blocks located.
-pub fn select(session: &Session, w: f64, calibration: Calibration, cfg: &Config) -> Result<Vec<Turn>, Refusal> {
+pub fn select(session: &Session, fit: &Fit, calibration: Calibration, cfg: &Config) -> Result<Vec<Turn>, Refusal> {
     let (m, last) = (calibration.multiplier, session.last("compiles").unwrap_or(obj! {}));
     close_chunks(session, m, cfg);
     let held = |n: u64| session.count(&format!("layer{n}"));
@@ -58,9 +77,10 @@ pub fn select(session: &Session, w: f64, calibration: Calibration, cfg: &Config)
     };
     let prices: Vec<f64> = loose.clone().rev().map(price).collect(); // newest first, as the live image limits count
     let fixed = prices.iter().fold(0.0, |a, x| a + x);
-    let frontier = plan(frontier, cost, |(n, p)| p < held(n), fixed, w, &groups, cfg);
+    let carried = fixed + frontier.iter().map(|&n| cost(n)).fold(0.0, |a, x| a + x);
+    let frontier = plan(frontier, cost, |(n, p)| p < held(n), fixed, fit.over, fit.to, &groups, cfg);
     let total = fixed + frontier.iter().map(|&n| cost(n)).fold(0.0, |a, x| a + x);
-    let limit = (w * (1.0 + cfg.over_budget_grace)).floor();
+    let limit = if fit.reach && carried > fit.over { fit.to } else { fit.limit };
     let refusal = |stage| {
         let held = |raw: bool| frontier.iter().filter(|n| (n.0 == 0) == raw).fold((0, 0.0), |(k, t), &n| (k + 1, t + cost(n)));
         let tail = prices[..(loose.end - tail) as usize].iter().fold(0.0, |a, x| a + x);
@@ -92,7 +112,7 @@ pub fn select(session: &Session, w: f64, calibration: Calibration, cfg: &Config)
     };
     let marks = [keys.len().checked_sub(1), stable.checked_sub(1)];
     let nodes: Vec<Value> = frontier.iter().map(|&(n, p)| vec![n, p].into()).collect();
-    session.append("compiles", obj! {"frontier" => nodes, "multiplier" => m, "armed" => total, "keys" => keys, "escalated" => total > w});
+    session.append("compiles", obj! {"frontier" => nodes, "multiplier" => m, "armed" => total, "keys" => keys, "escalated" => total > fit.over});
     Ok(entries.iter().enumerate().flat_map(|(i, e)| split(e, marks.contains(&Some(i)))).collect())
 }
 

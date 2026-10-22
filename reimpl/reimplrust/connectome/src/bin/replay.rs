@@ -57,7 +57,7 @@ fn plans() {
         let cfg = Config { slack: case["slack"].as_f64().unwrap(), unfold_below: case["unfold_below"].as_f64().unwrap(), ..Config::default() };
         let salt = case["salt"].u64();
         let exists = |(level, id): Node| have.get(level as usize).is_some_and(|&n| id < n);
-        let planned = plan(nodes(&case["frontier"]), |n| cost(n, salt), exists, case["fixed"].as_f64().unwrap(), case["W"].as_f64().unwrap(), &Fixed(case["k"].u64()), &cfg);
+        let planned = plan(nodes(&case["frontier"]), |n| cost(n, salt), exists, case["fixed"].as_f64().unwrap(), case["W"].as_f64().unwrap(), case["W"].as_f64().unwrap() * (1.0 - cfg.slack), &Fixed(case["k"].u64()), &cfg);
         Value::Array(planned.into_iter().map(|(l, i)| Value::Array(vec![l.into(), i.into()])).collect())
     });
     println!("{}", json::to_string(&Value::Array(out.collect())));

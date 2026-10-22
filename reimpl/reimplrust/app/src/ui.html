@@ -535,6 +535,10 @@ function SessionForm() {
     <label><input name="sandbox" type="checkbox" defaultChecked=${!!s.sandbox} /> bash in the sandbox</label>
     <label>Window <input name="window" type="number" defaultValue=${s.window ?? ''} /></label>
     <label>Reply reserve <input name="reserve" type="number" defaultValue=${s.reserve ?? ''} /></label>
+    <label title="Past this many tokens of prompt, the context folds into memories, waiting for them if it must">Fold above
+      <input name="fold_above" type="number" data-optional="1" defaultValue=${s.fold_above ?? ''} placeholder="the window, less the reply" /></label>
+    <label title="Folding goes down to this many tokens of prompt, so it doesn't fold again at every step">Fold down to
+      <input name="fold_to" type="number" data-optional="1" defaultValue=${s.fold_to ?? ''} placeholder=${`${Math.round((s.config?.slack ?? 0.1) * 100)}% under that`} /></label>
     <label>System prompt <textarea name="system" rows="2" defaultValue=${s.system ?? ''}></textarea></label>
     <small id="ssaved">${page.notes.session || 'Changes save as you make them. The rest is in the session\'s session_settings.json.'}</small>
   </form>`;
@@ -845,12 +849,12 @@ function typing(e) {
 }
 
 // a field of the session form saved, alone, into the form's session, unless its file has it already: a
-// number once it is one, and a provider with the model its list starts on. The form may have gone, the
+// number once it is one (an optional one, blank, unset), and a provider with the model its list starts on. The form may have gone, the
 // page on another session (a browser can tell its field it's left as it goes): then nothing on the page
 // says so.
 async function tune(el) {
   clearTimeout(pausing.get(el));
-  const [form, value] = [el.form, el.type === 'checkbox' ? el.checked : el.type === 'number' ? (el.value.trim() ? Number(el.value) : NaN) : el.value || null];
+  const [form, value] = [el.form, el.type === 'checkbox' ? el.checked : el.type === 'number' ? (el.value.trim() ? Number(el.value) : el.dataset.optional ? null : NaN) : el.value || null];
   const name = form?.id === 'session' ? form.dataset.session : null, shown = name === current();
   if (!el.name || !name || shown && value === (state?.settings?.[el.name] ?? null)) return;
   if (Number.isNaN(value)) {

@@ -80,13 +80,16 @@ since one holds the keys:
   there), chunks of 15k tokens, and, on Linux, bash in the sandbox.
 - `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its
-  `window`, `reserve` and `system` prompt, and the library's settings (`config`). A new session's
+  `window`, `reserve`, the band its prompt folds in (`fold_above` and `fold_to`: past `fold_above`
+  tokens the context folds, down to `fold_to`; by default past what the window leaves the reply, down
+  to `config.slack` under that), its `system` prompt, and the library's settings (`config`). A new session's
   file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its
   parent's; a session without one has none to run with, and the page says so. The page edits the
   main fields, each saved alone as it changes (a choice at once, typing once it pauses for 2.5 s or
   leaves the field, a number only once it is one), its model one its provider lists (or any, typed,
   for a provider that lists none); `config.merge_threshold` can't change once memories have merged,
-  nor `config.merge_by_count` turn on.
+  nor `config.merge_by_count` turn on; `fold_to` stays at most `fold_above`, and that at most
+  what the window leaves the reply.
 
 Tools (`app/src/tools/`): the model can call `bash` (a command in a new shell in the session's
 workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in the workspace changed
@@ -142,10 +145,11 @@ turn on it. Turning Auto on sends the session's last turn to the companion, unle
 either. A fork has no companion of its own.
 
 A turn takes steps, a model request each, as many as it takes until a reply calls no tools (or the
-user stops it). After a step that called tools, and after the turn, the next memory due forms. A
-context that doesn't fit the window waits for its memories instead: they form, as many as it takes,
-until it fits, or none can form, or memories couldn't make the room (the tail and the messages no
-chunk holds yet are over the window alone); a context still over says what it holds. A request that fails in a way that may pass (no answer, a stream cut off, an HTTP
+user stops it). After a step that called tools, and after the turn, the next memory due forms. Below
+`fold_above` the context doesn't fold; past it, it folds down to `fold_to`, and waits for the memories
+that takes: they form, as many as it takes, until it gets there, or none can form, or memories couldn't
+make the room (the tail and the messages no chunk holds yet are over `fold_to` alone). Then it goes as
+it is if the window takes it, and a context the window can't take says what it holds. A request that fails in a way that may pass (no answer, a stream cut off, an HTTP
 408, 409, 425, 429 or 5xx, an error event of overload, rate limit, timeout or the API's own) is
 tried again, up to five times: 500 ms after, then 500 ms, then 2 s each; what streamed of the reply
 is dropped, and the page says why it's trying again. A failure that would come again (a bad key, a

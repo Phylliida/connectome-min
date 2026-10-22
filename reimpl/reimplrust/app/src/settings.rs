@@ -85,6 +85,10 @@ pub struct SessionSettings {
     pub allow: BTreeSet<String>,          // the tools that run without asking
     #[default(90000.0)] pub window: f64,  // tokens a request may take, the reply's included
     #[default(30000.0)] pub reserve: f64, // tokens for the reply (its reasoning too)
+    // a prompt (the system prompt and tools with the context) past fold_above folds, down to fold_to; by
+    // default past what the window leaves the reply, down to config.slack under that
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub fold_above: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub fold_to: Option<f64>,
     pub system: Option<String>,
     pub config: Config,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub companion: Option<String>,   // the session that is this one's companion (companion.rs)
@@ -98,8 +102,9 @@ impl SessionSettings {
 
     /// These settings as what `v` gives changes them: any of their fields, and any of config's. The
     /// provider must be one of `all`'s, a workspace given a directory that exists (absolute, a leading
-    /// ~/ the home directory, no trailing /), and once memories have `merged`, merge_threshold as it was
-    /// and merge_by_count not turned on (merging by count after merging by tokens would misread them).
+    /// ~/ the home directory, no trailing /), fold_to at most fold_above and that at most what the window
+    /// leaves the reply, and once memories have `merged`, merge_threshold as it was and merge_by_count
+    /// not turned on (merging by count after merging by tokens would misread them).
     pub fn tuned(&self, v: &Value, merged: bool, all: &Settings) -> Result<SessionSettings, String> {
         let mut new = serde_json::to_value(self).expect("settings are JSON");
         for (k, x) in v.as_object().into_iter().flatten() {
@@ -118,6 +123,13 @@ impl SessionSettings {
         }
         if !all.providers.contains_key(&new.provider) {
             return Err(format!("no provider {}", new.provider));
+        }
+        let room = new.window - new.reserve;
+        if let Some(above) = new.fold_above.filter(|&a| !(0.0..=room).contains(&a)) {
+            return Err(format!("fold_above ({above}) must be at most what the window leaves the reply ({room})"));
+        }
+        if let Some(to) = new.fold_to.filter(|&t| !(0.0..=new.fold_above.unwrap_or(room)).contains(&t)) {
+            return Err(format!("fold_to ({to}) must be at most fold_above ({})", new.fold_above.unwrap_or(room)));
         }
         if merged && new.config.merge_threshold != self.config.merge_threshold {
             return Err("merge_threshold stays as it is once memories have merged".into());
