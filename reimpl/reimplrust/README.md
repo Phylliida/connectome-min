@@ -142,7 +142,10 @@ turn on it. Turning Auto on sends the session's last turn to the companion, unle
 either. A fork has no companion of its own.
 
 A turn takes steps, a model request each, as many as it takes until a reply calls no tools (or the
-user stops it). A request that fails in a way that may pass (no answer, a stream cut off, an HTTP
+user stops it). After a step that called tools, and after the turn, the next memory due forms. A
+context that doesn't fit the window waits for its memories instead: they form, as many as it takes,
+until it fits, or none can form, or memories couldn't make the room (the tail and the messages no
+chunk holds yet are over the window alone); a context still over says what it holds. A request that fails in a way that may pass (no answer, a stream cut off, an HTTP
 408, 409, 425, 429 or 5xx, an error event of overload, rate limit, timeout or the API's own) is
 tried again, up to five times: 500 ms after, then 500 ms, then 2 s each; what streamed of the reply
 is dropped, and the page says why it's trying again. A failure that would come again (a bad key, a

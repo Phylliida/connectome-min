@@ -18,7 +18,7 @@ pub fn step(session: &Session, messages: &[Value], usage: Option<f64>, budget: f
     messages.iter().for_each(|message| append(session, message, cfg));
     let calibration = usage.into_iter().fold(current(session), Calibration::observe);
     let compiled = compile(session, budget, reserve, window, calibration, cfg);
-    (compiled, drive(session, host, cfg))
+    (compiled, drive(session, host, cfg).err())
 }
 
 pub fn append(session: &Session, message: &Value, cfg: &Config) {

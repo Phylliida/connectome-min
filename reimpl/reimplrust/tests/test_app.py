@@ -55,7 +55,7 @@ HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
 LIFTED = 2300   # lifted's window: without lifting, its context stops fitting by the 31st turn
-seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': [], 'planned': {}, 'passbacks': 0}
+seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': [], 'planned': {}, 'passbacks': 0, 'forgetful': False}
 PONDERED = 'I weighed what this stretch should keep. '   # what a memory's summarizer thinks first: never sent again
 
 
@@ -125,6 +125,8 @@ class Mock(BaseHTTPRequestHandler):
         elif 'a long story' in last:
             seen['chat'] += 1
             blocks, stop = [{'type': 'text', 'text': 'Once upon a time'}], 'max_tokens'
+        elif 'memory' in last and ('Write the memory' in last or 'consolidate' in last) and seen['forgetful']:   # memories down, at once
+            return self.answer(400, {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'No memories today'}})
         elif 'memory' in last and ('Write the memory' in last or 'consolidate' in last):
             if request.get('tools') and request.get('tool_choice') != {'type': 'none'}:
                 return self.problem(f'a memory request may call tools: tool_choice {request.get("tool_choice")}')
@@ -479,7 +481,17 @@ def lifted(tls, ca) -> str:
         lifts = [(n, m['merges']) for n in range(2, len(layers)) for m in layers[n] if isinstance(m['merges'][0], list)]
         if (why := misgrouped(state, layers)) or not lifts:
             raise SystemExit(why or f'no memories lifted in a window of {LIFTED}: layers {state["layers"]}, frontier {state["frontier"]}')
-        return f'{len(lifts)} lifted merges (the first L{lifts[0][0]} of {lifts[0][1]}), layers {state["layers"]}, frontier {state["frontier"]}'
+        call(port, '/api/sessions', {'name': 'backlog'})                 # memories down while a session grows in a roomy window,
+        call(port, '/api/s/backlog/settings', {'window': 20000})         # then back as the window shrinks: the next turn waits
+        seen['forgetful'] = True                                         # for every memory it takes to fit
+        chat(port, 'backlog', 12, 0, 20000)
+        seen['forgetful'], before = False, call(port, '/api/s/backlog')['layers']
+        call(port, '/api/s/backlog/settings', {'window': 3000})
+        after = chat(port, 'backlog', 1, 12, 3000)['layers']
+        if sum(before[1:]) or sum(after[1:]) <= 3:
+            raise SystemExit(f'a turn that waited for its memories found layers {before} and left {after}')
+        return f'{len(lifts)} lifted merges (the first L{lifts[0][0]} of {lifts[0][1]}), layers {state["layers"]}, frontier {state["frontier"]}; ' \
+               f'a turn waited for {sum(after[1:])} memories'
     finally:
         app.terminate()
         mock.shutdown()

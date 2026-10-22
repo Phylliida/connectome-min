@@ -173,7 +173,7 @@ impl Worker<'_> {
         let auto = self.app.ask_session(self.name, Msg::Ended);
         self.event(Event::End(ended.clone().err()));
         self.hand_over(start, ended, auto);
-        if let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup) }
+        if let Ok(setup) = Setup::new(self.app, self.name) { let _ = self.form(&setup); }
     }
 
     /// A chat turn: the log mended if the server stopped in a step (mend), its message joins the log,
@@ -265,14 +265,22 @@ impl Worker<'_> {
         // the lag, so the request and its answer fit even at the library's grace over budget
         let w = (setup.settings.window - setup.overhead - reserve) / lag / (1.0 + cfg.over_budget_grace);
         let mut compiled = select(s, w, reported.map_or(last, |u| last.observe(u)), cfg);
-        // a refusal escalates the session, so the memory the context waits for forms at once; then it compiles again, up to 3 times
-        for _ in 0..3 {
-            if compiled.is_ok() { break }
-            self.form(&setup);
-            compiled = select(s, w, current(s), cfg);
+        // a refusal escalates the session, so the memories the context waits for form at once, as many as it takes
+        // to fit: while one forms, and while memories can make the room (the messages no chunk holds yet and the
+        // tail fit without them)
+        let mut failed = None;
+        while let Err(r) = &compiled && r.actual > r.budget && r.open + r.tail <= r.budget {
+            match self.form(&setup) {
+                Ok(true) => compiled = select(s, w, current(s), cfg),
+                Ok(false) => break,
+                Err(why) => {
+                    failed = Some(why);
+                    break;
+                }
+            }
         }
         if self.stopped() { return Err(STOPPED.into()) } // before the request
-        let turns = compiled.map_err(|r| refused(&r, &setup))?;
+        let turns = compiled.map_err(|r| refused(&r, &setup) + &failed.map_or(String::new(), |why| format!(" A memory it waits for failed: {why}")))?;
         if let Some(fold) = costs::fold(s) { self.event(Event::Fold(fold)) }
         let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.settings.system.as_deref(), "tools" => setup.definitions.clone()});
         let piece = |piece| {
@@ -299,7 +307,7 @@ impl Worker<'_> {
         }
         if self.stopped() { return Err(STOPPED.into()) }
         if !called { return Ok(false) }
-        self.form(&setup);
+        let _ = self.form(&setup);
         Ok(true)
     }
 
@@ -316,15 +324,18 @@ impl Worker<'_> {
         answered.recv_timeout(APPROVAL_WAIT).unwrap_or_else(|_| Err(DENIED.into()))
     }
 
-    /// Memories form (memory::drive), the pages told while they do; none once the turn is stopped.
-    fn form(&self, setup: &Setup) {
-        if self.stopped() { return }
+    /// Memories form (memory::drive), the pages told while they do; none once the turn is stopped:
+    /// whether any formed, or why the one tried failed.
+    fn form(&self, setup: &Setup) -> Result<bool, String> {
+        if self.stopped() { return Ok(false) }
         self.event(Event::Forming(true));
-        if let Some(error) = drive(&self.s, &mut Summarizer { setup, stopped: &|| self.stopped() }, &setup.settings.config) {
+        let formed = drive(&self.s, &mut Summarizer { setup, stopped: &|| self.stopped() }, &setup.settings.config);
+        if let Err(error) = &formed {
             eprintln!("{}: forming a memory: {error}", self.name);
         }
         self.spend(setup, For::Memories);
         self.event(Event::Forming(false));
+        formed
     }
 
     /// What the step's requests used since this was last told (Llm::spent), for `what`, joins the

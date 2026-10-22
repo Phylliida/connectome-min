@@ -84,32 +84,34 @@ impl Request {
 pub const INTERRUPTED: &str = "interrupted";
 
 /// driveTick: the memories that are due form, in order (a stub without a call), until one makes a
-/// call or none may be tried; the error a failed call gave, if one did.
-pub fn drive(session: &Session, host: &mut dyn Host, cfg: &Config) -> Option<String> {
+/// call or none may be tried: whether any formed, or the error a failed call gave.
+pub fn drive(session: &Session, host: &mut dyn Host, cfg: &Config) -> Result<bool, String> {
+    let mut formed = false;
     loop {
-        let ((level, p), members) = due(session, cfg).filter(|&(target, _)| !blocked(session, target, cfg))?;
+        let Some(((level, p), members)) = due(session, cfg).filter(|&(target, _)| !blocked(session, target, cfg)) else { return Ok(formed) };
         if level == 1
             && let Some(stub) = quiet(session, p, cfg)
         {
             session.append("layer1", stub);
+            formed = true;
             continue;
         }
         // an L1 waits while it carries tool blocks and the host has declared no tools
-        let request = if level == 1 { l1_request(session, p, host, cfg)? } else { merge_request(session, level, &members, host, cfg) };
+        let Some(request) = (if level == 1 { l1_request(session, p, host, cfg) } else { Some(merge_request(session, level, &members, host, cfg)) }) else { return Ok(formed) };
         let (outcome, error) = match host.complete(&request, &mut Reader::new(session, true)) {
-            Err(error) if error == INTERRUPTED => return None,
+            Err(error) if error == INTERRUPTED => return Ok(formed),
             Err(error) => ("retry", Some(error)),
             Ok(response) if response["stopReason"] == "refusal" => ("refusal", None),
             Ok(response) => match usable(&response) {
                 None => ("retry", None),
                 Some(text) => {
                     session.append(&format!("layer{level}"), written(session, level, &members, &request, &response, text, cfg));
-                    return None;
+                    return Ok(true);
                 }
             },
         };
         session.append("attempts", obj! {"target" => vec![level, p], "messages" => session.count("messages"), "outcome" => outcome});
-        return error;
+        return error.map_or(Ok(formed), Err);
     }
 }
 
@@ -404,7 +406,7 @@ mod tests {
             let said = session.count("messages");
             append(session, &obj! {"participant" => if said % 2 == 0 { "user" } else { "assistant" }, "content" => vec![obj! {"type" => "text", "text" => format!("message {said}: {}", "words ".repeat(60))}]}, cfg);
             while form && due(session, cfg).is_some() {
-                assert_eq!(drive(session, host, cfg), None);
+                assert_eq!(drive(session, host, cfg), Ok(true));
             }
         }
     }
@@ -423,9 +425,9 @@ mod tests {
         }
         assert!(due(&session, &cfg).is_some());
         let mut stopped = Answering(Err(INTERRUPTED.into()), 0);
-        assert_eq!((drive(&session, &mut stopped, &cfg), stopped.1, session.count("attempts")), (None, 1, 0));
+        assert_eq!((drive(&session, &mut stopped, &cfg), stopped.1, session.count("attempts")), (Ok(false), 1, 0));
         let mut failing = Answering(Err("down".into()), 0);
-        assert_eq!((drive(&session, &mut failing, &cfg), session.count("attempts")), (Some("down".into()), 1));
+        assert_eq!((drive(&session, &mut failing, &cfg), session.count("attempts")), (Err("down".into()), 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -485,7 +487,7 @@ mod tests {
         let chunk = format!("[\"messages\",{},0]", session.read("layer0", 10)["first"].u64());
         let order = [at("Recall memory L1-8."), at("Recall memory L1-9."), at(&chunk), at("the L1 memories and the slices of recent experience (raw conversation) above")];
         assert!(order.is_sorted() && at("a single L3 memory") > order[3], "{request}");
-        assert_eq!(drive(&session, &mut host, &cfg), None);
+        assert_eq!(drive(&session, &mut host, &cfg), Ok(true));
         assert_eq!(session.read("layer3", 2)["merges"], json!([[2, 4, 4], [1, 10, 10]]));
         let groups = Recorded::new(&session, &cfg);
         assert_eq!((groups.members((3, 2)), chunks((3, 2), &groups), groups.parent((2, 4))), (vec![(2, 4), (1, 10)], 8..11, Some((3, 2))));
@@ -500,7 +502,7 @@ mod tests {
         let mut formed = vec![];
         while let Some(memory) = due(&session, &cfg) {
             formed.push(memory);
-            assert_eq!(drive(&session, &mut host, &cfg), None);
+            assert_eq!(drive(&session, &mut host, &cfg), Ok(true));
         }
         let l1 = |p: u64| ((1, p), vec![(0, p)]);
         assert_eq!(formed, [l1(11), l1(12), ((2, 5), vec![(1, 11), (1, 12)]), ((4, 1), vec![(3, 2), (2, 5)]), ((5, 0), vec![(4, 0), (4, 1)])]);
