@@ -77,7 +77,8 @@ since one holds the keys:
   first run writes it with a provider named `default` for `https://api.anthropic.com` without a key,
   which the page then asks for, listing `claude-sonnet-5-5`, and defaults for a window of 90k tokens,
   30k of them reserved for the reply (and its reasoning: a reply that reaches its reserve stops
-  there), chunks of 15k tokens, and, on Linux, bash in the sandbox.
+  there), chunks of 15k tokens, memories of up to 8000 tokens (`config.compression_max_tokens`), and,
+  on Linux, bash in the sandbox.
 - `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its
   `window`, `reserve`, the band its prompt folds in (`fold_above` and `fold_to`: past `fold_above`
@@ -85,7 +86,9 @@ since one holds the keys:
   to `config.slack` under that), its `system` prompt, and the library's settings (`config`). A new session's
   file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its
   parent's; a session without one has none to run with, and the page says so. The page edits the
-  main fields and the raw tail (`config.recent_window_tokens`: the newest tokens, never folded), each saved alone as it changes (a choice at once, typing once it pauses for 2.5 s or
+  main fields, the raw tail (`config.recent_window_tokens`: the newest tokens, never folded) and a
+  memory's max tokens (`config.compression_max_tokens`, its reasoning included: unlike the library,
+  where it only lowers the 16000 a memory gets by default, it's the max_tokens a memory asks for), each saved alone as it changes (a choice at once, typing once it pauses for 2.5 s or
   leaves the field, a number only once it is one), its model one its provider lists (or any, typed,
   for a provider that lists none); `config.merge_threshold` can't change once memories have merged,
   nor `config.merge_by_count` turn on; `fold_to` stays at most `fold_above`, and that at most

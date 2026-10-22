@@ -25,7 +25,7 @@ pub struct Config {
     // memory formation (memory.rs)
     pub compression_model: String,                                   // compressionModel: the summarizer, whose voice memories are in
     #[default(2000.0)] pub summary_target_tokens: f64,               // summaryTargetTokens: the length the instruction asks for
-    pub compression_max_tokens: Option<f64>,                         // compressionMaxTokens: the model's output ceiling, if lower
+    pub compression_max_tokens: Option<f64>,                         // compressionMaxTokens: a memory request's max_tokens (its reasoning's too), where the library only lowers its 16000 (or 1.5 * summary_target_tokens) to it
     #[default(200)] pub min_chunk_chars: usize,                      // minChunkCharsForLLM: text-only chunks under this get a stub
     #[default(100_000.0)] pub recall_budget_tokens: f64,             // compressionRecallBudgetTokens: recall pairs a request replays
     #[default(12 * 1024 * 1024)] pub compression_image_bytes: usize, // maxCompressionImageBytes: inline image bytes a request keeps

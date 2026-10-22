@@ -309,13 +309,12 @@ fn ask(session: &Session, before: u64, task: Vec<Turn>, host: &dyn Host, cfg: &C
     for (i, t) in wire.iter_mut().enumerate() {
         t.mark = marks.contains(&i);
     }
-    let cap = cfg.compression_max_tokens.filter(|&c| c > 0.0).unwrap_or(f64::INFINITY);
     Request {
         system: host.system().filter(|s| !s.is_empty()).map(str::to_string),
         messages: wire,
         cache_ttl: !marks.is_empty(),
         model: cfg.compression_model.clone(),
-        max_tokens: 16000f64.max(js_round(cfg.summary_target_tokens * 1.5)).min(cap),
+        max_tokens: cfg.compression_max_tokens.filter(|&c| c > 0.0).unwrap_or_else(|| 16000f64.max(js_round(cfg.summary_target_tokens * 1.5))),
         tools: host.tools().cloned(),
     }
 }

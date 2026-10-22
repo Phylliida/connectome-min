@@ -55,7 +55,7 @@ HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
 LIFTED = 2300   # lifted's window: without lifting, its context stops fitting by the 31st turn
-seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': [], 'planned': {}, 'passbacks': 0, 'forgetful': False, 'long-winded': False}
+seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': [], 'planned': {}, 'passbacks': 0, 'forgetful': False, 'long-winded': False, 'memory max': []}
 PONDERED = 'I weighed what this stretch should keep. '   # what a memory's summarizer thinks first: never sent again
 
 
@@ -131,6 +131,7 @@ class Mock(BaseHTTPRequestHandler):
             if request.get('tools') and request.get('tool_choice') != {'type': 'none'}:
                 return self.problem(f'a memory request may call tools: tool_choice {request.get("tool_choice")}')
             seen['memory'] += 1
+            seen['memory max'].append(request.get('max_tokens'))
             seen['tool memories'] += any(b['type'] == 'tool_use' for m in messages for b in m['content'])
             blocks = [{'type': 'thinking', 'thinking': PONDERED * 40, 'signature': 'bWVt'}, {'type': 'text', 'text': f'I remember stretch {seen["memory"]}: the user talked about ' + ' '.join(['things'] * 60)}]
             if seen['long-winded']:                                # its tokens run out while it thinks
@@ -512,12 +513,15 @@ def lifted(tls, ca) -> str:
             except urllib.error.HTTPError as error:
                 if error.code != 400 or 'fold_' not in json.loads(error.read())['error']:
                     raise SystemExit(f'{wrong} got {error.code}')
-        overhead, contexts = call(port, '/api/s/banded/settings', {'window': 20000, 'fold_above': 4000, 'fold_to': 2000})['overhead'], []   # the tools and system prompt
+        band, asked = {'window': 20000, 'fold_above': 4000, 'fold_to': 2000, 'config': {'compression_max_tokens': 24000}}, len(seen['memory max'])   # memories of up to 24000 tokens, past the library's 16000
+        overhead, contexts = call(port, '/api/s/banded/settings', band)['overhead'], []   # the tools and system prompt
         for t in range(40):
             contexts.append(chat(port, 'banded', 1, t, 20000)['armed'])
         folds = [i for i in range(1, len(contexts)) if contexts[i] < contexts[i - 1]]
         if max(contexts) > 4000 - overhead or not folds or any(contexts[i] > 2000 - overhead for i in folds) or len(folds) > len(contexts) // 4:
             raise SystemExit(f'contexts in a band of 2000 to 4000 tokens of prompt: {contexts}, folding at {folds}')
+        if set(seen['memory max'][:asked]) != {8000} or set(seen['memory max'][asked:]) != {24000}:   # a first run's 8000, then the session's own
+            raise SystemExit(f'memory requests asked for {seen["memory max"][:asked][:4]}, then {seen["memory max"][asked:][:4]} tokens')
         return f'{len(lifts)} lifted merges (the first L{lifts[0][0]} of {lifts[0][1]}), layers {state["layers"]}, frontier {state["frontier"]}; ' \
                f'a turn waited for {sum(after[1:])} memories; contexts in a band of 2000 to 4000 folded {len(folds)} times in 40 turns'
     finally:

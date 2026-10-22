@@ -359,7 +359,7 @@ impl Worker<'_> {
             Err(why) => Formed::Failed(why),
             Ok(_) if self.s.count("attempts") > tried => Formed::Unused(match summarizer.ended {
                 Some((ended, _)) if ended == "refusal" => "the summarizer refused to write it, and memories stop forming until that's mended".into(),
-                Some((ended, max)) if ended == "max_tokens" => format!("the summarizer's reply ran out of its {max} tokens, its reasoning included, before it wrote the memory (config.compression_max_tokens)"),
+                Some((ended, max)) if ended == "max_tokens" => format!("the summarizer's reply ran out of its {max} tokens, its reasoning included, before it wrote the memory (Memory max tokens, config.compression_max_tokens)"),
                 ended => format!("the summarizer's reply ended ({}) without a memory in it", ended.map_or("nothing".into(), |(ended, _)| ended)),
             }),
             Ok(true) => Formed::Memory,
