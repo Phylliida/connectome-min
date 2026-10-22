@@ -1152,7 +1152,9 @@ def chatted(turns, tls, ca, baseline) -> str:
             say(port, 'tight', 'too long ' * 2000)
             raise SystemExit('a context that does not fit was sent')
         except SystemExit as refused:
-            if "The context doesn't fit" not in str(refused) or 'less 1000 for the reply' not in str(refused) or 'Raise the window' not in str(refused):
+            took, told = re.search(r'it takes (\d+) tokens', str(refused)), re.search(r'It holds 0 memories \(0 tokens\), 0 chunks raw that have no memory yet \(0\), (\d+) tokens of messages not yet in a chunk .* and the 0 most recent', str(refused))
+            if "The context doesn't fit" not in str(refused) or 'less 1000 for the reply' not in str(refused) or 'Raise the window' not in str(refused) \
+                    or not took or not told or took[1] != told[1]:   # all of it the message: past the recent window, the tail has none, and alone it closes no chunk
                 raise
         call(port, '/api/sessions', {'name': 'cut'})                     # a reply whose stream is cut off, then one whose request fails: each tried again
         before, started = len(seen['retries']), time.monotonic()

@@ -25,6 +25,13 @@ pub struct Refusal {
     pub stage: &'static str,
     pub actual: f64,
     pub budget: f64,
+    /// What the context at its most folded holds, how many and their tokens: memories, and chunks
+    /// raw that have no L1 yet; then the tokens of the messages no chunk holds yet, outside the tail
+    /// and in it.
+    pub memories: (usize, f64),
+    pub unformed: (usize, f64),
+    pub open: f64,
+    pub tail: f64,
 }
 
 /// The plan: the turns of the context, their blocks located.
@@ -49,17 +56,23 @@ pub fn select(session: &Session, w: f64, calibration: Calibration, cfg: &Config)
         let p = priced(session, i);
         if live.contains(&i) { live_price(&p, m, &mut admit) } else { py_round(stripped_raw(&p) * m) }
     };
-    let fixed = loose.clone().rev().map(price).fold(0.0, |a, x| a + x);
+    let prices: Vec<f64> = loose.clone().rev().map(price).collect(); // newest first, as the live image limits count
+    let fixed = prices.iter().fold(0.0, |a, x| a + x);
     let frontier = plan(frontier, cost, |(n, p)| p < held(n), fixed, w, &groups, cfg);
     let total = fixed + frontier.iter().map(|&n| cost(n)).fold(0.0, |a, x| a + x);
     let limit = (w * (1.0 + cfg.over_budget_grace)).floor();
+    let refusal = |stage| {
+        let held = |raw: bool| frontier.iter().filter(|n| (n.0 == 0) == raw).fold((0, 0.0), |(k, t), &n| (k + 1, t + cost(n)));
+        let tail = prices[..(loose.end - tail) as usize].iter().fold(0.0, |a, x| a + x);
+        Refusal { stage, actual: total, budget: limit, memories: held(false), unformed: held(true), open: fixed - tail, tail }
+    };
     if total > limit {
         let mut record = last.clone();
         record["multiplier"] = m.into();
         record["armed"] = calibration.armed.into();
         record["escalated"] = true.into();
         session.append("compiles", record);
-        return Err(Refusal { stage: "Adaptive picker exhausted", actual: total, budget: limit });
+        return Err(refusal("Adaptive picker exhausted"));
     }
 
     let mut entries: Vec<Turn> = frontier.iter().flat_map(|&node| render(session, node, cfg)).chain(messages(session, loose.clone(), &live, cfg)).collect();
@@ -67,7 +80,7 @@ pub fn select(session: &Session, w: f64, calibration: Calibration, cfg: &Config)
     entries.truncate(entries.len() - trailing);
     let entries = pair_tools(entries);
     if !loose.is_empty() && !entries.iter().any(|e| e.source == Some(loose.end - 1)) {
-        return Err(Refusal { stage: "Structural repair did not retain the newest turn", actual: total, budget: limit });
+        return Err(refusal("Structural repair did not retain the newest turn"));
     }
     let keys: Vec<String> = entries.iter().map(|e| digest(&Value::Array(vec![e.participant.as_str().into(), located(&e.content)]))).collect();
     // placeCacheMarkers: the end of the prefix unchanged since the previous compile (before any, the last

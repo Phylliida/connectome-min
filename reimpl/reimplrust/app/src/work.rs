@@ -91,8 +91,11 @@ fn refused(r: &Refusal, setup: &Setup) -> String {
     if r.actual <= r.budget {
         return format!("{} ({:.0} tokens, of {:.0})", r.stage, r.actual, r.budget);
     }
+    let ((memories, remembered), (unformed, waiting)) = (r.memories, r.unformed);
     format!("The context doesn't fit: folded as far as it can be, it takes {:.0} tokens, and the window leaves it {:.0} ({:.0}, less {:.0} for the reply and {:.0} for the tools and system prompt). \
-        Raise the window, lower the reply reserve, or keep fewer recent tokens raw (config.recent_window_tokens, now {:.0}).", r.actual, r.budget, s.window, s.reserve, setup.overhead, s.config.recent_window_tokens)
+        It holds {memories} memories ({remembered:.0} tokens), {unformed} chunks raw that have no memory yet ({waiting:.0}), {:.0} tokens of messages not yet in a chunk (one closes at config.target_chunk_tokens, now {:.0}, of text), \
+        and the {:.0} most recent kept raw (config.recent_window_tokens, now {:.0}). Raise the window, lower the reply reserve, or make chunks or the recent window smaller.",
+        r.actual, r.budget, s.window, s.reserve, setup.overhead, r.open, s.config.target_chunk_tokens, r.tail, s.config.recent_window_tokens)
 }
 
 /// The tokens a system prompt and tool definitions take.
