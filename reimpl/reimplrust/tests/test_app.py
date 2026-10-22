@@ -506,12 +506,12 @@ def lifted(tls, ca) -> str:
                 raise
         seen['long-winded'] = False
         call(port, '/api/sessions', {'name': 'banded'})                  # a band in a big window: past fold_above it folds, down to fold_to
-        for wrong in ({'fold_above': 19500}, {'fold_above': 4000, 'fold_to': 4500}):
+        for wrong in ({'fold_above': 19500}, {'fold_above': 4000, 'fold_to': 4500}, {'config': {'target_chunk_tokens': 0}}):
             try:
                 call(port, '/api/s/banded/settings', {'window': 20000, **wrong})
                 raise SystemExit(f'the settings took {wrong} in a window of 20000, 1000 of it the reply\'s')
             except urllib.error.HTTPError as error:
-                if error.code != 400 or 'fold_' not in json.loads(error.read())['error']:
+                if error.code != 400 or not re.search('fold_|a chunk', json.loads(error.read())['error']):
                     raise SystemExit(f'{wrong} got {error.code}')
         band, asked = {'window': 20000, 'fold_above': 4000, 'fold_to': 2000, 'config': {'compression_max_tokens': 24000}}, len(seen['memory max'])   # memories of up to 24000 tokens, past the library's 16000
         overhead, contexts = call(port, '/api/s/banded/settings', band)['overhead'], []   # the tools and system prompt

@@ -537,6 +537,8 @@ function SessionForm() {
     <label>Reply reserve <input name="reserve" type="number" defaultValue=${s.reserve ?? ''} /></label>
     <label title="The newest this many tokens of the context stay as they were, never folded">Raw tail
       <input name="config.recent_window_tokens" type="number" defaultValue=${s.config?.recent_window_tokens ?? ''} /></label>
+    <label title="Messages close into a chunk, which one memory holds, at this many tokens of text; and a merge gathers memories until they hold this many">Chunk size
+      <input name="config.target_chunk_tokens" type="number" defaultValue=${s.config?.target_chunk_tokens ?? ''} /></label>
     <label title="The most tokens the summarizer may write for a memory, its reasoning included">Memory max tokens
       <input name="config.compression_max_tokens" type="number" data-optional="1" defaultValue=${s.config?.compression_max_tokens ?? ''} placeholder=${Math.max(16000, Math.round((s.config?.summary_target_tokens ?? 2000) * 1.5))} /></label>
     <label title="Past this many tokens of prompt, the context folds into memories, waiting for them if it must">Fold above

@@ -86,13 +86,14 @@ since one holds the keys:
   to `config.slack` under that), its `system` prompt, and the library's settings (`config`). A new session's
   file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its
   parent's; a session without one has none to run with, and the page says so. The page edits the
-  main fields, the raw tail (`config.recent_window_tokens`: the newest tokens, never folded) and a
+  main fields, the chunk size (`config.target_chunk_tokens`: the tokens of text a chunk closes at,
+  and that a merge gathers memories to), the raw tail (`config.recent_window_tokens`: the newest tokens, never folded) and a
   memory's max tokens (`config.compression_max_tokens`, its reasoning included: unlike the library,
   where it only lowers the 16000 a memory gets by default, it's the max_tokens a memory asks for), each saved alone as it changes (a choice at once, typing once it pauses for 2.5 s or
   leaves the field, a number only once it is one), its model one its provider lists (or any, typed,
   for a provider that lists none); `config.merge_threshold` can't change once memories have merged,
   nor `config.merge_by_count` turn on; `fold_to` stays at most `fold_above`, and that at most
-  what the window leaves the reply.
+  what the window leaves the reply; and a chunk holds more than 0 tokens.
 
 Tools (`app/src/tools/`): the model can call `bash` (a command in a new shell in the session's
 workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in the workspace changed
