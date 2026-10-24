@@ -3,16 +3,18 @@
 //!   - the next chunk's L1, once l1_holdback_chunks newer chunks have closed, or at once when the last
 //!     compile couldn't fold enough (escalated);
 //!   - else the next merge at the lowest level: layer n+1's next entry, once the entries of layer n no
-//!     memory has merged yet have closed a group (closed): the fewest, at least two, that hold
-//!     target_chunk_tokens, as chunks close; or under merge_by_count, as the library merges, k of
+//!     memory has merged yet have closed a group (closed): the fewest, at least min_merge_memories,
+//!     that hold target_chunk_tokens, as chunks close; or under merge_by_count, as the library merges, k of
 //!     them (k = merge_threshold). A merged memory's record says what it merged (Recorded);
 //!   - else, when the last compile couldn't fold enough and not under merge_by_count, a lifted merge,
 //!     which the library doesn't make (it merges only within a layer). Each layer keeps the entries
 //!     no memory has merged, short of a group, and with enough layers those and the tail outgrow the
 //!     window, with nothing left to fold. A lifted merge takes the oldest of them past the top
-//!     layer's, across layers, the fewest, at least two, that hold target_chunk_tokens, into a memory
-//!     one layer above the highest it takes, so it waits with that layer's (lifted). A memory held back
-//!     (blocked) holds back those after it, but not a lift, which goes ahead past it.
+//!     layer's, across layers, the fewest, at least min_merge_memories, that hold target_chunk_tokens, into a memory
+//!     one layer above the highest it takes, so it waits with that layer's (lifted);
+//!   - else, when the last compile couldn't fold enough, the same merge or lift of two at least, so
+//!     folding never waits on a third memory (escalated: what was due at min_merge_memories first).
+//!   A memory held back (blocked) holds back those after it, but not a lift, which goes ahead past it.
 //!
 //! A memory asks the summarizer what the agent saw before the stretch, replayed (a recall pair for each
 //! unmerged memory the recall budget fits, newest first), then the stretch and an instruction. A
@@ -122,7 +124,7 @@ fn next(session: &Session, cfg: &Config) -> Option<(Node, Vec<Node>)> {
     if !blocked(session, first.0, cfg) {
         return Some(first);
     }
-    lift(session, cfg).filter(|&(target, _)| !blocked(session, target, cfg))
+    [cfg.min_merge_memories, 2].into_iter().find_map(|least| lift(session, least, cfg)).filter(|&(target, _)| !blocked(session, target, cfg))
 }
 
 /// Why the memory due doesn't form, if it's held back: memories stopped forming at a refusal, or it
@@ -137,17 +139,21 @@ pub fn stalled(session: &Session, cfg: &Config) -> Option<String> {
 }
 
 /// The memory to form next, and what it holds: the next L1 (its chunk), else the lowest level's next
-/// merge, else a lift.
+/// merge, else a lift, of min_merge_memories at least; else, when the last compile couldn't fold
+/// enough, the same of two at least.
 fn due(session: &Session, cfg: &Config) -> Option<(Node, Vec<Node>)> {
     let (groups, count) = (Recorded::new(session, cfg), |n: u64| session.count(&format!("layer{n}")));
     let holdback = if escalated(session) { 0 } else { cfg.l1_holdback_chunks };
-    let merge = || (1..).take_while(|&n| count(n) > 0).find_map(|n| closed(session, n, &groups, cfg)).map(|m| into(session, m));
-    (count(1) < count(0).saturating_sub(holdback)).then(|| into(session, vec![(0, count(1))])).or_else(merge).or_else(|| lift(session, cfg))
+    let merge = |least: u64| (1..).take_while(|&n| count(n) > 0).find_map(|n| closed(session, n, &groups, least, cfg)).map(|m| into(session, m));
+    let either = |least: u64| merge(least).or_else(|| lift(session, least, cfg));
+    let pairs = || (escalated(session) && cfg.min_merge_memories > 2).then(|| either(2)).flatten();
+    (count(1) < count(0).saturating_sub(holdback)).then(|| into(session, vec![(0, count(1))])).or_else(|| either(cfg.min_merge_memories)).or_else(pairs)
 }
 
-/// A lifted merge, when the last compile couldn't fold enough, not under merge_by_count.
-fn lift(session: &Session, cfg: &Config) -> Option<(Node, Vec<Node>)> {
-    (escalated(session) && !cfg.merge_by_count).then(|| lifted(session, cfg)).flatten().map(|m| into(session, m))
+/// A lifted merge of `least` memories at least, when the last compile couldn't fold enough, not under
+/// merge_by_count.
+fn lift(session: &Session, least: u64, cfg: &Config) -> Option<(Node, Vec<Node>)> {
+    (escalated(session) && !cfg.merge_by_count).then(|| lifted(session, least, cfg)).flatten().map(|m| into(session, m))
 }
 
 /// Whether the last compile couldn't fold enough.
@@ -217,9 +223,9 @@ fn open(session: &Session, n: u64, groups: &Recorded) -> u64 {
 }
 
 /// The group layer n+1's next memory merges, once it has closed: of the entries of layer n no memory
-/// has merged, the fewest, at least two, that hold target_chunk_tokens; under merge_by_count,
+/// has merged, the fewest, at least `least`, that hold target_chunk_tokens; under merge_by_count,
 /// merge_threshold of them.
-fn closed(session: &Session, n: u64, groups: &Recorded, cfg: &Config) -> Option<Vec<Node>> {
+fn closed(session: &Session, n: u64, groups: &Recorded, least: u64, cfg: &Config) -> Option<Vec<Node>> {
     let (start, count) = (open(session, n, groups), session.count(&format!("layer{n}")));
     if cfg.merge_by_count {
         return (start + cfg.merge_threshold <= count).then(|| (start..start + cfg.merge_threshold).map(|j| (n, j)).collect());
@@ -227,21 +233,21 @@ fn closed(session: &Session, n: u64, groups: &Recorded, cfg: &Config) -> Option<
     let mut held = 0.0;
     let full = |i: &u64| {
         held += session.read(&format!("layer{n}"), *i)["tokens"].as_f64().unwrap();
-        *i > start && held >= cfg.target_chunk_tokens
+        *i + 1 >= start + least && held >= cfg.target_chunk_tokens
     };
     (start..count).find(full).map(|last| (start..=last).map(|j| (n, j)).collect())
 }
 
 /// The group a lifted memory merges: of the memories no memory has merged, oldest first, past the top
-/// layer's, the fewest, at least two, that hold target_chunk_tokens.
-fn lifted(session: &Session, cfg: &Config) -> Option<Vec<Node>> {
+/// layer's, the fewest, at least `least`, that hold target_chunk_tokens.
+fn lifted(session: &Session, least: u64, cfg: &Config) -> Option<Vec<Node>> {
     let waiting = unmerged(session, u64::MAX, cfg);
     let top = waiting.first()?.0.0;
     let below: Vec<(Node, f64)> = waiting.into_iter().skip_while(|&((level, _), _)| level == top).collect();
     let mut held = 0.0;
     let last = below.iter().enumerate().position(|(i, &(_, tokens))| {
         held += tokens;
-        i > 0 && held >= cfg.target_chunk_tokens
+        i as u64 + 1 >= least && held >= cfg.target_chunk_tokens
     })?;
     Some(below[..=last].iter().map(|&(node, _)| node).collect())
 }
@@ -469,7 +475,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("connectome-merges-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let session = Session::open(&dir);
-        let by_count = Config { target_chunk_tokens: 50.0, recent_window_tokens: 50.0, l1_holdback_chunks: 0, merge_threshold: 4, merge_by_count: true, ..Config::default() };
+        let by_count = Config { target_chunk_tokens: 50.0, recent_window_tokens: 50.0, l1_holdback_chunks: 0, merge_threshold: 4, merge_by_count: true, min_merge_memories: 2, ..Config::default() };
         let mut host = memory_of_30_tokens();
         let mut grow = |chunks: u64, cfg: &Config| grow(&session, &mut host, chunks, true, cfg);
         let count = |n: u64| session.count(&format!("layer{n}"));
@@ -493,6 +499,11 @@ mod tests {
         let before = count(2) as usize;
         grow(4, &tiny);
         assert_eq!(runs(2, before), [(16, 17), (18, 19)]);
+        // and min_merge_memories at least, which may change as it goes
+        let threes = Config { min_merge_memories: 3, ..tiny.clone() };
+        let before = count(2) as usize;
+        grow(6, &threes);
+        assert_eq!(runs(2, before), [(20, 22), (23, 25)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -501,7 +512,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("connectome-lifted-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let session = Session::open(&dir);
-        let cfg = Config { target_chunk_tokens: 50.0, recent_window_tokens: 50.0, l1_holdback_chunks: 0, ..Config::default() };
+        let cfg = Config { target_chunk_tokens: 50.0, recent_window_tokens: 50.0, l1_holdback_chunks: 0, min_merge_memories: 2, ..Config::default() };
         let mut host = memory_of_30_tokens();
         let count = |n: u64| session.count(&format!("layer{n}"));
         // memories of 30 tokens merge two at a time, so eleven chunks leave L4 0, L2 4 and L1 10 unmerged
@@ -513,7 +524,9 @@ mod tests {
         let before = floor();
         assert_eq!(due(&session, &Config { merge_by_count: true, ..cfg.clone() }), None);   // as the library: nothing to merge
         assert_eq!(due(&session, &cfg), Some(((3, 2), vec![(2, 4), (1, 10)])));   // past the top layer's, into one above the highest
-        assert_eq!(lifted(&session, &Config { target_chunk_tokens: 10.0, ..cfg.clone() }), Some(vec![(2, 4), (1, 10)]));   // two at least
+        assert_eq!(lifted(&session, 2, &Config { target_chunk_tokens: 10.0, ..cfg.clone() }), Some(vec![(2, 4), (1, 10)]));   // two at least
+        assert_eq!(lifted(&session, 3, &cfg), None);   // three at least, and two wait
+        assert_eq!(due(&session, &Config { min_merge_memories: 3, ..cfg.clone() }), Some(((3, 2), vec![(2, 4), (1, 10)])));   // so two, to fold
         // its request: what each merged, one level deeper (L2 4's L1s as recall pairs, L1 10's chunk raw)
         let request = merge_request(&session, 3, &[(2, 4), (1, 10)], &host, &cfg).value(|b| b.at.value()).to_string();
         let at = |needle: &str| request.find(needle).unwrap_or_else(|| panic!("{needle} is not in {request}"));
@@ -548,7 +561,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("connectome-stalled-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let session = Session::open(&dir);
-        let cfg = Config { target_chunk_tokens: 50.0, recent_window_tokens: 50.0, l1_holdback_chunks: 0, ..Config::default() };
+        let cfg = Config { target_chunk_tokens: 50.0, recent_window_tokens: 50.0, l1_holdback_chunks: 0, min_merge_memories: 2, ..Config::default() };
         let mut host = memory_of_30_tokens();
         grow(&session, &mut host, 11, true, &cfg);
         grow(&session, &mut host, 1, false, &cfg); // chunk 11, its memory not yet formed

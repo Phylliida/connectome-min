@@ -6,13 +6,13 @@ autobiographical compaction) and a web app around it.
 - `connectome/`: the library, over serde_json (with smart-default and itertools). A session is
   append-only JSONL files on disk (`store.rs`), in the same format the Python port writes, so either
   can carry on from the other's files while memories merge by count. One thing differs from the
-  port: by default a merge takes the fewest memories of the layer below, at least two, that hold
-  `target_chunk_tokens`, as chunks close, so a merge's request stays about the same size however
+  port: by default a merge takes the fewest memories of the layer below, at least `min_merge_memories`
+  (3 by default; 2 when a compile can't fold far enough without), that hold `target_chunk_tokens`, as chunks close, so a merge's request stays about the same size however
   long memories are, and its record says what it merged (`merges`). And where the library only
   merges within a layer, a compile that can't fold enough lifts: each layer keeps memories no merge
   has taken yet, short of a group, and with enough layers those and the tail outgrow the window with
-  nothing left to fold, so the oldest of them past the top layer's, across layers, the fewest that
-  hold `target_chunk_tokens`, merge into a memory one layer above the highest it takes (`memory.rs`,
+  nothing left to fold, so the oldest of them past the top layer's, across layers, the fewest (again at
+  least `min_merge_memories`) that hold `target_chunk_tokens`, merge into a memory one layer above the highest it takes (`memory.rs`,
   `lifted`), even past a memory that keeps failing, which would hold back any other. `merge_by_count` merges `merge_threshold` at a time and never lifts, as the port does
   (the differential test runs that way); a memory without `merges` is read as such a group, so a
   session that merged by count goes on by tokens from where it was. A compile plans the context from prices and block shapes only (`emit::select`), and
@@ -87,13 +87,13 @@ since one holds the keys:
   file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its
   parent's; a session without one has none to run with, and the page says so. The page edits the
   main fields, the chunk size (`config.target_chunk_tokens`: the tokens of text a chunk closes at,
-  and that a merge gathers memories to), the raw tail (`config.recent_window_tokens`: the newest tokens, never folded) and a
+  and that a merge gathers memories to), the least memories a merge takes (`config.min_merge_memories`, 2 or more, though a merge takes 2 when the context can't fold down to `fold_to` otherwise; it can change at any time, since each merge records what it took), the raw tail (`config.recent_window_tokens`: the newest tokens, never folded) and a
   memory's max tokens (`config.compression_max_tokens`, its reasoning included: unlike the library,
   where it only lowers the 16000 a memory gets by default, it's the max_tokens a memory asks for), each saved alone as it changes (a choice at once, typing once it pauses for 2.5 s or
   leaves the field, a number only once it is one), its model one its provider lists (or any, typed,
   for a provider that lists none); `config.merge_threshold` can't change once memories have merged,
   nor `config.merge_by_count` turn on; `fold_to` stays at most `fold_above`, and that at most
-  what the window leaves the reply; and a chunk holds more than 0 tokens.
+  what the window leaves the reply; a chunk holds more than 0 tokens; and a merge takes 2 memories or more.
 
 Tools (`app/src/tools/`): the model can call `bash` (a command in a new shell in the session's
 workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in the workspace changed

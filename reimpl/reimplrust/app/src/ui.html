@@ -539,6 +539,8 @@ function SessionForm() {
       <input name="config.recent_window_tokens" type="number" defaultValue=${s.config?.recent_window_tokens ?? ''} /></label>
     <label title="Messages close into a chunk, which one memory holds, at this many tokens of text; and a merge gathers memories until they hold this many">Chunk size
       <input name="config.target_chunk_tokens" type="number" defaultValue=${s.config?.target_chunk_tokens ?? ''} /></label>
+    <label title="A merge takes at least this many memories, 2 or more, from one layer or, lifted, several, however few would hold a chunk's tokens; two only when the context can't fold down otherwise">Min memories per merge
+      <input name="config.min_merge_memories" type="number" min="2" step="1" defaultValue=${s.config?.min_merge_memories ?? ''} /></label>
     <label title="The most tokens the summarizer may write for a memory, its reasoning included">Memory max tokens
       <input name="config.compression_max_tokens" type="number" data-optional="1" defaultValue=${s.config?.compression_max_tokens ?? ''} placeholder=${Math.max(16000, Math.round((s.config?.summary_target_tokens ?? 2000) * 1.5))} /></label>
     <label title="Past this many tokens of prompt, the context folds into memories, waiting for them if it must">Fold above

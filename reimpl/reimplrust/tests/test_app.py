@@ -442,10 +442,11 @@ def chat(port, name, turns, start, window=WINDOW):
 
 def misgrouped(state, layers) -> str | None:
     """Why a session's merges aren't as memory formation makes them, if they aren't: each the fewest
-    memories, at least two, that hold a chunk's tokens, of the layer below, or, lifted, of runs of
+    memories, at least min_merge_memories (or two, when folding needs them), that hold a chunk's tokens, of the layer below, or, lifted, of runs of
     several layers below, the highest first, side by side; each layer's merged memories its oldest,
     each merged once; each memory covering the chunks its members do."""
     target, covers, taken = state['settings']['config']['target_chunk_tokens'], state['covers'], set()
+    least = state['settings']['config']['min_merge_memories']
     chunks = lambda level, j: (j, j + 1) if level == 1 else tuple(covers[level - 2][j])
     for n in range(2, len(layers)):
         for p, m in enumerate(layers[n]):
@@ -453,7 +454,7 @@ def misgrouped(state, layers) -> str | None:
             members = [(level, j) for level, a, b in runs for j in range(a, b + 1)]
             tokens, spans = [layers[level][j]['tokens'] for level, j in members], [chunks(*node) for node in members]
             if runs[0][0] != n - 1 or [r[0] for r in runs] != sorted({r[0] for r in runs}, reverse=True) or len(members) < 2 or sum(tokens) < target \
-                    or sum(tokens[:-1]) >= target or any(a[1] != b[0] for a, b in zip(spans, spans[1:])) or tuple(covers[n - 2][p]) != (spans[0][0], spans[-1][1]) or taken & set(members):
+                    or len(members) > least and sum(tokens[:-1]) >= target or any(a[1] != b[0] for a, b in zip(spans, spans[1:])) or tuple(covers[n - 2][p]) != (spans[0][0], spans[-1][1]) or taken & set(members):
                 return f'L{n} {p} merged {runs}, memories of {tokens} tokens (a chunk {target}) covering {spans}, as L{n} covers {covers[n - 2][p]}'
             taken |= set(members)
     for level in range(1, len(layers)):

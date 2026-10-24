@@ -103,7 +103,7 @@ impl SessionSettings {
     /// These settings as what `v` gives changes them: any of their fields, and any of config's. The
     /// provider must be one of `all`'s, a workspace given a directory that exists (absolute, a leading
     /// ~/ the home directory, no trailing /), fold_to at most fold_above and that at most what the window
-    /// leaves the reply, chunks of more than 0 tokens, and once memories have `merged`, merge_threshold as it was and merge_by_count
+    /// leaves the reply, chunks of more than 0 tokens, merges of 2 memories or more, and once memories have `merged`, merge_threshold as it was and merge_by_count
     /// not turned on (merging by count after merging by tokens would misread them).
     pub fn tuned(&self, v: &Value, merged: bool, all: &Settings) -> Result<SessionSettings, String> {
         let mut new = serde_json::to_value(self).expect("settings are JSON");
@@ -133,6 +133,9 @@ impl SessionSettings {
         }
         if new.config.target_chunk_tokens <= 0.0 {
             return Err(format!("a chunk ({} tokens) must hold more than 0", new.config.target_chunk_tokens));
+        }
+        if new.config.min_merge_memories < 2 {
+            return Err(format!("a merge ({} memories at least) must take 2 or more", new.config.min_merge_memories));
         }
         if merged && new.config.merge_threshold != self.config.merge_threshold {
             return Err("merge_threshold stays as it is once memories have merged".into());
