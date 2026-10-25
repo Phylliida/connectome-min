@@ -75,9 +75,11 @@ since one holds the keys:
   new session starts with; `sandbox`, what a sandboxed command sees; and `search`, a SearXNG
   server's address (say `http://10.0.0.139:8288`), which gives sessions the `web_search` tool. The
   first run writes it with a provider named `default` for `https://api.anthropic.com` without a key,
-  which the page then asks for, listing `claude-sonnet-5-5`, and defaults for a window of 90k tokens,
+  which the page then asks for, listing `claude-sonnet-5-5`, and defaults for a window of 180k tokens,
   30k of them reserved for the reply (and its reasoning: a reply that reaches its reserve stops
-  there), chunks of 15k tokens, memories of up to 8000 tokens (`config.compression_max_tokens`), and,
+  there), a prompt that folds past 90k tokens down to 65k (`fold_above`, `fold_to`), a raw tail of
+  20k, chunks of 3k, merges of 3 memories at least, memories of up to 20k tokens
+  (`config.compression_max_tokens`), and,
   on Linux, bash in the sandbox.
 - `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its
@@ -151,7 +153,11 @@ either. A fork has no companion of its own.
 Channels (`app/src/channels.rs`) are logs of posts that sessions take part in, made from the page's
 Channels list on the left, each shown with its posts and a box that posts to it as the user. A
 session's settings panel adds it to a channel (its choice of channels, and +) and sets whether it
-listens there, kept in its settings' `channels` (`{"NAME": {"inputs": true}}`). A session in a
+listens there and the most posts a day it may make there, kept in its settings' `channels`
+(`{"NAME": {"inputs": true, "per_day": 5}}`; `per_day` 0 or less, or left out, is no limit). Past
+its limit (counted over the last 24 hours), `message_channel` is refused, "Rate limit exceeded",
+saying when the next post can go, and under one each post's result says how many it has left; the
+tool's description lists each channel's limit, which changes only when you change it. A session in a
 channel has `message_channel`, which posts there; a post, the user's or a session's, goes at once to
 every session in the channel with `inputs` on but the one that posted it, as a message (its
 participant `#NAME`) headed by who posted it ("onion posted in #NAME:", or "The user posted…") and
@@ -161,9 +167,40 @@ listens), the way a companion's messages come: between the steps
 of a turn running, or in a turn of its own. The call's result names the sessions that heard it.
 What a session says otherwise stays in its session, so it stops posting when it chooses to; only the
 user sets who's in a channel and who listens. A channel is `ROOT/.channels/NAME/`: `posts.jsonl`,
-each post `{id, from, text}` (`from` null for the user's), and `channel.json`, its `description`;
+each post `{id, from, text, at}` (`from` null for the user's, `at` when, in seconds since 1970), and `channel.json`, its `description`;
 the hub alone writes both. A fork, and a new companion, are in no channel. Sessions can't yet read a channel's history
 beyond what they hear.
+
+Boards (`app/src/boards.rs`) are kanban boards kept as files, which sessions work on with the tools
+they have. A board is `ROOT/.boards/NAME/`: `board.json` (its columns' order and its description),
+and a folder per column, `done/` always among them and last, each holding a `.md` file per task:
+
+```markdown
+---
+title: Document the merge minimum
+owner: onion
+---
+What it's for…
+
+## Comments
+- **onion**: started on this
+```
+
+The page's Boards list on the left makes boards (with todo, doing and done) and shows one as columns
+of cards, read again every 3 s, where you add and take out columns (an empty one, not done), reorder
+them by dragging a column's header (done stays last), collapse one to its header (kept in your
+browser), make tasks, move one by dragging its card to another column, and open one to change its
+title, column, owner and description, comment, or delete it. A
+session's settings panel puts it on a board (`boards` in its settings), which takes a workspace and
+not being a companion: the board's folder is then bound into its sandbox, read-write, besides what
+`settings.json`'s `sandbox` gives it, its `edit` tool reaches it, and its system prompt says where the
+board is and how it's laid out, so it makes, moves (`mv`) and comments on tasks as files. A task's
+owner, if it's a session on the board, hears as a message (participant `board:NAME`) when the task is
+handed to it and when someone else comments on it, the message ending with a sentence on how boards
+work and then the board's description. The hub looks at a board again after each step of a session
+on it that ran tools, and after each change from the page, and puts what changed down to that
+session, or to you, so a session that takes a task itself isn't told; a change made by hand outside
+the page is put down to whoever looks next. A fork, and a new companion, are on no board.
 
 A turn takes steps, a model request each, as many as it takes until a reply calls no tools (or the
 user stops it). After a step that called tools, and after the turn, the next memory due forms. Below

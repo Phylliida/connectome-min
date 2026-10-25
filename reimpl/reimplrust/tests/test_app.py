@@ -24,10 +24,11 @@ host gets nothing; the model's tool calls, through MCP servers, get their result
 memories; the app's peak memory doesn't grow with the contexts it streams; and in a window too
 small for a memory no merge has taken on each layer and the tail, the oldest of them merge across
 layers (lifted), and every turn still gets its reply. In a channel, each post, the user's or a
-session's (message_channel), goes to the sessions there with inputs on but its poster.
+session's (message_channel), goes to the sessions there with inputs on but its poster. On a board,
+sessions work on tasks as files, and a task's owner hears when it's handed to them or commented on.
 
-The six parts (the chat, the tool calls, the large contexts, the companion, the lifted memories,
-the channels) run at once, in processes of their own, each with its own mock; the first to fail stops the rest.
+The seven parts (the chat, the tool calls, the large contexts, the companion, the lifted memories,
+the channels, the boards) run at once, in processes of their own, each with its own mock; the first to fail stops the rest.
 
     python3 tests/test_app.py [turns]
 """
@@ -314,16 +315,16 @@ def call(port, path, body=None):
 
 def configure(root, base, window, recent, chunk):
     """settings.json as the app's first run wrote it, edited as a user would: the default provider at
-    `base`, and new sessions on the mock's model in `window` tokens, 1000 of them the reply's, the
-    library's chunks and recent window sized for it (as a first run sizes them for its window, less
-    the tool definitions)."""
+    `base`, and new sessions on the mock's model in `window` tokens, 1000 of them the reply's, folding
+    in the band the window gives (no fold_above or fold_to), with `chunk`s and a recent window of
+    `recent` sized for it."""
     path = Path(root, 'settings.json')
     everything = json.loads(path.read_text())
     if everything['defaults']['sandbox'] != sys.platform.startswith('linux') or everything['providers']['default']['models'] != [everything['defaults']['model']] \
-            or everything['defaults']['config']['target_chunk_tokens'] != 15000:
+            or everything['defaults']['config']['target_chunk_tokens'] != 3000 or (everything['defaults']['fold_above'], everything['defaults']['fold_to']) != (90000, 65000):
         raise SystemExit(f'a first run wrote {everything["defaults"]["sandbox"]=}, {everything["providers"]["default"]["models"]=} and chunks of {everything["defaults"]["config"]["target_chunk_tokens"]}')
     everything['providers']['default']['base'] = base
-    everything['defaults'].update(model='mock', window=window, reserve=1000)
+    everything['defaults'].update(model='mock', window=window, reserve=1000, fold_above=None, fold_to=None)   # the window's own band
     everything['defaults']['config'].update(recent_window_tokens=recent, target_chunk_tokens=chunk)
     path.write_text(json.dumps(everything))
 
@@ -523,7 +524,7 @@ def lifted(tls, ca) -> str:
         folds = [i for i in range(1, len(contexts)) if contexts[i] < contexts[i - 1]]
         if max(contexts) > 4000 - overhead or not folds or any(contexts[i] > 2000 - overhead for i in folds) or len(folds) > len(contexts) // 4:
             raise SystemExit(f'contexts in a band of 2000 to 4000 tokens of prompt: {contexts}, folding at {folds}')
-        if set(seen['memory max'][:asked]) != {8000} or set(seen['memory max'][asked:]) != {24000}:   # a first run's 8000, then the session's own
+        if set(seen['memory max'][:asked]) != {20000} or set(seen['memory max'][asked:]) != {24000}:   # a first run's 20000, then the session's own
             raise SystemExit(f'memory requests asked for {seen["memory max"][:asked][:4]}, then {seen["memory max"][asked:][:4]} tokens')
         return f'{len(lifts)} lifted merges (the first L{lifts[0][0]} of {lifts[0][1]}), layers {state["layers"]}, frontier {state["frontier"]}; ' \
                f'a turn waited for {sum(after[1:])} memories; contexts in a band of 2000 to 4000 folded {len(folds)} times in 40 turns'
@@ -958,7 +959,7 @@ def accompanied(tls, ca) -> str:
             raise SystemExit(f'after finish the session has {own}, its companion {its}')
         declared = {('pal' if 'Count the bees.' in system else 'pair', tuple(t for t in tools if t in ('message', 'finish'))) for system, tools in seen['requests'][before:]}
         if declared != {('pal', ('message', 'finish')), ('pair', ('message',))}:
-            raise SystemExit(f'the requests declared {declared}')
+            raise SystemExit(f'the requests declared {declared}: {len(seen["requests"])} requests, {before} before the companion, the last {seen["requests"][-3:]}')
         if {s['name']: (s['companion'], s['accompanies']) for s in call(port, '/api/sessions')} != {'pair': ('pal', None), 'pal': (None, 'pair')}:
             raise SystemExit(f'the sessions listed as {call(port, "/api/sessions")}')
         say(port, 'pair', 'call ' + json.dumps([['message', {'text': 'echo the answer', 'wait': True}]]))   # Auto off
@@ -1257,7 +1258,8 @@ def channeled(tls, ca) -> str:
     message_channel, goes at once to each session there with inputs on but the one that posted it,
     headed by the channel and who posted it and ending with how to reply there, then the channel's
     description once it has one, and an idle session takes a turn on it; the call's result names who
-    heard it. A page following the channel gets each
+    heard it, and, under a limit of posts a day, how many the session has left, a post past it refused
+    (0 or less: no limit). A page following the channel gets each
     post once, as it's logged. Posting in a channel the session isn't in fails; joining or posting to a
     channel there isn't is refused, leaving takes a session out, the sessions listed leave out the
     channels' directory, and a fork is in no channel."""
@@ -1333,6 +1335,25 @@ def channeled(tls, ca) -> str:
         say(port, 'cy', 'call ' + json.dumps([['message_channel', {'channel': 'elsewhere', 'text': 'hi'}]]))
         if results('cy', count) != [("you're not in #elsewhere", True)] or len(posts()) != 4:
             raise SystemExit(f'a post in a channel cy isn\'t in got {results("cy", count)}')
+        call(port, '/api/s/cy/channel', {'channel': 'lounge', 'per_day': 2})   # cy, which has posted once, may post twice a day: once more, then no more
+        if {m['name']: m['per_day'] for c in call(port, '/api/channels') if c['name'] == 'lounge' for m in c['members']} != {'ann': None, 'bob': None, 'cy': 2}:
+            raise SystemExit(f'the channel lists {call(port, "/api/channels")}')
+        count = len(call(port, '/api/s/cy/messages'))
+        say(port, 'cy', post('echo two'))
+        say(port, 'cy', post('echo three'))
+        calm(port, 'ann', 'bob', 'cy')
+        limited = results('cy', count)
+        if limited[0] != ('Posted in #lounge; ann and bob heard it. You have 0 of your 2 posts a day left there.', False) or not limited[1][1] \
+                or not re.fullmatch(r"Rate limit exceeded: you've posted 2 times in #lounge in the last 24 hours, the most the user allows there; your next post can go in (23 h 59|24 h 0) min\.", limited[1][0]) \
+                or posts()[-1] != ('cy', 'echo two'):
+            raise SystemExit(f'cy, two posts a day, got {limited}, and the channel ends {posts()[-1]}')
+        for unlimited in (0, -1):                                       # 0 or less: no limit
+            call(port, '/api/s/cy/channel', {'channel': 'lounge', 'per_day': unlimited})
+            count = len(call(port, '/api/s/cy/messages'))
+            say(port, 'cy', post(f'echo free {unlimited}'))
+            calm(port, 'ann', 'bob', 'cy')
+            if results('cy', count) != [('Posted in #lounge; ann and bob heard it.', False)] or call(port, '/api/s/cy')['settings']['channels'] != {'lounge': {'inputs': False}}:
+                raise SystemExit(f'cy, {unlimited} posts a day, got {results("cy", count)}')
         refused('/api/s/ann/channel', {'channel': 'nowhere', 'inputs': True})
         refused('/api/c/nowhere/post', {'text': 'hi'})
         refused('/api/c/nowhere/describe', {'description': 'hi'})
@@ -1346,6 +1367,122 @@ def channeled(tls, ca) -> str:
     finally:
         app.terminate()
         mock.shutdown()
+
+def boarded(tls, ca) -> str:
+    """Boards: one made through the API (a name taken, or not a name, refused), with sessions put on it:
+    ones with a workspace, not one without or a companion. A session on it has its system prompt say
+    where it is, and reaches its folder, bound into the sandbox (which can't write the rest of /tmp
+    here), with bash and edit. A task handed to a session tells it, as a message ending with how boards
+    work and then the board's description, unless it took the task itself, and a comment tells the
+    task's owner, unless they wrote it; changes from the page are the user's. Columns are added and taken
+    out (an empty one, not done), and a task moved and deleted; a fork is on no board."""
+    port, root, mock_port = free_port(), tempfile.mkdtemp(), free_port()
+    mock = serve(mock_port, tls)
+    app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--no-open'], stderr=subprocess.DEVNULL)
+    for _ in range(100):
+        try:
+            call(port, '/api/sessions')
+            break
+        except OSError:
+            time.sleep(0.05)
+    configure(root, f'https://localhost:{mock_port}', 12000, 2381, 595.25)
+    everything = json.loads(Path(root, 'settings.json').read_text())
+    everything['sandbox']['rw'] = []                                   # /tmp, where root and the board are, out of reach but for the binding
+    Path(root, 'settings.json').write_text(json.dumps(everything))
+    folder = Path(root, '.boards', 'sprint')
+    log = lambda name: [(m['participant'], words(m)) for m in call(port, f'/api/s/{name}/messages')]
+    notes = lambda name: [text for who, text in log(name) if who == 'board:sprint']
+    results = lambda name, since: [(b['content'], b.get('isError', False)) for m in call(port, f'/api/s/{name}/messages')[since:] for b in m['content'] if b['type'] == 'tool_result']
+    view = lambda: call(port, '/api/b/sprint')
+    change = lambda body: call(port, '/api/b/sprint/change', body)
+    reminder = lambda me, about='': f'(Board sprint is the folder {folder}: a folder per column, and a .md file per task, its owner in its front matter and comments appended to it as lines "- **{me}**: …".)' \
+        + (f'\nAbout sprint: {about}' if about else '')
+    bash = lambda command: 'call ' + json.dumps([['bash', {'command': command}]])
+
+    def refused(path, body):
+        try:
+            call(port, path, body)
+            raise SystemExit(f'{path} took {body}')
+        except urllib.error.HTTPError as error:
+            if error.code != 400:
+                raise
+    try:
+        if call(port, '/api/boards', {'name': 'sprint'}) != [{'name': 'sprint', 'open': 0, 'members': 0}]:
+            raise SystemExit(f'the boards listed as {call(port, "/api/boards")}')
+        refused('/api/boards', {'name': 'sprint'})
+        refused('/api/boards', {'name': 'no good'})
+        for name in ('ann', 'bob', 'pal'):
+            call(port, '/api/sessions', {'name': name, 'workspace': tempfile.mkdtemp()})
+        call(port, '/api/sessions', {'name': 'lone'})
+        call(port, '/api/s/pal/settings', {'accompanies': 'ann'})       # a companion, as its settings say
+        for name in ('ann', 'bob'):
+            call(port, f'/api/s/{name}/settings', {'allow': ['bash', 'edit']})
+            call(port, f'/api/s/{name}/board', {'board': 'sprint'})
+        refused('/api/s/lone/board', {'board': 'sprint'})
+        refused('/api/s/pal/board', {'board': 'sprint'})
+        refused('/api/s/ann/board', {'board': 'nowhere'})
+        if view()['members'] != ['ann', 'bob'] or [c['name'] for c in view()['columns']] != ['todo', 'doing', 'done']:
+            raise SystemExit(f'the board has {view()}')
+        task = f'{folder}/todo/1-count-the-bees.md'                    # ann makes a task for bob with bash, in the sandbox
+        say(port, 'ann', bash(f"printf -- '---\\ntitle: Count the bees\\nowner: bob\\n---\\nAll of them.\\n\\n## Comments\\n' > {task}"))
+        calm(port, 'ann', 'bob')
+        if not any(f'You\'re on the kanban board sprint (at {folder})' in system for system, _ in seen['requests']):
+            raise SystemExit('no request\'s system prompt said where the board is')
+        handed = f'On board sprint, ann handed you the new task "Count the bees" (todo/1-count-the-bees.md).\n\n{reminder("bob")}'
+        if notes('bob') != [handed] or notes('ann'):
+            raise SystemExit(f'bob was told {notes("bob")}, ann {notes("ann")}; the board has {view()}')
+        counts = len(log('ann')), len(call(port, '/api/s/ann/messages'))   # ann takes a task itself, and edits bob's task: no word to either
+        say(port, 'ann', bash(f"printf -- '---\\ntitle: Sweep up\\nowner: ann\\n---\\n' > {folder}/todo/2-sweep-up.md"))
+        say(port, 'ann', 'call ' + json.dumps([['edit', {'path': task, 'old': 'All of them.', 'new': 'All of them, twice.'}]]))
+        calm(port, 'ann', 'bob')
+        if results('ann', counts[1]) != [('\n[exit code 0]', False), (f'edited {task} at line 5', False)] or notes('ann') or len(notes('bob')) != 1:
+            raise SystemExit(f'ann\'s calls got {results("ann", counts[1])}; ann was told {notes("ann")}, bob {notes("bob")[1:]}')
+        about = 'Count carefully.'
+        call(port, '/api/b/sprint/describe', {'description': about})
+        say(port, 'ann', bash(f"printf -- '- **ann**: how many so far?\\n' >> {task}"))     # ann comments on bob's task, bob on it too
+        say(port, 'bob', bash(f"printf -- '- **bob**: seven\\n' >> {task}"))
+        calm(port, 'ann', 'bob')
+        asked = f'On board sprint, ann commented on your task "Count the bees" (todo/1-count-the-bees.md):\n\nhow many so far?\n\n{reminder("bob", about)}'
+        if notes('bob')[1:] != [asked] or notes('ann'):
+            raise SystemExit(f'after the comments bob was told {notes("bob")[1:]}, ann {notes("ann")}')
+        change({'op': 'update', 'file': '1-count-the-bees.md', 'column': 'doing'})   # the user's: a move tells no one, a comment and a hand-over do
+        change({'op': 'comment', 'file': '1-count-the-bees.md', 'text': 'thanks!'})
+        change({'op': 'update', 'file': '1-count-the-bees.md', 'owner': 'ann'})
+        calm(port, 'ann', 'bob')
+        thanked = f'On board sprint, the user commented on your task "Count the bees" (doing/1-count-the-bees.md):\n\nthanks!\n\n{reminder("bob", about)}'
+        given = f'On board sprint, the user handed you the task "Count the bees" (doing/1-count-the-bees.md).\n\n{reminder("ann", about)}'
+        if notes('bob')[2:] != [thanked] or notes('ann') != [given]:
+            raise SystemExit(f'after the user\'s changes bob was told {notes("bob")[2:]}, ann {notes("ann")}')
+        got = call(port, '/api/b/sprint/t/1-count-the-bees.md')
+        if (got['column'], got['owner'], got['description'], [(c['who'], c['text']) for c in got['comments']]) != ('doing', 'ann', 'All of them, twice.', [('ann', 'how many so far?'), ('bob', 'seven'), ('user', 'thanks!')]):
+            raise SystemExit(f'the task reads {got}')
+        change({'op': 'make', 'column': 'todo', 'title': 'Write it up'})
+        change({'op': 'column', 'add': 'review'})
+        if [(c['name'], [t['file'] for t in c['tasks']]) for c in view()['columns']] != [('todo', ['2-sweep-up.md', '3-write-it-up.md']), ('doing', ['1-count-the-bees.md']), ('review', []), ('done', [])]:
+            raise SystemExit(f'the board has {view()["columns"]}')
+        for wrong in ({'op': 'column', 'remove': 'done'}, {'op': 'column', 'remove': 'todo'}, {'op': 'column', 'add': 'no good'}, {'op': 'make', 'column': 'nowhere', 'title': 't'},
+                      {'op': 'update', 'file': 'nothing.md', 'column': 'done'}):
+            refused('/api/b/sprint/change', wrong)
+        change({'op': 'column', 'order': ['review', 'todo', 'doing']})   # columns put in order, done last whatever
+        if [c['name'] for c in view()['columns']] != ['review', 'todo', 'doing', 'done']:
+            raise SystemExit(f'put in order, the board has {[c["name"] for c in view()["columns"]]}')
+        for wrong in ({'op': 'column', 'order': ['todo', 'doing']}, {'op': 'column', 'order': ['review', 'todo', 'doing', 'done']}, {'op': 'column', 'order': ['todo', 'todo', 'doing', 'review']}):
+            refused('/api/b/sprint/change', wrong)
+        change({'op': 'column', 'order': ['todo', 'doing', 'review']})
+        change({'op': 'column', 'remove': 'review'})
+        change({'op': 'delete', 'file': '3-write-it-up.md'})
+        if [c['name'] for c in view()['columns']] != ['todo', 'doing', 'done'] or call(port, '/api/boards') != [{'name': 'sprint', 'open': 2, 'members': 2}]:
+            raise SystemExit(f'the board has {view()["columns"]}, the boards {call(port, "/api/boards")}')
+        call(port, '/api/s/bob/board', {'board': 'sprint', 'leave': True})
+        call(port, '/api/s/ann/fork', {'at': 0, 'name': 'ann-fork'})
+        if view()['members'] != ['ann'] or call(port, '/api/s/ann-fork')['settings'].get('boards') \
+                or sorted(s['name'] for s in call(port, '/api/sessions')) != ['ann', 'ann-fork', 'bob', 'lone', 'pal']:
+            raise SystemExit(f'the board has {view()["members"]}, the fork {call(port, "/api/s/ann-fork")["settings"].get("boards")}')
+        return f'a board of {sum(len(c["tasks"]) for c in view()["columns"])} tasks, bob told of it {len(notes("bob"))} times and ann {len(notes("ann"))}'
+    finally:
+        app.terminate()
+        mock.shutdown()
+
 
 def part(name, run, done):
     """A part of the test in a process group of its own, which its apps and their servers join, so
@@ -1371,7 +1508,8 @@ def main(turns=60):
     forked = multiprocessing.get_context('fork')
     done, baseline = forked.Queue(), forked.Queue()
     parts = {'chat': lambda: chatted(turns, (cert, key), ca, baseline), 'tools': lambda: tooled((cert, key), ca, baseline), 'large': lambda: streamed_large((cert, key), ca),
-             'companion': lambda: accompanied((cert, key), ca), 'lifted': lambda: lifted((cert, key), ca), 'channels': lambda: channeled((cert, key), ca)}
+             'companion': lambda: accompanied((cert, key), ca), 'lifted': lambda: lifted((cert, key), ca), 'channels': lambda: channeled((cert, key), ca),
+             'boards': lambda: boarded((cert, key), ca)}
     running = [forked.Process(target=part, args=(name, run, done)) for name, run in parts.items()]
     summaries, totals, failure = {}, {'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0}, None
     try:
@@ -1396,7 +1534,7 @@ def main(turns=60):
         print(failure)
         return 1
     print(f'{totals["chat"]} chat turns and {totals["memory"]} memory requests; {summaries["chat"]}; {totals["bytes"] // 1024} KB of requests streamed '
-          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}')
+          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}')
     return 0
 
 

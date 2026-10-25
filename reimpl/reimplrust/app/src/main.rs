@@ -7,14 +7,16 @@
 //! Whatever changes has one thread that owns it, and threads tell each other things through channels,
 //! sharing nothing that changes:
 //! - each request's thread (api.rs) reads files and tells the hub what it wants of a session;
-//! - the hub (hub.rs) owns what changes quickly: the settings files, the channels' logs, which sessions
-//!   have a thread, and the pages following each session or channel and what they hear;
+//! - the hub (hub.rs) owns what changes quickly: the settings files, the channels' logs, the changes the
+//!   page makes to boards and what it last saw of them, which sessions have a thread, and the pages
+//!   following each session or channel and what they hear;
 //! - each session's thread (work.rs) does its jobs one at a time, the only one to write its log.
 //!
 //! A session's files are its only record, what its requests used among them (costs.rs): the hub keeps
 //! beside them only what they don't hold yet.
 
 mod api;
+mod boards;
 mod channels;
 mod companion;
 mod costs;
@@ -26,7 +28,7 @@ mod work;
 
 use crate::{settings::{SessionSettings, Settings}, tools::mcp};
 use connectome::{json, store::Session};
-use std::{net::TcpListener, path::{Path, PathBuf}, sync::mpsc::{channel, Sender}, time::Duration};
+use std::{net::TcpListener, path::PathBuf, sync::mpsc::{channel, Sender}, time::Duration};
 
 /// What every thread reads, set once at the start and never changed.
 pub struct App {
@@ -49,6 +51,14 @@ impl App {
     fn profile_path(&self, name: &str) -> PathBuf { self.root.join(name).join("session_settings.json") }
 
     fn profile(&self, name: &str) -> Result<SessionSettings, String> { settings::read(&self.profile_path(name)) }
+
+    /// Every session's settings, by name, of those that have them.
+    fn profiles(&self) -> Vec<(String, SessionSettings)> {
+        let names = std::fs::read_dir(&self.root).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|n| !n.starts_with('.'));
+        let mut names: Vec<String> = names.collect();
+        names.sort();
+        names.into_iter().filter_map(|name| self.profile(&name).ok().map(|s| (name, s))).collect()
+    }
 }
 
 fn main() {
@@ -70,8 +80,7 @@ fn main() {
     let (addr, agent) = (arg("--addr", "127.0.0.1:8080"), llm::agent(ca.as_deref()).expect("--ca"));
     let app: &'static App = Box::leak(Box::new(App { root, addr, agent, mcp, bash: !flag("--no-bash"), limit, hub: told }));
     if !app.settings_path().exists() {
-        let tools = work::toolbox(app, Some(Path::new("")), None, None);
-        settings::write(&app.settings_path(), &Settings::first(work::overhead(None, &tools.definitions()))).expect("settings.json");
+        settings::write(&app.settings_path(), &Settings::first()).expect("settings.json");
     }
     std::thread::spawn(move || hub::hub(app, inbox));
     let listener = TcpListener::bind(&app.addr).expect("--addr");

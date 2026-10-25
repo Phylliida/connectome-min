@@ -5,14 +5,15 @@
 //! reply calls no tools and the partner has told it nothing more, each reading the settings again:
 //! the context compiles and streams from disk into the request, the reply joins the log, and the tools
 //! it calls run, each once the user allows it, their results joining the log. The turn's end goes to
-//! the partner (companion.rs), then memories form; they form between steps too. The thread tells the
+//! the partner (companion.rs), then memories form; they form between steps too. After a step that ran
+//! tools, the hub looks at the boards the session is on again (boards.rs). The thread tells the
 //! hub what the pages following the job see (Msg). The user can stop a turn: it ends where it is
 //! (Worker::stopped).
 
-use crate::{api::brief, channels, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
+use crate::{api::brief, boards, channels, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, store::Session};
-use std::{cell::RefCell, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
+use std::{cell::RefCell, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
 
 /// A message from `who` of `text`, as the log keeps it.
 fn said(who: &str, text: String) -> Value { obj! {"participant" => who, "content" => vec![obj! {"type" => "text", "text" => text}]} }
@@ -29,25 +30,35 @@ pub const STOPPED: &str = "Stopped by the user.";
 /// The result of a call whose step the server stopped in, its reply logged but not its results.
 const UNFINISHED: &str = "No result: the server stopped before this call finished (while it ran, or waited for the user to allow it). It may or may not have run.";
 
-/// What a session's step runs with: its settings, the model client and tools they give, the tools'
-/// definitions, and the tokens the system prompt and those take, which every request carries.
+/// What a session's step runs with: its settings, the boards it's on, the model client and tools they
+/// give, the tools' definitions, the system prompt (the session's, then what boards::note says of its
+/// boards), and the tokens that and the definitions take, which every request carries.
 pub struct Setup {
     pub settings: SessionSettings,
+    pub boards: Vec<String>,
     llm: Llm,
     pub tools: Toolbox,
     definitions: Option<Value>,
+    system: Option<String>,
     pub overhead: f64,
 }
 
 impl Setup {
-    /// What a session's step runs with, from the settings as they are now.
+    /// What a session's step runs with, from the settings as they are now. The boards it's on are bound
+    /// into its sandbox, read-write, and its edit tool reaches them.
     pub fn new(app: &App, name: &str) -> Result<Setup, String> {
         let (all, settings) = (app.settings()?, app.profile(name)?);
         let p = all.providers.get(&settings.provider).ok_or_else(|| format!("no provider {} in settings.json", settings.provider))?;
         let llm = Llm { base: p.base.clone(), key: p.key.clone(), agent: app.agent.clone(), spent: Default::default() };
-        let tools = toolbox(app, settings.workspace.as_deref(), settings.sandbox.then_some(all.sandbox), all.search.as_deref()) + companion::tools(app, name, &settings) + channels::tools(app, name, &settings);
+        let boards = boards::of(app, &settings);
+        let reach: Vec<PathBuf> = boards.iter().map(|b| app.board_path(b)).collect();
+        let mut sandbox = all.sandbox;
+        sandbox.rw.extend(reach.iter().map(|p| p.to_string_lossy().into_owned()));
+        let tools = toolbox(app, settings.workspace.as_deref(), settings.sandbox.then_some(sandbox), all.search.as_deref(), &reach) + companion::tools(app, name, &settings) + channels::tools(app, name, &settings);
         let definitions = tools.definitions();
-        Ok(Setup { overhead: overhead(settings.system.as_deref(), &definitions), settings, llm, tools, definitions })
+        let parts: Vec<String> = [settings.system.clone().filter(|s| !s.is_empty()), boards::note(app, &boards, name)].into_iter().flatten().collect();
+        let system = Some(parts.join("\n\n")).filter(|s| !s.is_empty());
+        Ok(Setup { overhead: overhead(system.as_deref(), &definitions), system, boards, settings, llm, tools, definitions })
     }
 }
 
@@ -82,13 +93,13 @@ impl Host for Summarizer<'_> {
     }
 }
 
-/// A session's tools: bash (unless --no-bash) and edit in its `workspace`, bash in `sandbox` if given,
-/// both declared but failing without a workspace; web_search, if settings.json names a SearXNG server
-/// (`searching`); then the MCP servers'.
-pub fn toolbox(app: &App, workspace: Option<&Path>, sandbox: Option<Sandbox>, searching: Option<&str>) -> Toolbox {
+/// A session's tools: bash (unless --no-bash) and edit in its `workspace`, edit reaching its `boards`'
+/// folders too, bash in `sandbox` if given, both declared but failing without a workspace; web_search,
+/// if settings.json names a SearXNG server (`searching`); then the MCP servers'.
+pub fn toolbox(app: &App, workspace: Option<&Path>, sandbox: Option<Sandbox>, searching: Option<&str>, boards: &[PathBuf]) -> Toolbox {
     let why = "it has no workspace; the user can set one in the session's settings";
     let (bash, edit) = match workspace {
-        Some(dir) => (bash::tool(dir.into(), app.limit, sandbox.clone()), edit::tool(dir.into(), app.limit, sandbox)),
+        Some(dir) => (bash::tool(dir.into(), app.limit, sandbox.clone()), edit::tool(dir.into(), boards.to_vec(), app.limit, sandbox)),
         None => (bash::unavailable(why), edit::unavailable(why)),
     };
     let bash = if app.bash { bash } else { Toolbox::default() };
@@ -164,14 +175,14 @@ impl Worker<'_> {
     fn run(&self, id: u64, job: Job, stop: Sender<()>) {
         match job {
             Job::Say { text } => self.chat(id, stop, text.map(|text| said("user", text))),
-            Job::Hear(Heard { from, text }) | Job::Post(Heard { from, text }) => self.chat(id, stop, Some(said(&from, text))),
+            Job::Hear(Heard { from, text }) | Job::Notice(Heard { from, text }) => self.chat(id, stop, Some(said(&from, text))),
             Job::Fork { at, name: fork, reply } => {
                 let path = self.app.root.join(&fork); // claimed here, when the fork is made
                 let made = std::fs::create_dir(&path).map_err(|e| format!("can't fork {} as {fork}: {e}", self.name));
                 let _ = reply.send(made.and_then(|()| {
                     Session::fork(&self.s, at, path);
-                    let own = self.app.profile(self.name)?; // a fork has no companion of its own, and is in no channel
-                    settings::write(&self.app.profile_path(&fork), &SessionSettings { companion: None, accompanies: None, auto: false, channels: Default::default(), ..own })
+                    let own = self.app.profile(self.name)?; // a fork has no companion of its own, and is in no channel and on no board
+                    settings::write(&self.app.profile_path(&fork), &SessionSettings { companion: None, accompanies: None, auto: false, channels: Default::default(), boards: Default::default(), ..own })
                 }));
             }
         }
@@ -222,14 +233,14 @@ impl Worker<'_> {
         Ok(())
     }
 
-    /// What the session's partner has told it meanwhile, and the posts in channels it hears, join the
-    /// log, each as its sender's message; the session's other jobs wait for the turn to end. Whether it
-    /// heard anything.
+    /// What the session's partner has told it meanwhile, and its notices (channels' posts, boards'
+    /// changes), join the log, each as its sender's message; the session's other jobs wait for the turn
+    /// to end. Whether it heard anything.
     fn deliver(&self) -> Result<bool, String> {
         let mut heard = false;
         while let Ok((id, job)) = self.jobs.try_recv() {
             match job {
-                Job::Hear(Heard { from, text }) | Job::Post(Heard { from, text }) => {
+                Job::Hear(Heard { from, text }) | Job::Notice(Heard { from, text }) => {
                     append(&self.s, &said(&from, text), &self.app.profile(self.name)?.config);
                     heard = true;
                 }
@@ -309,7 +320,7 @@ impl Worker<'_> {
         let explained = |r: Refusal| refused(&r, &setup) + &failed.or_else(|| stalled(s, cfg)).map_or(String::new(), |why| format!(" A memory it waits for doesn't form: {why}."));
         let turns = compiled.map_err(explained)?;
         if let Some(fold) = costs::fold(s) { self.event(Event::Fold(fold)) }
-        let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.settings.system.as_deref(), "tools" => setup.definitions.clone()});
+        let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.system.as_deref(), "tools" => setup.definitions.clone()});
         let piece = |piece| {
             self.event(Event::Piece(piece));
             !self.stopped()
@@ -331,6 +342,9 @@ impl Worker<'_> {
         if called {
             append(s, &obj! {"participant" => "user", "content" => results}, cfg);
             self.logged();
+            if !setup.boards.is_empty() { // what its calls changed on its boards is its doing
+                self.app.hub.send(Routed::Stepped(self.name.into())).expect("the hub runs");
+            }
         }
         if self.stopped() { return Err(STOPPED.into()) }
         if !called { return Ok(false) }

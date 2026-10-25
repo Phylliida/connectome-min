@@ -81,20 +81,53 @@ dialog .buttons small { margin-right: auto; }
 .switch input:disabled { opacity: .4; cursor: default; }
 
 /* the sessions, grouped by workspace, then the channels */
-#sessions a, #channel-list a { display: block; padding: 4px 6px; border-radius: 6px; color: inherit; text-decoration: none; }
-#sessions a.on, #channel-list a.on { background: var(--panel); outline: 1px solid var(--line); }
-#sessions small, #channel-list small { color: var(--muted); }
+#sessions a, #channel-list a, #board-list a { display: block; padding: 4px 6px; border-radius: 6px; color: inherit; text-decoration: none; }
+#sessions a.on, #channel-list a.on, #board-list a.on { background: var(--panel); outline: 1px solid var(--line); }
+#sessions small, #channel-list small, #board-list small { color: var(--muted); }
 h2.with-button { display: flex; align-items: center; justify-content: space-between; margin-top: 16px; }
 h2 .add { padding: 0 7px; font-size: 14px; line-height: 20px; color: var(--muted); }
 
 #about { margin: 0 0 14px; }
 
 /* the channels a session is in, whether it listens in each, and those it can join */
-#memberships { display: flex; flex-direction: column; gap: 4px; margin: 0 0 12px; font-size: 12px; }
+/* the channels and boards a session is in, and those it can join */
+.memberships { display: flex; flex-direction: column; gap: 4px; margin: 0 0 12px; font-size: 12px; }
+.membership a small { color: var(--muted); }
+.legend code { font: 11px ui-monospace, monospace; overflow-wrap: anywhere; }
+
+/* a board: its columns side by side, each a list of its tasks' cards; a task, in a dialog */
+.board { flex: 1; display: flex; gap: 12px; align-items: flex-start; overflow: auto; padding: 16px 28px; }
+.column { flex: 0 0 240px; display: flex; flex-direction: column; gap: 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+.column.adding { background: none; border-style: dashed; }
+.column header { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.column header small { color: var(--muted); margin-right: auto; }
+.column header button { padding: 0 7px; font-size: 14px; line-height: 20px; color: var(--muted); }
+.column header .fold { padding: 2px; border: 0; background: none; display: inline-flex; }
+.column header .fold svg { width: 14px; height: 14px; }
+.column header .fold:hover { color: var(--accent); }
+.task-card { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; padding: 8px 10px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; cursor: grab; }
+.task-card:hover, .task-card:focus-visible { border-color: var(--accent); }
+.column header[draggable="true"] { cursor: grab; }
+.column.dragged { opacity: .5; }
+.column.into { outline: 2px dashed var(--accent); outline-offset: -1px; }
+.column.before { box-shadow: -4px 0 0 var(--accent); }
+.column.after { box-shadow: 4px 0 0 var(--accent); }
+.task-card small { color: var(--muted); font-size: 12px; }
+#task { width: min(640px, 94vw); }
+#task .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+#task .comments { display: flex; flex-direction: column; gap: 6px; max-height: 40vh; overflow: auto; }
+#task .delete { color: var(--muted); }
+#task .delete:hover { color: var(--warn); border-color: var(--warn); }
+.comment { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+.comment b { font-size: 12px; color: var(--muted); }
+.comment .md > :first-child { margin-top: 2px; }
+.comment .md > :last-child { margin-bottom: 0; }
 .membership { display: flex; align-items: center; gap: 10px; }
 .membership a, .msg.post .who a, #members a { color: var(--accent); }
 .membership a { margin-right: auto; overflow-wrap: anywhere; }
 .membership label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+.membership .per-day { width: 52px; padding: 1px 4px; font-size: 12px; }
 .membership .leave { border: 0; background: none; padding: 0 4px; color: var(--muted); }
 .membership .leave:hover { color: var(--warn); }
 .join { display: flex; gap: 6px; }
@@ -222,23 +255,29 @@ const { h, render, Component } = preact;
 const html = htm.bind(h);
 const opened = () => decodeURIComponent(location.hash.slice(1));     // what the page shows: a session's name, or c: and a channel's
 const channel = () => opened().startsWith('c:') ? opened().slice(2) : null;   // the channel the page shows, if it shows one
-const current = () => channel() == null ? opened() : '';                   // the session the page shows, if it shows one
+const board = () => opened().startsWith('b:') ? opened().slice(2) : null;     // the board the page shows, if it shows one
+const current = () => channel() == null && board() == null ? opened() : '';   // the session the page shows, if it shows one
 
 let state = null;   // the session as the server has it (a global the browser tests read)
 const page = {
-  sessions: [], providers: [], channels: [],
+  sessions: [], providers: [], channels: [], boards: [],
+  board: null,                            // the board the page shows, as the server last read it (refresh)
+  task: null,                             // the task open in its dialog: {file, data (as the server last read it), error}
   messages: [],                           // the log's messages the page has, oldest first
   posts: [],                              // the channel's posts the page has, oldest first
   live: null,                             // the turn running, as the page hears it (follow)
   error: null,                            // why what the page last did failed
   broken: null,                           // why the session's files can't be read as they are
-  notes: { session: '', channel: '' },    // under the session form, and the channel's: saved, or why not
+  notes: { session: '', about: '' },     // under the session form, and a channel's or board's description: saved, or why not
   picked: null,                           // the provider chosen on the session form, until it starts again
   creating: null,                         // the new-session dialog, while it's open: {workspace chosen, error}
   settings: null,                         // the settings dialog, while it's open: {notes: under each card, by provider ('' the new one's), made: providers added}
   accompanying: null,                     // the dialog that makes the session's companion, while it's open: {error}
   detail: 'Select a memory or chunk.',    // the memory or chunk the pyramid last showed
   folded: new Set(),                      // the workspaces whose groups are folded, kept in this browser
+  collapsed: new Set(),                   // boards' columns collapsed to their headers, as board/column, kept in this browser
+  dragging: null,                         // what's dragged on the board: a task {file, from} or a column {column}
+  over: null,                             // the column it's dragged over, and where it would go: {column, side: into, before or after}
   panels: { left: true, right: true },    // which sides show, kept in this browser
   scroll: false,                          // whether the next draw takes the log to its end, wherever it's scrolled to
   keep: null,                             // the log's height, which the next draw adds what it puts above to (earlier messages, at its very top)
@@ -262,9 +301,9 @@ function draw() {
   main.classList.toggle('left-closed', !page.panels.left);
   main.classList.toggle('right-closed', !page.panels.right);
   render(html`<${App} />`, main);
-  const drawn = document.getElementById('log');
-  if (page.keep != null) drawn.scrollTop = drawn.scrollHeight - page.keep;
-  else if (following) drawn.scrollTop = drawn.scrollHeight;
+  const drawn = document.getElementById('log');   // none, on a board
+  if (drawn && page.keep != null) drawn.scrollTop = drawn.scrollHeight - page.keep;
+  else if (drawn && following) drawn.scrollTop = drawn.scrollHeight;
   [page.scroll, page.keep] = [false, null];
 }
 const redraw = () => frame ??= requestAnimationFrame(draw);
@@ -344,7 +383,7 @@ function Tab({ side, what }) {
 }
 
 const App = () => {
-  const [line, warn] = status(), c = channel();
+  const [line, warn] = status(), c = channel(), b = board();
   return html`
     <aside hidden=${!page.panels.left}>
       <div class="top">
@@ -356,19 +395,22 @@ const App = () => {
       <${Sessions} />
       <h2 class="with-button">Channels <button id="new-channel" class="add" title="New channel" aria-label="New channel" onClick=${makeChannel}>+</button></h2>
       <${Channels} />
+      <h2 class="with-button">Boards <button id="new-board" class="add" title="New board" aria-label="New board" onClick=${makeBoard}>+</button></h2>
+      <${Boards} />
     </aside>
     <section id="chat">
-      <${Tab} side="left" what="the sessions and channels" />
-      <${Tab} side="right" what=${c == null ? 'the session\'s settings and memory' : 'the channel\'s members'} />
-      ${c == null ? html`<${Log} />` : html`<${Posts} />`}
+      <${Tab} side="left" what="the sessions, channels and boards" />
+      <${Tab} side="right" what=${b != null ? 'the board\'s description and members' : c != null ? 'the channel\'s members' : 'the session\'s settings and memory'} />
+      ${b != null ? html`<${BoardView} />` : c != null ? html`<${Posts} />` : html`<${Log} />`}
       <div id="status" class=${warn ? 'warn' : ''}>${line}</div>
-      ${c == null ? html`<${SayForm} />` : html`<${PostForm} key=${c} />`}
+      ${b != null ? null : c != null ? html`<${PostForm} key=${c} />` : html`<${SayForm} />`}
     </section>
     <aside id="memory" hidden=${!page.panels.right}>
-      ${c != null ? html`<h2>#${c}</h2><${About} key=${c} /><${Members} />` : html`
+      ${b != null ? html`<h2>${b}</h2><${BoardPanel} />` : c != null ? html`<h2>#${c}</h2><${ChannelAbout} /><${Members} />` : html`
       <h2>Session</h2>
       <${Companion} />
       <${Memberships} />
+      <${BoardMemberships} />
       <${SessionForm} key=${current()} />
       <h2>Context</h2>
       <${Stats} />
@@ -379,7 +421,8 @@ const App = () => {
     </aside>
     ${page.creating && html`<${NewSession} />`}
     ${page.settings && html`<${Settings} />`}
-    ${page.accompanying && html`<${Accompany} />`}`;
+    ${page.accompanying && html`<${Accompany} />`}
+    ${page.task && html`<${TaskDialog} />`}`;
 };
 
 // the sessions, grouped by workspace (those without one last), a companion in its session's
@@ -406,17 +449,19 @@ function Channels() {
 }
 
 // the channels the session is in (it can post in each, with message_channel), each with whether it
-// has inputs on (it hears every post there but its own) and a button that takes it out; then a choice
-// of the others, to add it to
+// has inputs on (it hears every post there but its own), the most posts a day it may make there (blank,
+// 0 or less: no limit) and a button that takes it out; then a choice of the others, to add it to
 function Memberships() {
   const s = state?.settings;
   if (!s) return null;
   const joined = s.channels ?? {}, others = page.channels.map((c) => c.name).filter((c) => !(c in joined));
   const join = (e) => member(e.target.closest('.join').querySelector('select').value, {});
-  return html`<div id="memberships">
+  return html`<div id="memberships" class="memberships">
     ${Object.entries(joined).map(([c, m]) => html`<div class="membership" key=${c} data-channel=${c}>
       <a href="#c:${c}" title="The session can post here with its message_channel tool">#${c}</a>
       <label title="Every post in the channel from anyone else comes to this session as a message"><input type="checkbox" data-sub="inputs" checked=${m.inputs} onChange=${(e) => member(c, { inputs: e.target.checked })} /> inputs</label>
+      <label title="The most posts it may make here in any 24 hours; past them, message_channel is refused. Blank, 0 or less: no limit">
+        <input type="number" class="per-day" data-sub="per_day" step="1" defaultValue=${m.per_day > 0 ? m.per_day : ''} placeholder="∞" onChange=${(e) => member(c, { per_day: Number(e.target.value) || 0 })} /> a day</label>
       <button type="button" class="leave" title=${'Take the session out of #' + c} aria-label=${'Leave #' + c} onClick=${() => member(c, null)}>×</button>
     </div>`)}
     ${others.length > 0 && html`<div class="join"><select id="join-channel" aria-label="A channel to add the session to">${others.map((c) => html`<option key=${c} value=${c}>#${c}</option>`)}</select>
@@ -425,20 +470,132 @@ function Memberships() {
   </div>`;
 }
 
-// the channel's description, which each post its sessions hear ends with, saved as the session form's
-// fields are: once typing pauses, or as it leaves the field (describe)
-function About() {
-  const c = page.channels.find((x) => x.name === channel());
-  if (!c) return null;
+// a channel's or board's description (`description`, as saved), which each message its sessions get of
+// it ends with, saved to `url` as the session form's fields are: once typing pauses, or as it leaves the
+// field (describe); `saved` takes the server's answer
+function About({ url, description, saved, label, placeholder }) {
+  const save = (el) => describe(el, url, description, saved);
   const pause = (e) => {
     clearTimeout(pausing.get(e.target));
-    pausing.set(e.target, setTimeout(() => describe(e.target), PAUSE));
+    pausing.set(e.target, setTimeout(() => save(e.target), PAUSE));
   };
-  return html`<form id="about" class="settings" data-channel=${c.name} onSubmit=${(e) => e.preventDefault()}>
-    <label title="Each post the sessions here hear ends with it, after the reminder of how to reply">Description, which each post here ends with
-      <textarea name="description" rows="3" defaultValue=${c.description ?? ''} placeholder="Say, post only when you have something new: bees runs on an expensive model" onInput=${pause} onChange=${(e) => describe(e.target)}></textarea></label>
-    <small>${page.notes.channel}</small>
+  return html`<form id="about" class="settings" onSubmit=${(e) => e.preventDefault()}>
+    <label>${label}
+      <textarea name="description" rows="3" defaultValue=${description ?? ''} placeholder=${placeholder} onInput=${pause} onChange=${(e) => save(e.target)}></textarea></label>
+    <small>${page.notes.about}</small>
   </form>`;
+}
+
+// the description of the channel the page shows
+function ChannelAbout() {
+  const c = page.channels.find((x) => x.name === channel());
+  return c && html`<${About} key=${'c:' + c.name} url=${`/api/c/${c.name}/describe`} description=${c.description} saved=${(listing) => { page.channels = listing; }}
+    label="Description, which each post here ends with" placeholder="Say, post only when you have something new: bees runs on an expensive model" />`;
+}
+
+// the boards, each a link to it, with its tasks not done and how many sessions are on it
+function Boards() {
+  return html`<div id="board-list">${page.boards.length ? page.boards.map((b) => html`<a key=${b.name} href="#b:${b.name}" class=${b.name === board() ? 'on' : ''}>${b.name} <small>${b.open} open · ${b.members} on it</small></a>`)
+    : html`<small>No boards yet.</small>`}</div>`;
+}
+
+// the board the page shows, as the server last read it, if it has
+const shownBoard = () => page.board?.name === board() ? page.board : null;
+
+// the board the page shows: its columns side by side, done last, each with its tasks as cards (title,
+// owner, comments) that open the task and drag to another column, a header that drags the column
+// before or after another (not done, which stays last), a chevron that collapses it to its header (or
+// expands it), a + that makes a task, and, if it's empty and not done, an × that takes it out; then a
+// button that adds a column
+function BoardView() {
+  const b = shownBoard();
+  if (!b) return html`<div id="board" class="board"><div class="earlier">Loading the board…</div></div>`;
+  const plural = (n, what) => `${n} ${what}${n > 1 ? 's' : ''}`;
+  const open = (file) => (e) => (e.type === 'click' || e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), openTask(file));
+  return html`<div id="board" class="board">${b.columns.map((c) => {
+    const key = `${b.name}/${c.name}`, shut = page.collapsed.has(key), over = page.over?.column === c.name ? ' ' + page.over.side : '';
+    return html`<div class=${'column' + (shut ? ' collapsed' : '') + over + (page.dragging?.column === c.name ? ' dragged' : '')} key=${c.name} data-column=${c.name}
+        onDragOver=${dragging.over(c.name)} onDragLeave=${dragging.leave(c.name)} onDrop=${dragging.drop(c.name)}>
+      <header draggable=${c.name !== 'done' ? 'true' : 'false'} onDragStart=${dragging.start({ column: c.name })} onDragEnd=${dragging.end}><button class="fold" title=${(shut ? 'Expand ' : 'Collapse ') + c.name} aria-label=${(shut ? 'Expand ' : 'Collapse ') + c.name} aria-expanded=${!shut}
+        onClick=${() => collapse(key, !shut)}>${ICONS.chevron(shut ? 'right' : 'down')}</button><b>${c.name}</b><small>${c.tasks.length}</small>
+        ${c.name !== 'done' && !c.tasks.length && html`<button title=${'Take out the column ' + c.name} aria-label=${'Take out ' + c.name} onClick=${() => change({ op: 'column', remove: c.name })}>×</button>`}
+        <button class="add" title=${'A new task in ' + c.name} aria-label=${'New task in ' + c.name} onClick=${() => newTask(c.name)}>+</button></header>
+      ${!shut && c.tasks.map((t) => html`<div class="task-card" role="button" tabindex="0" key=${t.file} data-file=${t.file} draggable="true"
+        onClick=${open(t.file)} onKeyDown=${open(t.file)} onDragStart=${dragging.start({ file: t.file, from: c.name })} onDragEnd=${dragging.end}>
+        <span>${t.title}</span><small>${t.owner ?? 'no owner'}${t.comments ? ' · ' + plural(t.comments, 'comment') : ''}</small></div>`)}
+    </div>`;
+  })}
+    <div class="column adding"><button id="add-column" onClick=${addColumn}>+ Column</button></div>
+  </div>`;
+}
+
+// the board's description, the sessions on it (each with the tasks it owns not done), and where its
+// folder is
+function BoardPanel() {
+  const b = shownBoard();
+  if (!b) return null;
+  const owns = (m) => b.columns.filter((c) => c.name !== 'done').flatMap((c) => c.tasks).filter((t) => t.owner === m).length;
+  return html`<${About} key=${'b:' + b.name} url=${`/api/b/${b.name}/describe`} description=${b.description} saved=${(view) => { page.board = view; }}
+      label="Description, which each message about the board ends with" placeholder="Say, what the board is for, and who picks up what" />
+    <div id="members">
+      ${b.members.length ? b.members.map((m) => html`<div class="stat" key=${m}><a href="#${m}">${m}</a><span>${owns(m)} open</span></div>`)
+        : html`<small class="legend">No sessions on it yet: put one on it from its settings (it needs a workspace).</small>`}
+    </div>
+    <p class="legend">Its folder is <code>${b.path}</code>: a folder per column, a .md file per task. The sessions on it work on those files with their bash and edit
+      tools; a task's owner hears when it's handed to them and when someone else comments on it.</p>`;
+}
+
+// a task, in a dialog in the middle of the page (page.task): its title, column, owner (a session on the
+// board, or none) and description, each saved as it changes; its comments, and a box that adds one of
+// the user's (Enter); and a button that deletes it, once the user confirms
+function TaskDialog() {
+  const open = page.task, t = open.data, b = shownBoard();
+  const save = (fields) => change({ op: 'update', file: open.file, ...fields });
+  const comment = (e) => {
+    if (e.key !== 'Enter' || e.shiftKey) return;
+    e.preventDefault();
+    const text = e.target.value.trim();
+    if (!text) return;
+    e.target.value = '';
+    change({ op: 'comment', file: open.file, text });
+  };
+  const owners = [...new Set([...(b?.members ?? []), ...(t?.owner ? [t.owner] : [])])];
+  return html`<dialog id="task" ref=${(d) => d && !d.open && d.showModal()} onClose=${() => { page.task = null; draw(); }}>
+    ${!t ? html`<p class="legend">${open.error || 'Loading the task…'}</p>` : html`<form class="settings" key=${open.file} onSubmit=${(e) => e.preventDefault()}>
+      <label>Title <input name="title" defaultValue=${t.title} onChange=${(e) => e.target.value.trim() && save({ title: e.target.value })} /></label>
+      <div class="pair">
+        <label>Column <select name="column" onChange=${(e) => save({ column: e.target.value })}>${(b?.columns ?? []).map((c) => html`<option key=${c.name} selected=${c.name === t.column}>${c.name}</option>`)}</select></label>
+        <label>Owner <select name="owner" onChange=${(e) => save({ owner: e.target.value || null })}><option value="" selected=${!t.owner}>none</option>${owners.map((o) => html`<option key=${o} selected=${o === t.owner}>${o}</option>`)}</select></label>
+      </div>
+      <label>Description <textarea name="description" rows="5" defaultValue=${t.description} onChange=${(e) => save({ description: e.target.value })}></textarea></label>
+      <label>Comments</label>
+      <div class="comments">${t.comments.length ? t.comments.map((c, i) => html`<div class="comment" key=${i}><b>${c.who}</b><div class="md" dangerouslySetInnerHTML=${{ __html: markdown(c.text) }} /></div>`)
+        : html`<small class="legend">None yet.</small>`}</div>
+      <textarea id="comment" name="comment" rows="2" placeholder="Add a comment (Enter adds it, Shift+Enter for a new line)" onKeyDown=${comment}></textarea>
+      <small class="warn">${open.error}</small>
+      <div class="buttons">
+        <button type="button" class="icon delete" title="Delete the task" aria-label="Delete the task" onClick=${() => confirm(`Delete the task "${t.title}"?`) && change({ op: 'delete', file: open.file })}>${ICONS.trash()}</button>
+        <small>${t.column}/${t.file}</small>
+        <button type="button" onClick=${(e) => e.target.closest('dialog').close()}>Done</button>
+      </div>
+    </form>`}
+  </dialog>`;
+}
+
+// the boards the session is on, each with a button that takes it off; then a choice of the others, to
+// put it on (which takes a workspace, and not being a companion)
+function BoardMemberships() {
+  const s = state?.settings;
+  if (!s || !page.boards.length) return null;
+  const on = s.boards ?? [], others = page.boards.map((b) => b.name).filter((b) => !on.includes(b));
+  const why = !s.workspace ? 'A session needs a workspace to be on a board.' : s.accompanies ? 'A companion can\'t be on a board.' : null;
+  const join = (e) => onBoard(e.target.closest('.join').querySelector('select').value, true);
+  return html`<div id="board-memberships" class="memberships">
+    ${on.map((b) => html`<div class="membership" key=${b} data-board=${b}><a href="#b:${b}"><small>board</small> ${b}</a>
+      <button type="button" class="leave" title=${'Take the session off ' + b} aria-label=${'Leave ' + b} onClick=${() => onBoard(b, false)}>×</button></div>`)}
+    ${why ? html`<small class="legend">${why}</small>` : others.length > 0 && html`<div class="join"><select id="join-board" aria-label="A board to put the session on">${others.map((b) => html`<option key=${b} value=${b}>board ${b}</option>`)}</select>
+      <button type="button" id="join-b" title="Put the session on the board" aria-label="Put the session on the board" onClick=${join}>+</button></div>`}
+  </div>`;
 }
 
 // the sessions in the channel the page shows, and whether each has inputs on there (a session's
@@ -447,9 +604,9 @@ function Members() {
   const c = page.channels.find((x) => x.name === channel());
   if (!c) return html`<small class="legend">No channel ${channel()}.</small>`;
   return html`<div id="members">
-    ${c.members.length ? c.members.map((m) => html`<div class="stat" key=${m.name}><a href="#${m.name}">${m.name}</a><span>${m.inputs ? 'inputs on' : 'inputs off'}</span></div>`)
+    ${c.members.length ? c.members.map((m) => html`<div class="stat" key=${m.name}><a href="#${m.name}">${m.name}</a><span>${m.inputs ? 'inputs on' : 'inputs off'}${m.per_day ? ` · ${m.per_day} a day` : ''}</span></div>`)
       : html`<small class="legend">No sessions in it yet: add one from a session's settings.</small>`}
-    <p class="legend">Each session here can post with its message_channel tool. A post, yours or a session's, goes at once to every other session here with inputs on, as a message.</p>
+    <p class="legend">Each session here can post with its message_channel tool, up to its limit a day if it has one (a session's settings set it). A post, yours or a session's, goes at once to every other session here with inputs on, as a message.</p>
   </div>`;
 }
 
@@ -695,7 +852,7 @@ function fit(box) {
 // (delete), and a chevron (a side hidden or shown)
 const ICONS = {
   chevron: (to) => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-    <path d=${to === 'left' ? 'M15 5l-7 7 7 7' : 'M9 5l7 7-7 7'} /></svg>`,
+    <path d=${to === 'left' ? 'M15 5l-7 7 7 7' : to === 'down' ? 'M6 9l6 6 6-6' : 'M9 5l7 7-7 7'} /></svg>`,
   send: () => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <path d="M21.5 2.5 6 9.4l5.3 3.3 3.3 5.3z" fill="currentColor" fill-opacity=".18" /><path d="M21.5 2.5 11.3 12.7" />
     <path d="M2.5 16.5 5.5 13.5M4.5 20.5l3.2-3.2M8.6 21.6l1.6-1.6" opacity=".5" /></svg>`,
@@ -929,19 +1086,105 @@ async function makeChannel() {
 
 // a channel's description saved, from the field `el` (blank: none), unless the channel has it already;
 // the note under it says so, if the page still shows that channel
-async function describe(el) {
+async function describe(el, url, description, saved) {
   clearTimeout(pausing.get(el));
-  const name = el.form?.dataset.channel, text = el.value.trim(), shown = () => name === channel();
-  if (!name || text === (page.channels.find((c) => c.name === name)?.description ?? '')) return;
-  if (shown()) page.notes.channel = 'Saving…';
+  const [text, at] = [el.value.trim(), location.hash];
+  if (text === (description ?? '')) return;
+  page.notes.about = 'Saving…';
   draw();
   try {
-    page.channels = await api(`/api/c/${name}/describe`, { description: text });
-    if (shown()) page.notes.channel = 'Saved.';
+    saved(await api(url, { description: text }));
+    if (location.hash === at) page.notes.about = 'Saved.';
   } catch (err) {
-    if (shown()) page.notes.channel = err.message;
+    if (location.hash === at) page.notes.about = err.message;
   }
   draw();
+}
+
+async function listBoards() {
+  page.boards = await api('/api/boards');
+  redraw();
+}
+
+// a new board, named as the user says, then shown
+async function makeBoard() {
+  const name = prompt('Name for a new board (letters, digits, - and _)')?.trim();
+  if (!name) return;
+  try {
+    page.boards = await api('/api/boards', { name });
+    location.hash = 'b:' + name;
+  } catch (err) { fail(err); }
+}
+
+// the session the page shows put on board `name` (`on`), or taken off it
+async function onBoard(name, on) {
+  try {
+    state = await api(`/api/s/${current()}/board`, on ? { board: name } : { board: name, leave: true });
+    listBoards();
+  } catch (err) { fail(err); }
+  draw();
+}
+
+// a change to the board the page shows (boards.rs's apply), then the board as it is after it, and the
+// open task's comments and column; a failure shows in the open task, if there's one, else under the board
+async function change(ch) {
+  const name = board();
+  try {
+    const b = await api(`/api/b/${name}/change`, ch);
+    if (name === board()) page.board = b;
+    if (ch.op === 'delete') page.task = null;
+    else if (page.task && ch.file === page.task.file) await loadTask();
+    listBoards();
+  } catch (err) {
+    if (page.task) page.task.error = err.message;
+    else fail(err);
+  }
+  draw();
+}
+
+// a new task in `column`, titled as the user says
+function newTask(column) {
+  const title = prompt(`Title of the new task in ${column}`)?.trim();
+  if (title) change({ op: 'make', column, title });
+}
+
+// a new column, named as the user says
+function addColumn() {
+  const name = prompt('Name for a new column (letters, digits, - and _)')?.trim();
+  if (name) change({ op: 'column', add: name });
+}
+
+// a task opened in its dialog, as the server reads it
+function openTask(file) {
+  page.task = { file, data: null, error: '' };
+  draw();
+  loadTask();
+}
+
+// the open task read again (a session may have changed its file, moved it or deleted it)
+async function loadTask() {
+  const [name, open] = [board(), page.task];
+  if (!open) return;
+  try {
+    const data = await api(`/api/b/${name}/t/${encodeURIComponent(open.file)}`);
+    if (page.task === open) [open.data, open.error] = [data, ''];
+  } catch (err) {
+    if (page.task === open) open.error = err.message;
+  }
+  redraw();
+}
+
+// the board the page shows read again, and its open task, as the sessions on it change their files
+async function refresh() {
+  const name = board();
+  try {
+    const b = await api(`/api/b/${name}`);
+    if (name === board()) [page.board, page.error] = [b, null];
+  } catch (err) {
+    if (name === board()) page.error = err.message;
+  }
+  await loadTask();
+  redraw();
 }
 
 // the session the page shows put in channel `name`, its subscriptions there changed as `change` says
@@ -967,6 +1210,58 @@ function panel(side, open) {
 }
 
 // a group of sessions folded or opened, kept in this browser
+// dragging on the board (page.dragging, page.over): a task's card dropped on another column moves it
+// there; a column's header dropped on another column puts it before or after that one, by which half
+// of it the pointer is over (before done, always, which stays last)
+const dragging = {
+  start: (what) => (e) => {
+    page.dragging = what;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', what.file ?? what.column);   // Firefox drags only with data
+    e.stopPropagation();
+    redraw();
+  },
+  over: (name) => (e) => {
+    const d = page.dragging;
+    if (!d || d.column === name) return;   // not dropped here
+    e.preventDefault();
+    const box = e.currentTarget.getBoundingClientRect();
+    const side = d.file ? 'into' : name === 'done' || e.clientX < box.left + box.width / 2 ? 'before' : 'after';
+    if (page.over?.column !== name || page.over.side !== side) {
+      page.over = { column: name, side };
+      redraw();
+    }
+  },
+  leave: (name) => (e) => {
+    if (page.over?.column !== name || e.currentTarget.contains(e.relatedTarget)) return;
+    page.over = null;
+    redraw();
+  },
+  drop: (name) => (e) => {
+    e.preventDefault();
+    const [d, over, b] = [page.dragging, page.over, shownBoard()];
+    [page.dragging, page.over] = [null, null];
+    if (d?.file && d.from !== name) change({ op: 'update', file: d.file, column: name });
+    else if (d?.column && over && b) {
+      const order = b.columns.map((c) => c.name).filter((c) => c !== 'done' && c !== d.column), at = order.indexOf(name);
+      order.splice(name === 'done' ? order.length : over.side === 'before' ? at : at + 1, 0, d.column);
+      change({ op: 'column', order });
+    }
+    redraw();
+  },
+  end: () => {
+    [page.dragging, page.over] = [null, null];
+    redraw();
+  },
+};
+
+// a board's column (`key`, board/column) collapsed to its header, or expanded again, kept in this browser
+function collapse(key, shut) {
+  if (shut) page.collapsed.add(key); else page.collapsed.delete(key);
+  try { localStorage.setItem('collapsed', JSON.stringify([...page.collapsed])); } catch { /* no storage here: kept until the page reloads */ }
+  draw();
+}
+
 function fold(workspace, folded) {
   if (folded === page.folded.has(workspace)) return;
   if (folded) page.folded.add(workspace); else page.folded.delete(workspace);
@@ -1108,11 +1403,18 @@ async function turn(text) {
 
 // the session the page shows, followed while the page is in view: out of view it lets go of it (a
 // browser keeps few connections to a server open at once), and back in view follows it again
+// A board isn't followed but read again every 3 s (refresh): the sessions on it change its files
+// themselves.
+let polling = null;
 function subscribe() {
   stream?.abort();
   stream = null;
+  clearInterval(polling);
   if (document.hidden) return;
-  if (channel() != null) watch(channel(), (stream = new AbortController()).signal);
+  if (board() != null) {
+    refresh();
+    polling = setInterval(refresh, 3000);
+  } else if (channel() != null) watch(channel(), (stream = new AbortController()).signal);
   else if (current()) follow(current(), (stream = new AbortController()).signal);
 }
 
@@ -1251,11 +1553,13 @@ function grow(part, piece) {
 }
 
 try { page.folded = new Set(JSON.parse(localStorage.getItem('folded')) || []); } catch { /* no storage here: groups start open */ }
+try { page.collapsed = new Set(JSON.parse(localStorage.getItem('collapsed')) || []); } catch { /* no storage here: columns start expanded */ }
 try { Object.assign(page.panels, JSON.parse(localStorage.getItem('panels'))); } catch { /* no storage here: both sides show */ }
 window.onhashchange = () => {
-  [page.notes.session, page.notes.channel, page.picked, page.live, page.error, page.accompanying, page.messages, page.posts] = ['', '', null, null, null, null, [], []];
+  [page.notes.session, page.notes.about, page.picked, page.live, page.error, page.accompanying, page.messages, page.posts, page.board, page.task] = ['', '', null, null, null, null, [], [], null, null];
   listSessions();
   listChannels();
+  listBoards();
   subscribe();
 };
 document.onvisibilitychange = subscribe;
@@ -1263,6 +1567,7 @@ redraw();
 loadProviders();
 listSessions();
 listChannels();
+listBoards();
 subscribe();
 </script>
 </body>

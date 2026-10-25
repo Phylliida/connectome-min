@@ -4,7 +4,7 @@
 //! carry an x-connectome header (another site's page can't send one without a CORS preflight, which
 //! this server never approves), since a POST can change where the key goes.
 
-use crate::{channels::{self, Post}, companion, costs::{self, Compile, Fold, Spent}, hub::{Event, Job, Msg, Routed}, settings::{self, SessionSettings}, work::Setup, App};
+use crate::{boards, channels::{self, Post}, companion, costs::{self, Compile, Fold, Spent}, hub::{Event, Job, Msg, Routed}, settings::{self, SessionSettings}, work::Setup, App};
 use connectome::{config::Config, json::{self, sparse, Json, Value}, memory::Recorded, obj, planner::chunks, store::Session};
 use serde::{Serialize, Serializer};
 use std::{collections::{BTreeSet, HashMap}, net::TcpStream, path::Path, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
@@ -84,10 +84,14 @@ pub fn handle(app: &App, mut stream: TcpStream) -> io::Result<()> {
         ("POST", ["api", "sessions"]) => create(app, &body).map(Some),
         ("GET", ["api", "channels"]) => Ok(Some(channels::listing(app))),
         ("POST", ["api", "channels"]) => founded(app, &body).map(Some),
+        ("GET", ["api", "boards"]) => Ok(Some(boards::listing(app))),
+        ("POST", ["api", "boards"]) => set_up(app, &body).map(Some),
         (_, ["api", "s", name, rest @ ..]) if named(name) && app.root.join(name).is_dir() => session(app, method, name, rest, &body, &query, &mut stream),
         (_, ["api", "s", name, ..]) => Err(format!("no session {name}")),
         (_, ["api", "c", name, rest @ ..]) if named(name) && app.channel_exists(name) => in_channel(app, method, name, rest, &body, &query, &mut stream),
         (_, ["api", "c", name, ..]) => Err(format!("no channel {name}")),
+        (_, ["api", "b", name, rest @ ..]) if named(name) && app.board_exists(name) => on_board(app, method, name, rest, &body),
+        (_, ["api", "b", name, ..]) => Err(format!("no board {name}")),
         _ => Err("not found".into()),
     };
     match reply {
@@ -147,9 +151,13 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
             let (id, answer) = (body["id"].as_str().unwrap_or("").into(), body["answer"].as_str().unwrap_or("deny").into());
             app.ask_session(name, |reply| Msg::Approve { id, answer, reply }).map(|()| Some(obj! {}))
         }
-        ("POST", ["channel"]) => {   // {channel, inputs?}, or {channel, leave: true}
+        ("POST", ["board"]) => {   // {board}, or {board, leave: true}
+            let (board, on) = (body["board"].as_str().ok_or("which board?")?.to_string(), body["leave"] != true);
+            app.ask_session(name, |reply| Msg::OnBoard { board, on, reply }).map(|()| Some(state(app, name, &s)))
+        }
+        ("POST", ["channel"]) => {   // {channel, inputs?, per_day?}, or {channel, leave: true}
             let channel = body["channel"].as_str().ok_or("which channel?")?.to_string();
-            let change = if body["leave"] == true { Value::Null } else { obj! {"inputs" => body["inputs"].as_bool()} };
+            let change = if body["leave"] == true { Value::Null } else { obj! {"inputs" => body["inputs"].as_bool(), "per_day" => body["per_day"].as_f64()} };
             app.ask_session(name, |reply| Msg::Member { channel, change, reply }).map(|()| Some(state(app, name, &s)))
         }
         _ => Err("not found".into()),
@@ -164,7 +172,7 @@ fn in_channel(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, 
         ("GET", ["stream"]) => watch(app, name, query, stream),
         ("POST", ["post"]) => {
             let text = body["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or("say something")?.to_string();
-            app.ask(|reply| Routed::Post(Post { channel: name.into(), from: None, text }, reply)).map(|(post, _)| Some(post))
+            app.ask(|reply| Routed::Post(Post { channel: name.into(), from: None, text }, reply)).map(|posted| Some(posted.post))
         }
         ("POST", ["describe"]) => {
             let description = body["description"].as_str().unwrap_or("").to_string();
@@ -172,6 +180,38 @@ fn in_channel(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, 
         }
         _ => Err("not found".into()),
     }
+}
+
+/// A board's routes: the board, a task, and a change to either (boards::apply) or the board's
+/// description, answered with the board as it is after it.
+fn on_board(app: &App, method: &str, name: &str, rest: &[&str], body: &Value) -> Route {
+    let change = |change: Value| app.ask(|reply| Routed::Board(name.into(), change, reply)).map(|()| Some(boards::view(app, name)));
+    match (method, rest) {
+        ("GET", []) => Ok(Some(boards::view(app, name))),
+        ("GET", ["t", file]) => boards::task(app, name, &unescaped(file)).map(Some),
+        ("POST", ["change"]) => change(body.clone()),
+        ("POST", ["describe"]) => change(obj! {"op" => "describe", "description" => body["description"].clone()}),
+        _ => Err("not found".into()),
+    }
+}
+
+/// A URL's path segment, its %XX escapes undone (a task's file a session named may have spaces).
+fn unescaped(segment: &str) -> String {
+    let (bytes, mut out, mut i) = (segment.as_bytes(), vec![], 0);
+    while i < bytes.len() {
+        let hex = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(b)) => { out.push(b); i += 3 }
+            (b, _) => { out.push(b); i += 1 }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The boards, once the one `v` names is made.
+fn set_up(app: &App, v: &Value) -> Result<Value, String> {
+    let name = v["name"].as_str().filter(|name| named(name)).ok_or("a board's name is letters, digits, - and _")?;
+    boards::make(app, name).map(|()| boards::listing(app))
 }
 
 /// The channels, once the one `v` names is made.

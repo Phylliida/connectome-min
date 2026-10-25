@@ -18,17 +18,15 @@ pub struct Settings {
 
 impl Settings {
     /// What settings.json starts as: a provider named default, Anthropic's API without a key yet, and
-    /// new sessions on it (on the one model it lists) with a window of 90k tokens: the reply's reserve, `overhead`, which every
-    /// request carries (the system prompt and tool definitions), and the context, which the library's
-    /// settings are sized for: its recent window a quarter of it (up to the library's 30k), its chunks a
-    /// third (up to 15k, five times the library's, so memories form less often and each covers more).
-    pub fn first(overhead: f64) -> Settings {
+    /// new sessions on it (on the one model it lists) with a window of 180k tokens, 30k of it the
+    /// reply's, a prompt that folds past 90k down to 65k, a raw tail of 20k, chunks of 3k (the
+    /// library's), merges of 3 memories at least, and memories of up to 20k tokens.
+    pub fn first() -> Settings {
         let (defaults, base) = (SessionSettings::default(), "https://api.anthropic.com".into());
-        let left = defaults.window - overhead - defaults.reserve;
-        let (recent_window_tokens, target_chunk_tokens) = ((left / 4.0).min(30000.0), (left / 3.0).min(15000.0));
-        let config = Config { summary_participant: "assistant".into(), recent_window_tokens, target_chunk_tokens, compression_max_tokens: Some(8000.0), ..Config::default() };
+        let config = Config { summary_participant: "assistant".into(), recent_window_tokens: 20000.0, target_chunk_tokens: 3000.0, min_merge_memories: 3, compression_max_tokens: Some(20000.0), ..Config::default() };
         let providers = BTreeMap::from([("default".into(), Provider { base, key: String::new(), models: vec![defaults.model.clone()] })]);
-        Settings { providers, defaults: SessionSettings { config, ..defaults }, sandbox: Sandbox::default(), search: None }
+        let defaults = SessionSettings { fold_above: Some(90000.0), fold_to: Some(65000.0), config, ..defaults };
+        Settings { providers, defaults, sandbox: Sandbox::default(), search: None }
     }
 
     /// The providers as the page sees them: never a key, only whether there is one.
@@ -83,7 +81,7 @@ pub struct SessionSettings {
     pub workspace: Option<PathBuf>,
     #[default(cfg!(target_os = "linux"))] pub sandbox: bool, // where bubblewrap runs
     pub allow: BTreeSet<String>,          // the tools that run without asking
-    #[default(90000.0)] pub window: f64,  // tokens a request may take, the reply's included
+    #[default(180000.0)] pub window: f64, // tokens a request may take, the reply's included
     #[default(30000.0)] pub reserve: f64, // tokens for the reply (its reasoning too)
     // a prompt (the system prompt and tools with the context) past fold_above folds, down to fold_to; by
     // default past what the window leaves the reply, down to config.slack under that
@@ -95,12 +93,23 @@ pub struct SessionSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub accompanies: Option<String>, // the session this one is the companion of
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub auto: bool,               // each turn's end goes to the other
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")] pub channels: BTreeMap<String, Membership>, // the channels it's in, by name (channels.rs)
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")] pub boards: BTreeSet<String>,  // the boards it's on (boards.rs), which take a workspace, and not being a companion
 }
 
-/// A session's place in a channel (channels.rs): whether it hears the channel's posts (`inputs`).
+/// A session's place in a channel (channels.rs): whether it hears the channel's posts (`inputs`), and
+/// the most posts it may make there in any 24 hours (`per_day`; 0 or less, no limit).
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Membership {
     #[serde(default)] pub inputs: bool,
+    #[serde(default, skip_serializing_if = "no_limit")] pub per_day: i64,
+}
+
+/// Whether a limit of posts a day is none (0 or less), which settings leave out.
+fn no_limit(per_day: &i64) -> bool { *per_day <= 0 }
+
+impl Membership {
+    /// Its limit, if it has one.
+    pub fn limit(&self) -> Option<u64> { u64::try_from(self.per_day).ok().filter(|&n| n > 0) }
 }
 
 impl SessionSettings {

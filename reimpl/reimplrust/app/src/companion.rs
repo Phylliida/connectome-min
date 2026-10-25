@@ -180,7 +180,7 @@ pub fn make(app: &App, worker: &str, name: &str, goal: &str) -> Result<(), Strin
         return Err(format!("{worker} is paired with {partner} already"));
     }
     std::fs::create_dir(app.root.join(name)).map_err(|e| format!("can't make {name}: {e}"))?;
-    let first = SessionSettings { workspace: None, allow: BTreeSet::new(), system: Some(prompt(name, worker, goal)), companion: None, accompanies: Some(worker.into()), auto: true, channels: Default::default(), ..own };
+    let first = SessionSettings { workspace: None, allow: BTreeSet::new(), system: Some(prompt(name, worker, goal)), companion: None, accompanies: Some(worker.into()), auto: true, channels: Default::default(), boards: Default::default(), ..own };
     settings::write(&app.profile_path(name), &first)?;
     if app.ask_session(worker, |reply| Msg::Pair(name.into(), reply))? {
         kick_off(app, worker)?;
