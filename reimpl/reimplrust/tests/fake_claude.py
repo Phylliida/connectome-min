@@ -4,6 +4,8 @@ started (its session id, from --session-id or --resume), and takes one turn on t
 
 - 'call TOOL': a reply of text, then a call to TOOL that it asks about (can_use_tool), its result
   what the answer let it do, then text saying so;
+- 'delegate TOOL': text, then a call to a subagent (Agent), whose own call to TOOL it asks about, the
+  subagent's messages and stream marked as the subagent's (parent_tool_use_id);
 - 'hang': text, then nothing, as a turn the user will stop;
 - anything else: 'You said: …'.
 
@@ -84,6 +86,21 @@ if text.startswith('call '):
     say({'type': 'user', 'message': {'role': 'user', 'content': [result]}, 'parent_tool_use_id': None, 'session_id': session})
     reply_id = f'msg_{time.monotonic_ns()}'
     streamed(0, {'type': 'text', 'text': 'It ran.' if allowed else 'Not allowed.'}, ['It ran.' if allowed else 'Not allowed.'])
+    said = 'done'
+elif text.startswith('delegate '):
+    tool = text.split()[1]
+    streamed(0, {'type': 'text', 'text': 'Delegating.'}, ['Delegating.'])
+    streamed(1, {'type': 'tool_use', 'id': 'toolu_agent', 'name': 'Agent', 'input': {'prompt': 'touch sub'}}, ['{"prompt": "touch sub"}'])
+    sub = {'type': 'tool_use', 'id': 'toolu_sub', 'name': tool, 'input': {'command': 'touch sub'}}
+    say({'type': 'stream_event', 'event': {'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': 'SUBAGENT'}}, 'parent_tool_use_id': 'toolu_agent'})
+    say({'type': 'assistant', 'message': {'id': 'msg_sub', 'role': 'assistant', 'content': [sub]}, 'parent_tool_use_id': 'toolu_agent', 'session_id': session})
+    say({'type': 'control_request', 'request_id': 'ask-sub', 'request': {'subtype': 'can_use_tool', 'tool_name': tool, 'input': sub['input'], 'tool_use_id': 'toolu_sub', 'agent_id': 'agent-1'}})
+    allowed = heard()['response']['response']['behavior'] == 'allow'
+    say({'type': 'user', 'message': {'role': 'user', 'content': [{'tool_use_id': 'toolu_sub', 'type': 'tool_result', 'content': 'ok'}]}, 'parent_tool_use_id': 'toolu_agent', 'session_id': session})
+    done = 'The subagent did it.' if allowed else 'The subagent was denied.'
+    say({'type': 'user', 'message': {'role': 'user', 'content': [{'tool_use_id': 'toolu_agent', 'type': 'tool_result', 'content': done}]}, 'parent_tool_use_id': None, 'session_id': session})
+    reply_id = f'msg_{time.monotonic_ns()}'
+    streamed(0, {'type': 'text', 'text': done}, [done])
     said = 'done'
 elif text == 'hang':
     streamed(0, {'type': 'text', 'text': 'Working'}, ['Working'])

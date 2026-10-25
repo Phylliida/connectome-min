@@ -415,11 +415,15 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
                 calls[-1][1] += last['input']
             seen['forming'] |= last.get('forming', False)
             end = last if 'end' in last else end
-            if 'approve' in last:                                           # a call of the reply just logged
-                reply = call(port, f'/api/s/{name}/messages?from={logged - 1}')[0]
-                tool = next(b['name'] for b in reply['content'] if b.get('id') == last['approve'])
-                seen['asked'].append(tool)
-                call(port, f'/api/s/{name}/approve', {'id': last['approve'], 'answer': (answers or {}).get(tool, 'allow')})
+            if 'approve' in last:                                           # a call of the reply just logged, or a subagent's, which the log doesn't have
+                asked = last['approve']
+                if not asked.get('agent'):
+                    reply = call(port, f'/api/s/{name}/messages?from={logged - 1}')[0]
+                    if not any(b.get('id') == asked['id'] and b['name'] == asked['tool'] for b in reply['content']):
+                        raise SystemExit(f'{name}: asked about {asked}, which the reply just logged doesn\'t have: {reply}')
+                seen['asked'].append(asked['tool'])
+                seen.setdefault('approvals', []).append(asked)
+                call(port, f'/api/s/{name}/approve', {'id': asked['id'], 'answer': (answers or {}).get(asked['tool'], 'allow')})
             thoughts.append(last.get('thinking', ''))
     seen['calls'] = calls
     if end.get('end', 'never ended') is not None:
@@ -764,7 +768,7 @@ def tooled(tls, ca, baseline) -> str:
             for e in events:
                 late.append(e)
                 if 'approve' in e:
-                    call(port, '/api/s/tools/approve', {'id': e['approve'], 'answer': 'allow'})
+                    call(port, '/api/s/tools/approve', {'id': e['approve']['id'], 'answer': 'allow'})
                 if e.get('done') == job[0]:
                     break
         starter.join()
@@ -862,7 +866,7 @@ def tooled(tls, ca, baseline) -> str:
             job, results, ends = call(port, '/api/s/tools/say', {'text': 'use tools forever'})['job'], 0, []
             for e in events:
                 if 'approve' in e:
-                    call(port, '/api/s/tools/approve', {'id': e['approve'], 'answer': 'always'})
+                    call(port, '/api/s/tools/approve', {'id': e['approve']['id'], 'answer': 'always'})
                 results += 'result' in e
                 if 'result' in e and results == 70:                     # its first step calls four tools, each after one: 67 steps
                     call(port, '/api/s/tools/stop', {})
@@ -1620,7 +1624,9 @@ def clauded(tls, ca) -> str:
     sandbox has none) (the session named in
     x-connectome-session) and its cost joining the session's. A call Claude Code asks about waits for
     the page: allowed, it runs; denied, its result is the denial; always allowed, the next call to its
-    tool doesn't ask, and the tool is the session's to toggle. A stopped turn ends at once, its reply as
+    tool doesn't ask, and the tool is the session's to toggle. A call one of Claude Code's subagents makes
+    is asked about whole (its tool, input and subagent), since the log, which has only Claude Code's
+    own messages, doesn't have it; the subagent's stream stays out of the page. A stopped turn ends at once, its reply as
     far as it came in the log. A Claude Code session can't fork, have a companion, or go on without a
     message."""
     streamed.set()   # the upstream answers at once: this part has its own process, so the gateway part waits as before
@@ -1680,6 +1686,12 @@ def clauded(tls, ca) -> str:
         asked = len(seen['asked'])
         if say(port, 'cc', 'call Edit')[0] != 'Calling.It ran.' or seen['asked'][asked:] or call(port, '/api/s/cc')['tools'] != ['Edit']:
             raise SystemExit(f'a call to a tool always allowed asked about {seen["asked"][asked:]}, the tools listed are {call(port, "/api/s/cc")["tools"]}')
+        asked = len(seen['asked'])
+        said = say(port, 'cc', 'delegate Bash')[0]
+        logged_ids = [b.get('id') or b.get('toolUseId') for _, content in log() for b in content]
+        if said != 'Delegating.The subagent did it.' or seen['asked'][asked:] != ['Bash'] or seen['approvals'][-1] != {'id': 'toolu_sub', 'tool': 'Bash', 'input': {'command': 'touch sub'}, 'agent': 'agent-1'} \
+                or 'toolu_sub' in logged_ids or 'toolu_agent' not in logged_ids:
+            raise SystemExit(f'a subagent\'s call streamed as {said!r}, asked as {seen["approvals"][-1]}, the log holding calls {logged_ids}')
         r, events = following(port, 'cc')
         with r:
             next(events)

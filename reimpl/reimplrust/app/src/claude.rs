@@ -15,11 +15,12 @@
 //! ~/.claude and ~/.claude.json) and the network, which reaching the gateway takes. Claude Code's own
 //! sandbox stays off. A turn sends what was said, then streams the reply to the pages,
 //! logs it, block by block as Claude Code finishes them, asks the pages before a call Claude Code
-//! asks about (unless the session always allows its tool), logs the results, and ends at Claude
+//! asks about (unless the session always allows its tool; a subagent's call, which stays in Claude
+//! Code and out of the log, the pages are shown whole), logs the results, and ends at Claude
 //! Code's result, whose cost joins the session's costs. Claude Code keeps the conversation (its
 //! session, ID, in ~/.claude), so each turn starts it again, resuming that session.
 
-use crate::{api::brief, boards, costs::{self, For}, hub::{Event, Msg, Routed}, llm::{Content, Delta, Piece, Streamed, Usage}, settings::Sandbox, tools::{bash, POLL}, work::{Worker, APPROVAL_WAIT, DENIED, STOPPED}, App};
+use crate::{api::brief, boards, costs::{self, For}, hub::{Asking, Event, Msg, Routed}, llm::{Content, Delta, Piece, Streamed, Usage}, settings::Sandbox, tools::{bash, POLL}, work::{Worker, APPROVAL_WAIT, DENIED, STOPPED}, App};
 use connectome::{drive::append, json::{self, sparse, Json, Value}, obj};
 use serde::Deserialize;
 use std::{hash::{BuildHasher, Hasher}, io::{BufRead, BufReader, Read, Write}, path::Path, process::{ChildStdin, Command, Stdio}, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
@@ -73,7 +74,7 @@ struct Message { #[serde(default)] id: String, content: Value }
 #[derive(Deserialize)]
 #[serde(tag = "subtype", rename_all = "snake_case")]
 enum Asked {
-    CanUseTool { tool_name: String, input: Value, #[serde(default)] tool_use_id: String },
+    CanUseTool { tool_name: String, input: Value, #[serde(default)] tool_use_id: String, agent_id: Option<String> },
     #[serde(other)] Other,
 }
 
@@ -203,10 +204,14 @@ impl Worker<'_> {
                 Said::ControlRequest { request_id, request } => {
                     self.log_reply(&mut reply); // the call Claude Code asks about is in the log, where the pages answer it
                     let response = match serde_json::from_value(request) {
-                        Ok(Asked::CanUseTool { tool_name, input, tool_use_id }) => {
-                            let decided = match self.allowed(&tool_name, &tool_use_id) {
+                        Ok(Asked::CanUseTool { tool_name, input, tool_use_id, agent_id }) => {
+                            let call = Asking { id: tool_use_id.clone(), tool: tool_name.clone(), input: input.clone(), agent: agent_id };
+                            let by_subagent = call.agent.is_some();
+                            let decided = match self.allowed(call) {
                                 Ok(()) => {
-                                    self.event(Event::Running { id: tool_use_id.clone(), tool: tool_name });
+                                    if !by_subagent { // a subagent's call runs in it, out of the page's sight
+                                        self.event(Event::Running { id: tool_use_id.clone(), tool: tool_name });
+                                    }
                                     obj! {"behavior" => "allow", "updatedInput" => input, "toolUseID" => tool_use_id}
                                 }
                                 Err(why) => obj! {"behavior" => "deny", "message" => why, "toolUseID" => tool_use_id},
@@ -250,13 +255,12 @@ impl Worker<'_> {
         self.logged();
     }
 
-    /// Whether the user lets call `id` to `tool` run: at once if the session always allows the tool;
-    /// otherwise the hub asks the pages and decides by a page's answer, no answer within APPROVAL_WAIT
-    /// a denial.
-    fn allowed(&self, tool: &str, id: &str) -> Result<(), String> {
-        if self.app.profile(self.name)?.allow.contains(tool) { return Ok(()) }
+    /// Whether the user lets `call` run: at once if the session always allows its tool; otherwise the
+    /// hub asks the pages and decides by a page's answer, no answer within APPROVAL_WAIT a denial.
+    fn allowed(&self, call: Asking) -> Result<(), String> {
+        if self.app.profile(self.name)?.allow.contains(&call.tool) { return Ok(()) }
         let (answer, answered) = channel();
-        self.tell(Msg::Ask { id: id.into(), tool: tool.into(), answer });
+        self.tell(Msg::Ask { call, answer });
         answered.recv_timeout(APPROVAL_WAIT).unwrap_or_else(|_| Err(DENIED.into()))
     }
 }

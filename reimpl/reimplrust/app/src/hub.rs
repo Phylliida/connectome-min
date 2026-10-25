@@ -87,9 +87,20 @@ pub enum Msg {
     /// From the session's thread: an event for the pages.
     Event(Event),
     /// From the session's thread: a call's question, and where to answer it (Ok: it runs).
-    Ask { id: String, tool: String, answer: Sender<Result<(), String>> },
+    Ask { call: Asking, answer: Sender<Result<(), String>> },
     /// From the session's thread: job `id` is done, its memories formed; no call waits any more.
     Done(u64),
+}
+
+/// A call that waits for the user's answer whether it may run: its id, tool and input, so a page can
+/// show a call the log doesn't have, as a call one of Claude Code's subagents makes isn't (`agent`,
+/// which subagent; claude.rs).
+#[derive(Clone, Serialize)]
+pub struct Asking {
+    pub id: String,
+    pub tool: String,
+    pub input: Value,
+    #[serde(skip_serializing_if = "Option::is_none")] pub agent: Option<String>,
 }
 
 /// What a page following a session hears, a JSON object a line, its one field the event's name. Its
@@ -114,8 +125,8 @@ pub enum Event {
     Spent(Spent),
     /// The reply's prompt in tokens, as its provider counted it.
     Prompt(f64),
-    /// The call with this id waits for the user's answer whether it may run.
-    Approve(String),
+    /// A call waits for the user's answer whether it may run.
+    Approve(Asking),
     /// A page has answered whether the call with this id may run.
     Answered(String),
     /// The reply's request failed in a way that may pass, and is tried again, the nth time of `of`:
@@ -387,10 +398,10 @@ impl Live {
                 self.send(Event::Logged(n));
             }
             Msg::Event(event) => self.send(event),
-            Msg::Ask { id, tool, answer } => {
+            Msg::Ask { call, answer } => {
                 if let Some(turn) = &mut self.turn {
-                    turn.asked.insert(id.clone(), (tool, answer));
-                    self.send(Event::Approve(id));
+                    turn.asked.insert(call.id.clone(), (call.tool.clone(), answer));
+                    self.send(Event::Approve(call));
                 } // without a turn the answer's sender goes, which denies the call
             }
         }

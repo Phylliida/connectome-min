@@ -930,11 +930,12 @@ function Log() {
       html`<${Message} key=${m.id} m=${m} more=${more} hidden=${hidden} results=${own.map((id) => results.get(id))} asked=${own.map((id) => !!live?.asked.has(id))} running=${own.map((id) => live?.running?.id === id)}
         joined=${m.content.map((b) => b.type === 'tool_result' && calls.has(b.toolUseId))} />`];
   });
+  const unlogged = [...(live?.asked.values() ?? [])].filter((c) => !calls.has(c.id));
   const top = messages.length > 0 && html`<div class="earlier">${messages[0].id === 0 ? 'The start of the session.' : page.earlier === 'loading' ? 'Loading earlier messages…' : ''}</div>`;
   return html`<div id="log" onScroll=${(e) => e.currentTarget.scrollTop < 2 * e.currentTarget.clientHeight && earlier()}>${top}${rows}${reply && reply.key > (messages.at(-1)?.id ?? -1) && [
     reply.fold && html`<${FoldLine} key="fold-live" fold=${reply.fold} live />`,
     html`<${Reply} key=${'reply-' + reply.key} reply=${reply} more=${who === 'assistant'} strays=${live.results.filter((b) => !calls.has(b.toolUseId))} />`,
-  ]}</div>`;
+  ]}${unlogged.length > 0 && html`<${Unlogged} calls=${unlogged} />`}</div>`;
 }
 
 // how the context folded before a reply: the nodes it shows instead of which, by layer, and the tokens
@@ -992,6 +993,13 @@ const Reply = ({ reply, more, strays }) => html`<div class=${'msg' + (more ? ' m
     : part.kind === 'text' ? html`<div key=${i} class="bubble md" data-kind="text">${part.done.map((done, k) => html`<div class="done" key=${k} dangerouslySetInnerHTML=${{ __html: done }} />`)}<div class="tail" dangerouslySetInnerHTML=${{ __html: markdown(part.source.slice(part.cut)) }} /></div>`
     : html`<details key=${i} class="tool" open data-kind="calling"><summary>${part.name} …</summary><pre>${part.source}</pre></details>`)}
   ${strays.map((b) => html`<${Card} key=${b.toolUseId} result=${b} />`)}
+</div>`;
+
+// calls asked about that the log doesn't have, as a call one of Claude Code's subagents makes isn't (it
+// stays in Claude Code): each a card of its own below the log, with the answers
+const Unlogged = ({ calls }) => html`<div class="msg" id="asked" data-who="assistant">
+  <div class="who">${calls.some((c) => c.agent) ? 'a subagent asks' : 'assistant asks'}</div>
+  ${calls.map((c) => html`<${Card} key=${c.id} call=${{ id: c.id, name: c.tool, input: c.input }} asking=${true} />`)}
 </div>`;
 
 // reasoning, folded to its last line (the end of it, when long); while it streams in (`live`), open
@@ -1524,7 +1532,7 @@ async function follow(name, signal) {
       if (!s.running) page.live = null;
     },
     broken: (why) => { page.broken = why; },
-    turn: (job) => { [page.live, page.error] = [{ job, phase: 'waiting', reply: null, asked: new Set(), results: [], running: null, retry: null, ended: false }, null]; },
+    turn: (job) => { [page.live, page.error] = [{ job, phase: 'waiting', reply: null, asked: new Map(), results: [], running: null, retry: null, ended: false }, null]; },
     done: () => {
       page.live = null;
       listSessions();
@@ -1545,8 +1553,8 @@ async function follow(name, signal) {
     text: piece(() => part('text')),
     calling: (name) => { page.live.reply.parts.push({ kind: 'calling', name, source: '' }); },
     input: piece(() => page.live.reply.parts.at(-1)),
-    approve: (id) => {
-      page.live.asked.add(id);
+    approve: (call) => {
+      page.live.asked.set(call.id, call);
       page.live.phase = 'asking';
     },
     answered: (id) => {

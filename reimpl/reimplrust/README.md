@@ -287,7 +287,9 @@ and `~/.claude` and `~/.claude.json`, read-write; and with the network even when
 none, since the gateway is reached on it, so the commands Claude Code runs have it too. Its reply
 streams to the page and joins the log block by block as Claude Code finishes each, its calls'
 results as they come; a call Claude Code asks about shows on its card in the page with Allow,
-Always allow and Deny, as any session's (Claude Code runs read-only ones without asking), and the
+Always allow and Deny, as any session's (Claude Code runs read-only ones without asking), a call of
+one of its subagents, which stays in Claude Code and out of the log, on a card of its own below the
+log, headed "a subagent asks"; and the
 tools the session always allows are its chips. Claude Code keeps the conversation, in a session
 of its own that the first turn starts (`claude_session` in the session's settings, once Claude
 Code has started it) and later turns resume. A turn's cost, as Claude Code's result counts it,
