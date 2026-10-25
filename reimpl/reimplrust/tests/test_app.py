@@ -49,6 +49,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -315,6 +316,25 @@ def call(port, path, body=None):
         return json.loads(r.read())
 
 
+def launch(root, port, ca, *flags) -> subprocess.Popen:
+    """The app on `port`, its sessions in `root`, trusting `ca`, with `flags`, once it answers. What it
+    writes goes to ROOT.log beside `root` rather than to a pipe nobody reads, which would stop the app
+    once full; an app that stops, or doesn't answer in 10 s, fails the part with what it wrote."""
+    log = f'{root}.log'
+    with open(log, 'a') as output:   # the app has its own copy of the file
+        app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--no-open', *flags], stderr=output)
+    for _ in range(200):
+        try:
+            call(port, '/api/sessions')
+            return app
+        except OSError:
+            if app.poll() is not None:
+                break
+            time.sleep(0.05)
+    app.kill()
+    raise SystemExit(f'the app on port {port} never answered; it wrote: {Path(log).read_text()[-2000:]}')
+
+
 def configure(root, base, window, recent, chunk):
     """settings.json as the app's first run wrote it, edited as a user would: the default provider at
     `base`, and new sessions on the mock's model in `window` tokens, 1000 of them the reply's, folding
@@ -402,7 +422,11 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
     seen['calls'] = calls
     if end.get('end', 'never ended') is not None:
         raise SystemExit(f'{name}: "{(text or "(continue)")[:40]}" got {end or last}')
-    if start is not None and heard != list(range(start, start + len(heard))) or 'state' not in after or not after['state']['running'] and start + len(heard) != after['state']['messages']:
+    # the session is read after the messages the page has, so a message that joins in between comes
+    # after it (api::follow): the first heard may be below start
+    first = heard[0] if heard else start
+    if start is not None and (heard != list(range(first, first + len(heard))) or first > start) or 'state' not in after \
+            or not after['state']['running'] and first + len(heard) != after['state']['messages']:
         raise SystemExit(f'{name}: a page following the session heard the messages {heard} after {start}, then {str(after)[:80]}')   # each once, as they joined the log
     return ''.join(pieces), ''.join(thoughts), times
 
@@ -475,14 +499,8 @@ def lifted(tls, ca) -> str:
     reply."""
     port, root, mock_port = free_port(), tempfile.mkdtemp(), free_port()
     mock = serve(mock_port, tls)
-    app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--no-bash', '--no-open'], stderr=subprocess.PIPE, text=True)
+    app = launch(root, port, ca, '--no-bash')
     try:
-        for _ in range(100):
-            try:
-                call(port, '/api/sessions')
-                break
-            except OSError:
-                time.sleep(0.05)
         configure(root, f'https://localhost:{mock_port}', LIFTED, 400, 200)
         call(port, '/api/sessions', {'name': 'lifted'})
         state = chat(port, 'lifted', 60, 0, LIFTED)
@@ -543,14 +561,8 @@ def streamed_large(tls, ca) -> str:
     session with a workspace then lacks."""
     port, root, size, mock_port = free_port(), tempfile.mkdtemp(), 900_000, free_port()
     mock = serve(mock_port, tls)
-    app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--no-bash', '--no-open'], stderr=subprocess.PIPE, text=True)
+    app = launch(root, port, ca, '--no-bash')
     try:
-        for _ in range(100):
-            try:
-                call(port, '/api/sessions')
-                break
-            except OSError:
-                time.sleep(0.05)
         configure(root, f'https://localhost:{mock_port}', 20000000, 30000, 3000)
         call(port, '/api/sessions', {'name': 'large', 'workspace': tempfile.mkdtemp()})
         r, _ = following(port, 'large')                                  # an idle page hears a blank line every few seconds
@@ -609,14 +621,7 @@ def tooled(tls, ca, baseline) -> str:
     Path(root, 'mcp.json').write_text(json.dumps({'mcpServers': servers}))
 
     def start():
-        app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--tool-timeout', '1', '--no-open'], stderr=subprocess.PIPE, text=True)
-        for _ in range(100):
-            try:
-                call(port, '/api/sessions')
-                break
-            except OSError:
-                time.sleep(0.05)
-        return app
+        return launch(root, port, ca, '--tool-timeout', '1')
     app, seen['limit'] = start(), window
     configure(root, f'https://localhost:{mock_port}', window, 2381, 595.25)
 
@@ -932,13 +937,7 @@ def accompanied(tls, ca) -> str:
     sent during a turn wait, queued, and can be changed or taken back until they go."""
     port, root, mock_port, work = free_port(), tempfile.mkdtemp(), free_port(), tempfile.mkdtemp()
     mock = serve(mock_port, tls)
-    app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--no-open'], stderr=subprocess.DEVNULL)
-    for _ in range(100):
-        try:
-            call(port, '/api/sessions')
-            break
-        except OSError:
-            time.sleep(0.05)
+    app = launch(root, port, ca)
     configure(root, f'https://localhost:{mock_port}', 12000, 2381, 595.25)
     quiet = lambda *names: calm(port, *names)
     log = lambda name: [(m['participant'], words(m)) for m in call(port, f'/api/s/{name}/messages')]
@@ -1047,14 +1046,8 @@ def chatted(turns, tls, ca, baseline) -> str:
     """The long chat, the fork and the settings; the main session's price multiplier goes to `baseline`."""
     mock_port, plain_port, port, root = free_port(), free_port(), free_port(), tempfile.mkdtemp()
     mock, plain = serve(mock_port, tls), serve(plain_port)
-    app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--no-open'], stderr=subprocess.PIPE, text=True)
+    app = launch(root, port, ca)
     try:
-        for _ in range(100):
-            try:
-                call(port, '/api/sessions')
-                break
-            except OSError:
-                time.sleep(0.05)
         configure(root, f'https://localhost:{mock_port}', WINDOW, 1948, 487)
         call(port, '/api/sessions', {'name': 'main'})
         state = chat(port, 'main', turns, 0)
@@ -1287,13 +1280,7 @@ def channeled(tls, ca) -> str:
     channels' directory, and a fork is in no channel."""
     port, root, mock_port = free_port(), tempfile.mkdtemp(), free_port()
     mock = serve(mock_port, tls)
-    app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--no-open'], stderr=subprocess.DEVNULL)
-    for _ in range(100):
-        try:
-            call(port, '/api/sessions')
-            break
-        except OSError:
-            time.sleep(0.05)
+    app = launch(root, port, ca)
     configure(root, f'https://localhost:{mock_port}', 12000, 2381, 595.25)
     log = lambda name: [(m['participant'], words(m)) for m in call(port, f'/api/s/{name}/messages')]
     results = lambda name, since=0: [(b['content'], b.get('isError', False)) for m in call(port, f'/api/s/{name}/messages')[since:] for b in m['content'] if b['type'] == 'tool_result']
@@ -1400,13 +1387,7 @@ def boarded(tls, ca) -> str:
     out (an empty one, not done), and a task moved and deleted; a fork is on no board."""
     port, root, mock_port = free_port(), tempfile.mkdtemp(), free_port()
     mock = serve(mock_port, tls)
-    app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--no-open'], stderr=subprocess.DEVNULL)
-    for _ in range(100):
-        try:
-            call(port, '/api/sessions')
-            break
-        except OSError:
-            time.sleep(0.05)
+    app = launch(root, port, ca)
     configure(root, f'https://localhost:{mock_port}', 12000, 2381, 595.25)
     everything = json.loads(Path(root, 'settings.json').read_text())
     everything['sandbox']['rw'] = []                                   # /tmp, where root and the board are, out of reach but for the binding
@@ -1568,7 +1549,7 @@ def gatewayed(tls, ca) -> str:
     import http.client
     port, root, mock_port = free_port(), tempfile.mkdtemp(), free_port()
     mock = serve(mock_port, tls, Upstream)
-    app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--upstream', f'https://localhost:{mock_port}', '--no-open'], stderr=subprocess.DEVNULL)
+    app = launch(root, port, ca, '--upstream', f'https://localhost:{mock_port}')
 
     def through(method, path, body=None, headers=None):
         connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
@@ -1582,12 +1563,6 @@ def gatewayed(tls, ca) -> str:
                 return [json.loads(line) for line in lines]
             time.sleep(0.05)
         raise SystemExit(f'{session} recorded {path.read_text() if path.exists() else "nothing"}')
-    for _ in range(100):
-        try:
-            call(port, '/api/sessions')
-            break
-        except OSError:
-            time.sleep(0.05)
     try:
         body = '{"model": "claude-test",   "stream": true, "messages": [{"role": "user", "content": "h\u00e9 é"}]}'.encode()
         sent = {'authorization': 'Bearer secret-token', 'anthropic-beta': 'oauth-2025-04-20,fine-grained', 'x-claude-code-session-id': 'abc-123',
@@ -1644,7 +1619,8 @@ def part(name, run, done):
     except SystemExit as failed:
         done.put((name, None, str(failed), seen))
     except Exception as e:
-        done.put((name, None, f'{type(e).__name__}: {e}', seen))
+        lines = [frame.lineno for frame in traceback.extract_tb(e.__traceback__) if frame.filename == __file__]
+        done.put((name, None, f'{type(e).__name__}: {e} (test_app.py lines {lines})', seen))
 
 
 def main(turns=60):
