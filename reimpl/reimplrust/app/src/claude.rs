@@ -4,7 +4,7 @@
 //! SDK's control requests, which ask before a tool runs), so all it needs is a Claude Code install:
 //!
 //!   claude --print --input-format stream-json --output-format stream-json --verbose
-//!          --include-partial-messages --permission-prompt-tool stdio --setting-sources ""
+//!          --include-partial-messages --replay-user-messages --permission-prompt-tool stdio --setting-sources ""
 //!          --settings '{"sandbox":{"enabled":false}}' --strict-mcp-config [--mcp-config MCP]
 //!          --model MODEL [--append-system-prompt SYSTEM]
 //!          (--session-id ID | --resume ID)
@@ -17,13 +17,17 @@
 //! logs it, block by block as Claude Code finishes them, asks the pages before a call Claude Code
 //! asks about (unless the session always allows its tool; a subagent's call, which stays in Claude
 //! Code and out of the log, the pages are shown whole), logs the results, and ends at Claude
-//! Code's result, whose cost joins the session's costs. Claude Code keeps the conversation (its
-//! session, ID, in ~/.claude), so each turn starts it again, resuming that session.
+//! Code's result, whose cost joins the session's costs. What the user, the session's partner, a channel
+//! or a board says meanwhile goes to Claude Code at once, which takes it in after the step it's on (a
+//! call's result), or once its reply is done, as a turn of its own in the same run; it echoes each as
+//! it does, and the log has it there, so the turn ends once Claude Code has taken in all it was told.
+//! Claude Code keeps the conversation (its session, ID, in ~/.claude), so each turn starts it again,
+//! resuming that session.
 
-use crate::{api::brief, boards, costs::{self, For}, hub::{Asking, Event, Msg, Routed}, llm::{Content, Delta, Piece, Streamed, Usage}, settings::Sandbox, tools::{bash, POLL}, work::{Worker, APPROVAL_WAIT, DENIED, STOPPED}, App};
+use crate::{api::brief, boards, companion::Heard, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Content, Delta, Piece, Streamed, Usage}, settings::Sandbox, tools::{bash, POLL}, work::{said, Worker, APPROVAL_WAIT, DENIED, STOPPED}, App};
 use connectome::{drive::append, json::{self, sparse, Json, Value}, obj};
 use serde::Deserialize;
-use std::{hash::{BuildHasher, Hasher}, io::{BufRead, BufReader, Read, Write}, path::Path, process::{ChildStdin, Command, Stdio}, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
+use std::{collections::VecDeque, hash::{BuildHasher, Hasher}, io::{BufRead, BufReader, Read, Write}, path::Path, process::{ChildStdin, Command, Stdio}, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
 use wait_timeout::ChildExt;
 
 /// Why a Claude Code session can't go on without a message: Claude Code takes a turn from one.
@@ -59,7 +63,7 @@ enum Said {
     System { #[serde(default)] subtype: String, #[serde(default)] claude_code_version: String },
     StreamEvent { event: Value, parent_tool_use_id: Option<String> },
     Assistant { message: Message, parent_tool_use_id: Option<String> },
-    User { message: Message, parent_tool_use_id: Option<String> },
+    User { message: Message, parent_tool_use_id: Option<String>, #[serde(default, rename = "isReplay")] is_replay: bool },
     ControlRequest { request_id: String, request: Value },
     Result { #[serde(default)] subtype: String, #[serde(default)] is_error: bool, result: Option<String>, total_cost_usd: Option<f64>, #[serde(default)] usage: Used },
     #[serde(other)] Other,
@@ -88,11 +92,11 @@ struct Used {
 }
 
 impl Worker<'_> {
-    /// A turn in Claude Code on what was `said`, which the log has: Claude Code started on the session
+    /// A turn in Claude Code on `message`, which the log has: Claude Code started on the session
     /// it keeps (claude_session; a new one, the first time, kept once Claude Code has started it), told
     /// it, and heard until its result, or until the user stops the turn, when it's killed and what came
     /// of the reply joins the log as it is.
-    pub fn claude_turn(&self, command: &[String], said: &Value) -> Result<(), String> {
+    pub fn claude_turn(&self, command: &[String], message: &Value) -> Result<(), String> {
         let (all, own) = (self.app.settings()?, self.app.profile(self.name)?);
         let workspace = own.workspace.clone().ok_or("a Claude Code session runs in its workspace: set one in the session's settings")?;
         let boards = boards::of(self.app, &own);
@@ -102,7 +106,7 @@ impl Worker<'_> {
             None => (new_uuid(), false),
         };
         let mut args: Vec<String> = ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-            "--permission-prompt-tool", "stdio", "--setting-sources", "", "--settings", SETTINGS, "--strict-mcp-config"].map(String::from).into();
+            "--replay-user-messages", "--permission-prompt-tool", "stdio", "--setting-sources", "", "--settings", SETTINGS, "--strict-mcp-config"].map(String::from).into();
         if let Some(mcp) = &self.app.mcp_config {
             args.extend(["--mcp-config".into(), mcp.clone()]);
         }
@@ -155,12 +159,30 @@ impl Worker<'_> {
         // 2) what was said, then what Claude Code says, until its result
         let mut stdin = child.stdin.take().expect("piped");
         let initialize = obj! {"type" => "control_request", "request_id" => "initialize", "request" => obj! {"subtype" => "initialize"}};
-        let message = obj! {"type" => "user", "message" => obj! {"role" => "user", "content" => said["content"].clone()}, "parent_tool_use_id" => Value::Null, "session_id" => ""};
-        let told = send(&mut stdin, &initialize).and_then(|()| send(&mut stdin, &message));
+        let started = send(&mut stdin, &initialize).and_then(|()| send(&mut stdin, &told_line(message)));
+        let mut told = VecDeque::from([Told { message: message.clone(), logged: true, job: None }]);
+        self.tell(Msg::Taking); // what the user says from now on comes here, at once
         let mut version = String::new();
         let mut reply = Reply::default();
-        let ended = match told { Err(e) => Err(format!("telling Claude Code what was said: {e}")), Ok(()) => loop {
+        let ended = match started { Err(e) => Err(format!("telling Claude Code what was said: {e}")), Ok(()) => 'turn: loop {
             if self.stopped() { break Err(STOPPED.into()) }
+            // what's said meanwhile goes to Claude Code as it comes; a fork, or a turn that continues
+            // the log, waits for the turn
+            while let Ok((job, heard)) = self.jobs.try_recv() {
+                self.taken.set(self.taken.get() + 1);
+                let (message, users) = match heard {
+                    Job::Say { text: Some(text) } => (said("user", text), Some(job)),
+                    Job::Hear(Heard { from, text }) | Job::Notice(Heard { from, text }) => (said(&from, text), None),
+                    other => {
+                        self.later.borrow_mut().push_back((job, other));
+                        continue;
+                    }
+                };
+                if let Err(e) = send(&mut stdin, &told_line(&message)) {
+                    break 'turn Err(format!("telling Claude Code what was said: {e}"));
+                }
+                told.push_back(Told { message, logged: false, job: users });
+            }
             let line = match lines.recv_timeout(POLL) {
                 Ok(Ok(line)) => line,
                 Ok(Err(e)) => break Err(format!("reading Claude Code's output: {e}")),
@@ -190,7 +212,16 @@ impl Worker<'_> {
                     reply.id = message.id;
                     reply.blocks.extend(message.content.arr().iter().cloned());
                 }
-                Said::User { message, parent_tool_use_id: None } => {
+                Said::User { parent_tool_use_id: None, is_replay: true, .. } => {
+                    // Claude Code takes in what it was told: the log has it here, where Claude Code's conversation does
+                    self.log_reply(&mut reply);
+                    if let Some(taken) = told.pop_front() && !taken.logged {
+                        append(&self.s, &taken.message, &own.config);
+                        self.logged();
+                        if let Some(job) = taken.job { self.tell(Msg::Taken(job)) }
+                    }
+                }
+                Said::User { message, parent_tool_use_id: None, .. } => {
                     self.log_reply(&mut reply);
                     let results: Vec<Value> = message.content.arr().iter().filter(|b| b.kind() == "tool_result").map(logged_result).collect();
                     if results.is_empty() { continue }
@@ -229,12 +260,23 @@ impl Worker<'_> {
                     let prompts = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
                     let used = Usage { cost: total_cost_usd, input: prompts, cached: usage.cache_read_input_tokens, output: usage.output_tokens };
                     if let Some(spent) = costs::spend(&self.s, For::Reply, used) { self.event(Event::Spent(spent)) }
-                    break if is_error { Err(result.unwrap_or(subtype)) } else { Ok(()) };
+                    if is_error { break Err(result.unwrap_or(subtype)) }
+                    // what Claude Code was told after its reply ends it takes in next, as a turn of its own in the same run
+                    if told.iter().all(|t| t.logged) { break Ok(()) }
                 }
                 _ => {}
             }
         } };
         self.log_reply(&mut reply); // a reply cut short joins the log as far as it came
+        // what Claude Code was told but didn't take in, the session's thread takes next, each a turn of its own
+        for left in told.into_iter().filter(|t| !t.logged) {
+            let text = left.message["content"][0]["text"].as_str().unwrap_or("").to_string();
+            let job = match left.message["participant"].as_str() {
+                Some("user") => Job::Say { text: Some(text) },
+                from => Job::Notice(Heard { from: from.unwrap_or("").into(), text }),
+            };
+            self.later.borrow_mut().push_back((left.job.unwrap_or(0), job));
+        }
         // 3) Claude Code done with: its input closed, so it exits; killed at once if the turn failed
         drop(stdin);
         if ended.is_err() { kill(&mut child) }
@@ -263,6 +305,16 @@ impl Worker<'_> {
         self.tell(Msg::Ask { call, answer });
         answered.recv_timeout(APPROVAL_WAIT).unwrap_or_else(|_| Err(DENIED.into()))
     }
+}
+
+/// A message Claude Code was told and hasn't taken in yet (it echoes each as it does): the message as
+/// the log keeps it, whether the log has it already (the turn's own, logged before Claude Code starts),
+/// and, for the user's, its job, which the pages show as handed over until then.
+struct Told { message: Value, logged: bool, job: Option<u64> }
+
+/// A message as Claude Code takes it on its stdin.
+fn told_line(message: &Value) -> Value {
+    obj! {"type" => "user", "message" => obj! {"role" => "user", "content" => message["content"].clone()}, "parent_tool_use_id" => Value::Null, "session_id" => ""}
 }
 
 /// The reply streaming in: its id, and the blocks it has that the log doesn't yet. A call Claude Code

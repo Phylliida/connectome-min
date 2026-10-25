@@ -16,7 +16,7 @@ use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, store::Session};
 use std::{cell::{Cell, RefCell}, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
 
 /// A message from `who` of `text`, as the log keeps it.
-fn said(who: &str, text: String) -> Value { obj! {"participant" => who, "content" => vec![obj! {"type" => "text", "text" => text}]} }
+pub fn said(who: &str, text: String) -> Value { obj! {"participant" => who, "content" => vec![obj! {"type" => "text", "text" => text}]} }
 
 /// How long a call waits for the user's answer before it's denied.
 pub const APPROVAL_WAIT: Duration = Duration::from_secs(600);
@@ -159,9 +159,9 @@ pub struct Worker<'a> {
     pub name: &'a str,
     pub s: Session,
     halt: Receiver<()>,
-    jobs: &'a Receiver<(u64, Job)>,
-    taken: &'a Cell<u64>, // how many jobs the thread has taken from `jobs`
-    later: &'a RefCell<VecDeque<(u64, Job)>>,
+    pub jobs: &'a Receiver<(u64, Job)>,
+    pub taken: &'a Cell<u64>, // how many jobs the thread has taken from `jobs`
+    pub later: &'a RefCell<VecDeque<(u64, Job)>>,
 }
 
 impl Worker<'_> {

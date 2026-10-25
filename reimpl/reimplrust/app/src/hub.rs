@@ -90,6 +90,12 @@ pub enum Msg {
     Ask { call: Asking, answer: Sender<Result<(), String>> },
     /// From the session's thread: job `id` is done, its memories formed; no call waits any more.
     Done(u64),
+    /// From the session's thread: its turn takes the user's messages as it runs (a Claude Code
+    /// session's: claude.rs), so the hub hands it those queued and those that come, at once.
+    Taking,
+    /// From the session's thread: Claude Code has taken in the user's message of job `id`, which the
+    /// log now has.
+    Taken(u64),
 }
 
 /// A call that waits for the user's answer whether it may run: its id, tool and input, so a page can
@@ -245,11 +251,13 @@ impl App {
 }
 
 /// A turn the user asked for that waits for the session's thread: its number, and its message (None:
-/// a turn that continues the log).
+/// a turn that continues the log); or, `handed`, a message the turn running has been handed that
+/// Claude Code hasn't taken in yet (Msg::Taking).
 #[derive(Clone, Serialize)]
 pub struct Queued {
     pub id: u64,
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")] pub handed: bool,
 }
 
 /// A session as the hub knows it: where its thread takes jobs, how many it has had, how many were sent
@@ -261,6 +269,7 @@ struct Live {
     sent: u64,
     idle: bool,
     queued: VecDeque<Queued>,
+    handed: VecDeque<Queued>, // the user's messages a turn that takes them as it runs has, not yet taken in
     pages: Vec<Sender<Event>>,
     turn: Option<Turn>,
     awaiting: Option<Sender<Heard>>, // a call waiting for what the partner tells it next
@@ -268,12 +277,14 @@ struct Live {
 
 /// A turn as a page that comes in during it hears it first: its start, then the events since the log
 /// last grew (what the log holds, the page reads from it); the calls waiting for an answer; the
-/// session's thread's line, until the user stops the turn; and whether it has ended (Msg::Ended).
+/// session's thread's line, until the user stops the turn; whether it has ended (Msg::Ended); and
+/// whether it takes the user's messages as it runs (Msg::Taking).
 struct Turn {
     events: Vec<Event>,
     asked: HashMap<String, (String, Sender<Result<(), String>>)>, // by call id: its tool, where to answer
     stop: Option<Sender<()>>,
     ended: bool,
+    taking: bool,
 }
 
 impl Live {
@@ -282,7 +293,7 @@ impl Live {
         let (jobs, queue) = channel();
         let name = name.to_string();
         std::thread::spawn(move || work(app, &name, queue));
-        Live { jobs, numbered: 0, sent: 0, idle: false, queued: VecDeque::new(), pages: vec![], turn: None, awaiting: None }
+        Live { jobs, numbered: 0, sent: 0, idle: false, queued: VecDeque::new(), handed: VecDeque::new(), pages: vec![], turn: None, awaiting: None }
     }
 
     /// Job `id` to the session's thread.
@@ -291,15 +302,29 @@ impl Live {
         let _ = self.jobs.send((id, job));
     }
 
-    /// The next queued turn to the session's thread, if it waits for one; the pages hear the queue as
-    /// it is then.
+    /// The next queued turn to the session's thread, if it waits for one, or every queued message, if
+    /// its turn takes them as it runs (a turn that continues the log stays queued); the pages hear the
+    /// queue as it is then.
     fn release(&mut self) {
-        if self.idle && let Some(Queued { id, text }) = self.queued.pop_front() {
+        if self.idle && let Some(Queued { id, text, .. }) = self.queued.pop_front() {
             self.dispatch(id, Job::Say { text });
         }
-        let queue = Event::Queue(self.queued.iter().cloned().collect());
+        while self.turn.as_ref().is_some_and(|t| t.taking) && self.queued.front().is_some_and(|q| q.text.is_some()) {
+            let mut handed = self.queued.pop_front().expect("a queued message");
+            self.dispatch(handed.id, Job::Say { text: handed.text.clone() });
+            handed.handed = true;
+            self.handed.push_back(handed);
+        }
+        self.show_queue();
+    }
+
+    /// The pages told what waits: the messages handed to the turn running, then the queued turns.
+    fn show_queue(&mut self) {
+        let queue = Event::Queue(self.queue());
         self.pages.retain(|page| page.send(queue.clone()).is_ok());
     }
+
+    fn queue(&self) -> Vec<Queued> { self.handed.iter().chain(&self.queued).cloned().collect() }
 
     fn handle(&mut self, app: &App, name: &str, msg: Msg) {
         match msg {
@@ -323,7 +348,7 @@ impl Live {
             }
             Msg::Job(Job::Say { text }, reply) => {
                 self.numbered += 1;
-                self.queued.push_back(Queued { id: self.numbered, text });
+                self.queued.push_back(Queued { id: self.numbered, text, handed: false });
                 let _ = reply.send(self.numbered);
                 self.release();
             }
@@ -353,7 +378,7 @@ impl Live {
                 }
                 let _ = followed.send(());
             }
-            Msg::Status(reply) => drop(reply.send((self.turn.is_some(), self.queued.iter().cloned().collect()))),
+            Msg::Status(reply) => drop(reply.send((self.turn.is_some(), self.queue()))),
             Msg::Tune(v, merged, reply) => {
                 let tune = |all: Settings| settings::change(&app.profile_path(name), |old: &mut SessionSettings| old.tuned(&v, merged, &all).map(|new| *old = new));
                 let _ = reply.send(app.settings().and_then(tune).map(drop));
@@ -361,7 +386,7 @@ impl Live {
             Msg::Member { channel, change, reply } => drop(reply.send(channels::member(app, name, &channel, &change))),
             Msg::OnBoard { board, on, reply } => drop(reply.send(boards::member(app, name, &board, on))),
             Msg::Start(id, stop) => {
-                self.turn = Some(Turn { events: vec![], asked: HashMap::new(), stop: Some(stop), ended: false });
+                self.turn = Some(Turn { events: vec![], asked: HashMap::new(), stop: Some(stop), ended: false, taking: false });
                 self.send(Event::Turn(id));
             }
             Msg::Stop(reply) => {
@@ -376,7 +401,19 @@ impl Live {
             }
             Msg::Done(id) => {
                 self.turn = None;
+                self.handed.clear(); // what the turn didn't take in, its thread takes next, as turns of their own
+                self.show_queue();
                 self.send(Event::Done(id));
+            }
+            Msg::Taking => {
+                if let Some(turn) = &mut self.turn {
+                    turn.taking = true;
+                }
+                self.release();
+            }
+            Msg::Taken(id) => {
+                self.handed.retain(|q| q.id != id);
+                self.show_queue();
             }
             Msg::Approve { id, answer, reply } => match self.turn.as_mut().and_then(|t| t.asked.remove(&id)) {
                 Some((tool, waiting)) => {

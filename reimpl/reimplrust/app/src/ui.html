@@ -839,7 +839,8 @@ function SessionForm() {
 
 // the messages (and continues) the user sent that wait for the turn running: each with a button that
 // edits it in place (Enter saves, Shift+Enter a new line, Escape leaves it as it was) and one that
-// takes it back; one that goes to the model meanwhile leaves the list
+// takes it back; one that goes to the model meanwhile leaves the list. A Claude Code session's turn
+// has the user's messages at once: each shows as with Claude Code, as it is, until Claude Code takes it in
 function QueuedList() {
   const queued = state?.queued ?? [];
   if (!queued.length) return null;
@@ -855,6 +856,7 @@ function QueuedList() {
   return html`<div id="queued">${queued.map((q) => q.id === page.editing
     ? html`<div class="queued" key=${q.id} data-id=${q.id}><textarea rows="2" defaultValue=${q.text ?? ''} onKeyDown=${keys(q.id)} ref=${(t) => t && !t.dataset.shown && (t.dataset.shown = '1', t.focus())}></textarea>
         <button title="Save it (Enter)" aria-label="Save the queued message" onClick=${(e) => requeue(q.id, e.target.closest('.queued').querySelector('textarea').value)}>Save</button></div>`
+    : q.handed ? html`<div class="queued handed" key=${q.id} data-id=${q.id}><span class="text" title=${q.text}>${q.text}</span><small title="Claude Code takes it in after the step it's on">with Claude Code</small></div>`
     : html`<div class="queued" key=${q.id} data-id=${q.id}><span class="text" title=${q.text ?? ''}>${q.text ?? '(continue)'}</span><small>queued</small>
         ${q.text != null && html`<button class="edit" title="Edit it" aria-label="Edit the queued message" onClick=${() => { page.editing = q.id; draw(); }}>${ICONS.pencil()}</button>`}
         <button class="cancel" title="Take it back" aria-label="Cancel the queued message" onClick=${() => requeue(q.id, null)}>×</button></div>`)}</div>`;

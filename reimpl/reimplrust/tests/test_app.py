@@ -1626,8 +1626,11 @@ def clauded(tls, ca) -> str:
     the page: allowed, it runs; denied, its result is the denial; always allowed, the next call to its
     tool doesn't ask, and the tool is the session's to toggle. A call one of Claude Code's subagents makes
     is asked about whole (its tool, input and subagent), since the log, which has only Claude Code's
-    own messages, doesn't have it; the subagent's stream stays out of the page. A stopped turn ends at once, its reply as
-    far as it came in the log. A Claude Code session can't fork, have a companion, or go on without a
+    own messages, doesn't have it; the subagent's stream stays out of the page. What the user says while
+    a turn runs goes to Claude Code at once, shown as with Claude Code until it takes it in, after the
+    call it's on, where the log has it, the turn going on with it; said during the turn's reply, it's
+    a turn of its own in the same run, which the turn waits for. A stopped turn ends at once, its reply as
+    far as it came in the log, and what Claude Code hadn't taken in yet is the next turn. A Claude Code session can't fork, have a companion, or go on without a
     message."""
     streamed.set()   # the upstream answers at once: this part has its own process, so the gateway part waits as before
     port, root, mock_port, work = free_port(), tempfile.mkdtemp(), free_port(), tempfile.mkdtemp()
@@ -1658,7 +1661,7 @@ def clauded(tls, ca) -> str:
         session, run = state['settings'].get('claude_session'), runs()[0]
         flags = ['--input-format', 'stream-json', '--output-format', 'stream-json', '--permission-prompt-tool', 'stdio', '--model', 'fake', '--session-id', session,
                  '--settings', '{"sandbox":{"enabled":false}}', '--setting-sources', '']   # Claude Code's own sandbox off: bubblewrap is the session's
-        if not session or any(run['args'][run['args'].index(flag) + 1] != value for flag, value in zip(flags[::2], flags[1::2])) or '--print' not in run['args']:
+        if not session or any(run['args'][run['args'].index(flag) + 1] != value for flag, value in zip(flags[::2], flags[1::2])) or not {'--print', '--replay-user-messages'} <= set(run['args']):
             raise SystemExit(f'Claude Code ran as {run["args"]}, the session keeping {session}')
         if not run['outside_failed'] or run['gateway'] != 200:
             raise SystemExit(f'in its sandbox Claude Code wrote outside its workspace ({not run["outside_failed"]}), and the gateway answered {run["gateway"]}')
@@ -1692,19 +1695,54 @@ def clauded(tls, ca) -> str:
         if said != 'Delegating.The subagent did it.' or seen['asked'][asked:] != ['Bash'] or seen['approvals'][-1] != {'id': 'toolu_sub', 'tool': 'Bash', 'input': {'command': 'touch sub'}, 'agent': 'agent-1'} \
                 or 'toolu_sub' in logged_ids or 'toolu_agent' not in logged_ids:
             raise SystemExit(f'a subagent\'s call streamed as {said!r}, asked as {seen["approvals"][-1]}, the log holding calls {logged_ids}')
-        r, events = following(port, 'cc')
-        with r:
-            next(events)
-            call(port, '/api/s/cc/say', {'text': 'hang'})
+        def meanwhile(first, cue, then, until='end'):
+            """A turn on `first` as a page following it hears it, `then` said when `cue` streams in: the
+            turns it heard start, the queues it heard, and its last event, `until`'s."""
+            r, events = following(port, 'cc')
+            with r:
+                next(events)
+                call(port, '/api/s/cc/say', {'text': first})
+                turns, queues = [], []
+                for event in events:
+                    turns += [event['turn']] if 'turn' in event else []
+                    queues += [event['queue']] if 'queue' in event else []
+                    if event.get('text') == cue or event.get('calling') == cue:
+                        then()
+                    if until in event:
+                        return turns, queues, event
+        text = lambda t: [{'type': 'text', 'text': t}]
+        before, processes = len(log()), len(runs())
+        turns, queues, end = meanwhile('wait', 'Bash', lambda: call(port, '/api/s/cc/say', {'text': 'and also this'}))
+        handed = [q for queue in queues for q in queue if q.get('handed')]
+        wait_call = {'type': 'tool_use', 'id': 'toolu_wait', 'name': 'Bash', 'input': {'command': 'sleep'}}
+        if log()[before:] != [('user', text('wait')), ('assistant', text('Working.') + [wait_call]), ('user', [{'type': 'tool_result', 'toolUseId': 'toolu_wait', 'content': 'slept'}]),
+                              ('user', text('and also this')), ('assistant', text('Also: and also this.'))] \
+                or len(turns) != 1 or end['end'] is not None or [q['text'] for q in handed[:1]] != ['and also this'] or queues[-1] != []:
+            raise SystemExit(f'a message said during a call was logged as {log()[before:]}, in turns {turns}, the queue heard as {queues}')
+        before = len(log())
+        turns, queues, end = meanwhile('linger', 'Lingering', lambda: call(port, '/api/s/cc/say', {'text': 'after the reply'}), until='done')
+        if log()[before:] != [('user', text('linger')), ('assistant', text('Lingering done.')), ('user', text('after the reply')), ('assistant', text('You said: after the reply'))] \
+                or len(turns) != 1 or len(runs()) != processes + 2:
+            raise SystemExit(f'a message said during a reply was logged as {log()[before:]}, in turns {turns}, Claude Code run {len(runs()) - processes} times')
+        stopped = time.monotonic()
+
+        def stop():
+            nonlocal stopped
+            call(port, '/api/s/cc/say', {'text': 'pending one'})
+            time.sleep(0.5)   # the session's thread hands it to Claude Code, which doesn't take it in before the stop
+            call(port, '/api/s/cc/stop', {})
             stopped = time.monotonic()
-            for event in events:
-                if event.get('text') == 'Working':
-                    call(port, '/api/s/cc/stop', {})
-                    stopped = time.monotonic()
-                if 'end' in event:
-                    break
-        if event['end'] != 'Stopped by the user.' or time.monotonic() - stopped > 5 or log()[-1] != ('assistant', [{'type': 'text', 'text': 'Working'}]):
-            raise SystemExit(f'a stopped turn ended {event} after {time.monotonic() - stopped:.1f} s, the log ending {log()[-1]}')
+        turns, queues, event = meanwhile('hang', 'Working', stop)
+        if event['end'] != 'Stopped by the user.' or time.monotonic() - stopped > 5:
+            raise SystemExit(f'a stopped turn ended {event} after {time.monotonic() - stopped:.1f} s')
+        expected = [('assistant', text('Working')), ('user', text('pending one')), ('assistant', text('You said: pending one'))]
+        for _ in range(100):   # the next turn starts as the stopped one's job ends
+            if log()[-3:] == expected:
+                break
+            time.sleep(0.05)
+        if log()[-3:] != expected:
+            raise SystemExit(f'after a stop with a message Claude Code hadn\'t taken in, the log ends {log()[-3:]}')
+        settle(port, 'cc')   # that turn is done, so a page following the session next hears none of it
         refused('/api/s/cc/fork', {'at': 1, 'name': 'cc-fork'})
         refused('/api/s/cc/companion', {'name': 'pal', 'goal': 'help'})
         r, events = following(port, 'cc')

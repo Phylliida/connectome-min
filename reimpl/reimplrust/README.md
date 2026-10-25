@@ -295,8 +295,12 @@ tools the session always allows are its chips. Claude Code keeps the conversatio
 of its own that the first turn starts (`claude_session` in the session's settings, once Claude
 Code has started it) and later turns resume. A turn's cost, as Claude Code's result counts it,
 joins the session's costs. Stop kills Claude Code and what it started, the reply joining the log as
-far as it came. What a channel or a board tells a Claude Code session takes a turn of its own
-rather than joining one running. Not yet: forks, a companion, Continue without a message, and
+far as it came. What the user says while a turn runs, and what a companion, a channel or a board
+tells the session, goes to Claude Code at once (`--replay-user-messages`): the user's shows above the
+message box as "with Claude Code" until Claude Code takes it in, after the step it's on (a call's
+result), or, once its reply is done, as a turn of its own in the same run; it echoes each as it does,
+and the log has it there. The turn ends once Claude Code has taken in all it was told; what a stopped
+turn's Claude Code hadn't taken in is the next turn. Not yet: forks, a companion, Continue without a message, and
 memories (the gateway forwards the requests unchanged).
 
 Flags: `--root DIR` (sessions and settings; `sessions` by default), `--addr` (`127.0.0.1:8080`),
