@@ -23,10 +23,11 @@ another site's page can't change the settings; a server whose certificate names 
 host gets nothing; the model's tool calls, through MCP servers, get their results and form
 memories; the app's peak memory doesn't grow with the contexts it streams; and in a window too
 small for a memory no merge has taken on each layer and the tail, the oldest of them merge across
-layers (lifted), and every turn still gets its reply.
+layers (lifted), and every turn still gets its reply. In a channel, each post, the user's or a
+session's (message_channel), goes to the sessions there with inputs on but its poster.
 
-The five parts (the chat, the tool calls, the large contexts, the companion, the lifted memories)
-run at once, in processes of their own, each with its own mock; the first to fail stops the rest.
+The six parts (the chat, the tool calls, the large contexts, the companion, the lifted memories,
+the channels) run at once, in processes of their own, each with its own mock; the first to fail stops the rest.
 
     python3 tests/test_app.py [turns]
 """
@@ -104,6 +105,7 @@ class Mock(BaseHTTPRequestHandler):
         seen['requests'].append((request.get('system') or '', [t['name'] for t in request.get('tools') or []]))
         last = ' '.join(b.get('text', '') for b in messages[-1]['content'])
         last = re.sub(r'^\s*\S+ (?:ended its turn|sends you a message while it works|asks you, and waits for your answer):\n\n', '', last)   # from a session's partner: what it says
+        last = re.sub(r'^\s*(?:\S+|The user) posted in #\S+:\n\n([\s\S]*)\n\n\(To reply in #\S+, use message_channel [^\n]*\)(?:\n\nAbout #\S+: [\s\S]*)?$', r'\1', last)   # a post in a channel: what it says
         results = [b for b in messages[-1]['content'] if b['type'] == 'tool_result']
         asked = next(' '.join(b.get('text', '') for b in m['content']) for m in reversed(messages) if m['role'] == 'user' and any(b['type'] == 'text' for b in m['content']))
         stop = 'end_turn'
@@ -900,6 +902,17 @@ def tooled(tls, ca, baseline) -> str:
         mock.shutdown()
 
 
+def calm(port, *names):
+    """Once no turn has run in the sessions for six polls in a row, a tenth of a second apart."""
+    still = 0
+    for _ in range(300):
+        still = 0 if any(call(port, f'/api/s/{n}')['running'] for n in names) else still + 1
+        if still == 6:
+            return
+        time.sleep(0.1)
+    raise SystemExit(f'turns still run in {names} after 30 s')
+
+
 def accompanied(tls, ca) -> str:
     """A session and its companion, made with a goal: it starts on the session's provider and model,
     without a workspace, the goal in its system prompt, Auto on; each declares message, the companion
@@ -921,16 +934,7 @@ def accompanied(tls, ca) -> str:
         except OSError:
             time.sleep(0.05)
     configure(root, f'https://localhost:{mock_port}', 12000, 2381, 595.25)
-
-    def quiet(*names):
-        """Once no turn has run in the sessions for six polls in a row, a tenth of a second apart."""
-        calm = 0
-        for _ in range(300):
-            calm = 0 if any(call(port, f'/api/s/{n}')['running'] for n in names) else calm + 1
-            if calm == 6:
-                return
-            time.sleep(0.1)
-        raise SystemExit(f'turns still run in {names} after 30 s')
+    quiet = lambda *names: calm(port, *names)
     log = lambda name: [(m['participant'], words(m)) for m in call(port, f'/api/s/{name}/messages')]
     try:
         call(port, '/api/sessions', {'name': 'pair', 'workspace': work})
@@ -1247,6 +1251,102 @@ def chatted(turns, tls, ca, baseline) -> str:
         plain.shutdown()
 
 
+def channeled(tls, ca) -> str:
+    """Channels: one made through the API (a name taken, or not a name, refused) and sessions put in
+    it, two with inputs on and one without. A post, the user's or one a session makes with
+    message_channel, goes at once to each session there with inputs on but the one that posted it,
+    headed by the channel and who posted it and ending with how to reply there, then the channel's
+    description once it has one, and an idle session takes a turn on it; the call's result names who
+    heard it. A page following the channel gets each
+    post once, as it's logged. Posting in a channel the session isn't in fails; joining or posting to a
+    channel there isn't is refused, leaving takes a session out, the sessions listed leave out the
+    channels' directory, and a fork is in no channel."""
+    port, root, mock_port = free_port(), tempfile.mkdtemp(), free_port()
+    mock = serve(mock_port, tls)
+    app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--no-open'], stderr=subprocess.DEVNULL)
+    for _ in range(100):
+        try:
+            call(port, '/api/sessions')
+            break
+        except OSError:
+            time.sleep(0.05)
+    configure(root, f'https://localhost:{mock_port}', 12000, 2381, 595.25)
+    log = lambda name: [(m['participant'], words(m)) for m in call(port, f'/api/s/{name}/messages')]
+    results = lambda name, since=0: [(b['content'], b.get('isError', False)) for m in call(port, f'/api/s/{name}/messages')[since:] for b in m['content'] if b['type'] == 'tool_result']
+    posts = lambda: [(p['from'], p['text']) for p in call(port, '/api/c/lounge/posts')]
+    members = lambda: {m['name']: m['inputs'] for c in call(port, '/api/channels') if c['name'] == 'lounge' for m in c['members']}
+    heard = lambda who, text, about='': f'{who} posted in #lounge:\n\n{text}\n\n(To reply in #lounge, use message_channel with channel "lounge"; what you say otherwise stays in your session.)' \
+        + (f'\n\nAbout #lounge: {about}' if about else '')
+    described = lambda: next(c for c in call(port, '/api/channels') if c['name'] == 'lounge').get('description')
+    post = lambda text: 'call ' + json.dumps([['message_channel', {'channel': 'lounge', 'text': text}]])
+
+    def refused(path, body):
+        try:
+            call(port, path, body)
+            raise SystemExit(f'{path} took {body}')
+        except urllib.error.HTTPError as error:
+            if error.code != 400:
+                raise
+    try:
+        if [c['name'] for c in call(port, '/api/channels', {'name': 'lounge'})] != ['lounge']:
+            raise SystemExit(f'the channels listed as {call(port, "/api/channels")}')
+        refused('/api/channels', {'name': 'lounge'})
+        refused('/api/channels', {'name': 'no good'})
+        for name in ('ann', 'bob', 'cy'):
+            call(port, '/api/sessions', {'name': name})
+        call(port, '/api/s/ann/channel', {'channel': 'lounge', 'inputs': True})
+        call(port, '/api/s/bob/channel', {'channel': 'lounge', 'inputs': True})
+        if call(port, '/api/s/cy/channel', {'channel': 'lounge'})['settings'].get('channels') != {'lounge': {'inputs': False}} \
+                or members() != {'ann': True, 'bob': True, 'cy': False}:
+            raise SystemExit(f'joined, the channel has {members()}')
+        page = urllib.request.urlopen(f'http://127.0.0.1:{port}/api/c/lounge/stream', timeout=10)
+        call(port, '/api/c/lounge/post', {'text': post('echo hi all')})   # ann and bob each post it, and each hears the other's
+        calm(port, 'ann', 'bob', 'cy')
+        if posts()[0] != (None, post('echo hi all')) or sorted(posts()[1:]) != [('ann', 'echo hi all'), ('bob', 'echo hi all')] or log('cy'):
+            raise SystemExit(f'the channel has {posts()}, cy heard {log("cy")}')
+        for me, other in (('ann', 'bob'), ('bob', 'ann')):
+            got = [text for who, text in log(me) if who == '#lounge']
+            if sorted(got) != sorted([heard('The user', post('echo hi all')), heard(other, 'echo hi all')]) or log(me)[-1] != ('assistant', 'hi all') \
+                    or results(me) != [(f'Posted in #lounge; {other} heard it.', False)]:
+                raise SystemExit(f'{me} heard {log(me)}, its call got {results(me)}')
+        streamed = []
+        while len(streamed) < 3:
+            if (line := page.readline()).strip():
+                streamed.append(json.loads(line)['post'])
+        page.close()
+        if [p['id'] for p in streamed] != [0, 1, 2] or [(p['from'], p['text']) for p in streamed] != posts():
+            raise SystemExit(f'a page following the channel got {streamed}')
+        about = 'Post only when it matters.'
+        if [c.get('description') for c in call(port, '/api/c/lounge/describe', {'description': f'  {about}\n'})] != [about] or described() != about:
+            raise SystemExit(f'the channel described as {described()!r}')
+        counts = len(log('ann')), len(log('bob'))                      # cy, without inputs, posts all the same
+        say(port, 'cy', post('echo from cy'))
+        calm(port, 'ann', 'bob', 'cy')
+        if posts()[-1] != ('cy', 'echo from cy') or results('cy') != [('Posted in #lounge; ann and bob heard it.', False)] \
+                or log('ann')[counts[0]:] != [('#lounge', heard('cy', 'echo from cy', about)), ('assistant', 'from cy')] \
+                or log('bob')[counts[1]:] != [('#lounge', heard('cy', 'echo from cy', about)), ('assistant', 'from cy')]:
+            raise SystemExit(f'cy posted {posts()[-1]}, its call got {results("cy")}, ann heard {log("ann")[counts[0]:]}')
+        call(port, '/api/c/lounge/describe', {'description': ' '})
+        if described() is not None:
+            raise SystemExit(f'a blank description left {described()!r}')
+        count = len(call(port, '/api/s/cy/messages'))
+        say(port, 'cy', 'call ' + json.dumps([['message_channel', {'channel': 'elsewhere', 'text': 'hi'}]]))
+        if results('cy', count) != [("you're not in #elsewhere", True)] or len(posts()) != 4:
+            raise SystemExit(f'a post in a channel cy isn\'t in got {results("cy", count)}')
+        refused('/api/s/ann/channel', {'channel': 'nowhere', 'inputs': True})
+        refused('/api/c/nowhere/post', {'text': 'hi'})
+        refused('/api/c/nowhere/describe', {'description': 'hi'})
+        refused('/api/c/lounge/post', {'text': '  '})
+        call(port, '/api/s/bob/channel', {'channel': 'lounge', 'leave': True})
+        call(port, '/api/s/ann/fork', {'at': 0, 'name': 'ann-fork'})
+        if members() != {'ann': True, 'cy': False} or call(port, '/api/s/ann-fork')['settings'].get('channels') \
+                or sorted(s['name'] for s in call(port, '/api/sessions')) != ['ann', 'ann-fork', 'bob', 'cy']:
+            raise SystemExit(f'the channel has {members()}, the fork {call(port, "/api/s/ann-fork")["settings"].get("channels")}, the sessions {call(port, "/api/sessions")}')
+        return f'a channel of {len(posts())} posts among three sessions, which ann and bob heard in {len(log("ann"))} and {len(log("bob"))} messages'
+    finally:
+        app.terminate()
+        mock.shutdown()
+
 def part(name, run, done):
     """A part of the test in a process group of its own, which its apps and their servers join, so
     that killing the group stops them all: (name, its summary or None, why it failed or None, counts)."""
@@ -1271,7 +1371,7 @@ def main(turns=60):
     forked = multiprocessing.get_context('fork')
     done, baseline = forked.Queue(), forked.Queue()
     parts = {'chat': lambda: chatted(turns, (cert, key), ca, baseline), 'tools': lambda: tooled((cert, key), ca, baseline), 'large': lambda: streamed_large((cert, key), ca),
-             'companion': lambda: accompanied((cert, key), ca), 'lifted': lambda: lifted((cert, key), ca)}
+             'companion': lambda: accompanied((cert, key), ca), 'lifted': lambda: lifted((cert, key), ca), 'channels': lambda: channeled((cert, key), ca)}
     running = [forked.Process(target=part, args=(name, run, done)) for name, run in parts.items()]
     summaries, totals, failure = {}, {'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0}, None
     try:
@@ -1296,7 +1396,7 @@ def main(turns=60):
         print(failure)
         return 1
     print(f'{totals["chat"]} chat turns and {totals["memory"]} memory requests; {summaries["chat"]}; {totals["bytes"] // 1024} KB of requests streamed '
-          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}')
+          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}')
     return 0
 
 

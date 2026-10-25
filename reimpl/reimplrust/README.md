@@ -148,6 +148,23 @@ answer. A turn hears it between its steps, and goes on while there's more; an id
 turn on it. Turning Auto on sends the session's last turn to the companion, unless a turn runs in
 either. A fork has no companion of its own.
 
+Channels (`app/src/channels.rs`) are logs of posts that sessions take part in, made from the page's
+Channels list on the left, each shown with its posts and a box that posts to it as the user. A
+session's settings panel adds it to a channel (its choice of channels, and +) and sets whether it
+listens there, kept in its settings' `channels` (`{"NAME": {"inputs": true}}`). A session in a
+channel has `message_channel`, which posts there; a post, the user's or a session's, goes at once to
+every session in the channel with `inputs` on but the one that posted it, as a message (its
+participant `#NAME`) headed by who posted it ("onion posted in #NAME:", or "The user posted…") and
+ending with a reminder of how to reply there, then the channel's description ("About #NAME: …"), if
+you gave it one in the box above its members (say, to post sparingly when an expensive model
+listens), the way a companion's messages come: between the steps
+of a turn running, or in a turn of its own. The call's result names the sessions that heard it.
+What a session says otherwise stays in its session, so it stops posting when it chooses to; only the
+user sets who's in a channel and who listens. A channel is `ROOT/.channels/NAME/`: `posts.jsonl`,
+each post `{id, from, text}` (`from` null for the user's), and `channel.json`, its `description`;
+the hub alone writes both. A fork, and a new companion, are in no channel. Sessions can't yet read a channel's history
+beyond what they hear.
+
 A turn takes steps, a model request each, as many as it takes until a reply calls no tools (or the
 user stops it). After a step that called tools, and after the turn, the next memory due forms. Below
 `fold_above` the context doesn't fold; past it, it folds down to `fold_to`, and waits for the memories

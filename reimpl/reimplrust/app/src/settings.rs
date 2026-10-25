@@ -94,6 +94,13 @@ pub struct SessionSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub companion: Option<String>,   // the session that is this one's companion (companion.rs)
     #[serde(default, skip_serializing_if = "Option::is_none")] pub accompanies: Option<String>, // the session this one is the companion of
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub auto: bool,               // each turn's end goes to the other
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")] pub channels: BTreeMap<String, Membership>, // the channels it's in, by name (channels.rs)
+}
+
+/// A session's place in a channel (channels.rs): whether it hears the channel's posts (`inputs`).
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+pub struct Membership {
+    #[serde(default)] pub inputs: bool,
 }
 
 impl SessionSettings {

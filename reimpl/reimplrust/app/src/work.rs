@@ -1,5 +1,6 @@
 //! A session's thread: it does its jobs one at a time, in the order they come (a message or fork told
-//! during a turn waits for it, but what the session's partner tells it joins the turn), the only one
+//! during a turn waits for it, but what the session's partner tells it, and a post in a channel it
+//! hears, joins the turn), the only one
 //! to write the session's log. A turn's chat message joins the log, then the turn takes steps until a
 //! reply calls no tools and the partner has told it nothing more, each reading the settings again:
 //! the context compiles and streams from disk into the request, the reply joins the log, and the tools
@@ -8,7 +9,7 @@
 //! hub what the pages following the job see (Msg). The user can stop a turn: it ends where it is
 //! (Worker::stopped).
 
-use crate::{api::brief, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
+use crate::{api::brief, channels, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, store::Session};
 use std::{cell::RefCell, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::Path, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
@@ -44,7 +45,7 @@ impl Setup {
         let (all, settings) = (app.settings()?, app.profile(name)?);
         let p = all.providers.get(&settings.provider).ok_or_else(|| format!("no provider {} in settings.json", settings.provider))?;
         let llm = Llm { base: p.base.clone(), key: p.key.clone(), agent: app.agent.clone(), spent: Default::default() };
-        let tools = toolbox(app, settings.workspace.as_deref(), settings.sandbox.then_some(all.sandbox), all.search.as_deref()) + companion::tools(app, name, &settings);
+        let tools = toolbox(app, settings.workspace.as_deref(), settings.sandbox.then_some(all.sandbox), all.search.as_deref()) + companion::tools(app, name, &settings) + channels::tools(app, name, &settings);
         let definitions = tools.definitions();
         Ok(Setup { overhead: overhead(settings.system.as_deref(), &definitions), settings, llm, tools, definitions })
     }
@@ -163,14 +164,14 @@ impl Worker<'_> {
     fn run(&self, id: u64, job: Job, stop: Sender<()>) {
         match job {
             Job::Say { text } => self.chat(id, stop, text.map(|text| said("user", text))),
-            Job::Hear(Heard { from, text }) => self.chat(id, stop, Some(said(&from, text))),
+            Job::Hear(Heard { from, text }) | Job::Post(Heard { from, text }) => self.chat(id, stop, Some(said(&from, text))),
             Job::Fork { at, name: fork, reply } => {
                 let path = self.app.root.join(&fork); // claimed here, when the fork is made
                 let made = std::fs::create_dir(&path).map_err(|e| format!("can't fork {} as {fork}: {e}", self.name));
                 let _ = reply.send(made.and_then(|()| {
                     Session::fork(&self.s, at, path);
-                    let own = self.app.profile(self.name)?; // a fork has no companion of its own
-                    settings::write(&self.app.profile_path(&fork), &SessionSettings { companion: None, accompanies: None, auto: false, ..own })
+                    let own = self.app.profile(self.name)?; // a fork has no companion of its own, and is in no channel
+                    settings::write(&self.app.profile_path(&fork), &SessionSettings { companion: None, accompanies: None, auto: false, channels: Default::default(), ..own })
                 }));
             }
         }
@@ -221,13 +222,14 @@ impl Worker<'_> {
         Ok(())
     }
 
-    /// What the session's partner has told it meanwhile joins the log, each as the partner's message;
-    /// the session's other jobs wait for the turn to end. Whether the partner told it anything.
+    /// What the session's partner has told it meanwhile, and the posts in channels it hears, join the
+    /// log, each as its sender's message; the session's other jobs wait for the turn to end. Whether it
+    /// heard anything.
     fn deliver(&self) -> Result<bool, String> {
         let mut heard = false;
         while let Ok((id, job)) = self.jobs.try_recv() {
             match job {
-                Job::Hear(Heard { from, text }) => {
+                Job::Hear(Heard { from, text }) | Job::Post(Heard { from, text }) => {
                     append(&self.s, &said(&from, text), &self.app.profile(self.name)?.config);
                     heard = true;
                 }

@@ -1,23 +1,34 @@
 //! The hub's thread. It owns what changes quickly, so each is told one thing at a time: settings.json
-//! and the sessions' settings files, which sessions have a thread (started the first time one is told
-//! something), and each session's pages and what they hear (Live).
+//! and the sessions' settings files, the channels' logs (channels.rs), which sessions have a thread
+//! (started the first time one is told something), each session's pages and what they hear (Live),
+//! and the pages following each channel.
 
-use crate::{api::Shown, companion::Heard, costs::{Fold, Spent}, llm::Piece, settings::{self, SessionSettings, Settings}, work::{work, DENIED, STOPPED}, App};
+use crate::{api::Shown, channels::{self, Post}, companion::Heard, costs::{Fold, Spent}, llm::Piece, settings::{self, SessionSettings, Settings}, work::{work, DENIED, STOPPED}, App};
 use connectome::json::Value;
 use serde::Serialize;
 use std::{collections::HashMap, sync::mpsc::{channel, Receiver, SendError, Sender}};
 
 /// What the hub is told: a message about a session; a change to settings.json, answered with the
-/// settings it leaves; or Auto turned on or off for a session and its partner, answered with whether
-/// the back-and-forth needs starting (auto).
-pub enum Routed { To(String, Msg), Provide(Value, Sender<Result<Settings, String>>), Auto(String, bool, Sender<Result<bool, String>>) }
+/// settings it leaves; Auto turned on or off for a session and its partner, answered with whether
+/// the back-and-forth needs starting (auto); a post to a channel, answered with the post as logged and
+/// the sessions that heard it (post); a channel's description set (channels::describe); or a page that
+/// follows a channel from now on (its posts as they're logged), answered once it does.
+pub enum Routed {
+    To(String, Msg),
+    Provide(Value, Sender<Result<Settings, String>>),
+    Auto(String, bool, Sender<Result<bool, String>>),
+    Post(Post, Sender<Result<(Value, Vec<String>), String>>),
+    Describe(String, String, Sender<Result<(), String>>),
+    Watch(String, Sender<Value>, Sender<()>),
+}
 
 /// A job for a session's thread: a turn with a message, or without (None) one that continues the log;
-/// what its partner tells it (companion.rs), which joins a turn running between its steps, else starts
-/// one; or a fork at message `at` as `name`.
+/// what its partner tells it (companion.rs), or a post in a channel it hears (channels.rs), either of
+/// which joins a turn running between its steps, else starts one; or a fork at message `at` as `name`.
 pub enum Job {
     Say { text: Option<String> },
     Hear(Heard),
+    Post(Heard),
     Fork { at: u64, name: String, reply: Sender<Result<(), String>> },
 }
 
@@ -45,6 +56,8 @@ pub enum Msg {
     Status(Sender<bool>),
     /// A change to the session's settings (SessionSettings::tuned), and whether its memories have merged.
     Tune(Value, bool, Sender<Result<(), String>>),
+    /// A change to the session's place in a channel (channels::member).
+    Member { channel: String, change: Value, reply: Sender<Result<(), String>> },
     /// The user stops the turn running (work's Worker::stopped); answered with whether one ran.
     Stop(Sender<Result<(), String>>),
     /// From the session's thread: job `id`'s turn starts; while it runs the hub holds `stop`, and lets
@@ -105,14 +118,44 @@ pub enum Event {
 }
 
 pub fn hub(app: &'static App, inbox: Receiver<Routed>) {
-    let mut sessions: HashMap<String, Live> = HashMap::new();
+    let (mut sessions, mut watching): (HashMap<String, Live>, Watching) = (HashMap::new(), HashMap::new());
     for routed in inbox {
         match routed {
-            Routed::To(name, msg) => sessions.entry(name.clone()).or_insert_with(|| Live::start(app, &name)).handle(app, &name, msg),
+            Routed::To(name, msg) => live(app, &mut sessions, &name).handle(app, &name, msg),
             Routed::Provide(v, reply) => drop(reply.send(settings::change(&app.settings_path(), |all: &mut Settings| all.provide(&v)))),
             Routed::Auto(name, on, reply) => drop(reply.send(auto(app, &sessions, &name, on))),
+            Routed::Post(p, reply) => drop(reply.send(post(app, &mut sessions, &mut watching, p))),
+            Routed::Describe(name, description, reply) => drop(reply.send(channels::describe(app, &name, &description))),
+            Routed::Watch(name, page, followed) => {
+                watching.entry(name).or_default().push(page);
+                let _ = followed.send(());
+            }
         }
     }
+}
+
+/// The pages following each channel, by its name.
+type Watching = HashMap<String, Vec<Sender<Value>>>;
+
+/// A session as the hub knows it, its thread started if it hasn't one.
+fn live<'s>(app: &'static App, sessions: &'s mut HashMap<String, Live>, name: &str) -> &'s mut Live {
+    sessions.entry(name.to_string()).or_insert_with(|| Live::start(app, name))
+}
+
+/// A post joins its channel's log, then goes to the pages following the channel and to each session
+/// that hears it, but the one that posted it; answered with the post as logged, and those sessions.
+fn post(app: &'static App, sessions: &mut HashMap<String, Live>, watching: &mut Watching, p: Post) -> Result<(Value, Vec<String>), String> {
+    let logged = channels::append(app, &p)?;
+    if let Some(pages) = watching.get_mut(&p.channel) {
+        pages.retain(|page| page.send(logged.clone()).is_ok());
+    }
+    let hearing: Vec<String> = channels::hearing(app, &p.channel).into_iter().filter(|m| p.from.as_ref() != Some(m)).collect();
+    let description = app.about(&p.channel).description;
+    for member in &hearing {
+        let (numbered, _) = channel();
+        live(app, sessions, member).handle(app, member, Msg::Job(Job::Post(channels::heard(&p, description.as_deref())), numbered));
+    }
+    Ok((logged, hearing))
 }
 
 /// Auto turned on or off for `name` and its partner; whether the back-and-forth needs starting: Auto
@@ -210,6 +253,7 @@ impl Live {
                 let tune = |all: Settings| settings::change(&app.profile_path(name), |old: &mut SessionSettings| old.tuned(&v, merged, &all).map(|new| *old = new));
                 let _ = reply.send(app.settings().and_then(tune).map(drop));
             }
+            Msg::Member { channel, change, reply } => drop(reply.send(channels::member(app, name, &channel, &change))),
             Msg::Start(id, stop) => {
                 self.turn = Some(Turn { events: vec![], asked: HashMap::new(), stop: Some(stop), ended: false });
                 self.send(Event::Turn(id));

@@ -80,10 +80,26 @@ dialog .buttons small { margin-right: auto; }
 .switch input:checked::before { left: 16px; }
 .switch input:disabled { opacity: .4; cursor: default; }
 
-/* the sessions, grouped by workspace */
-#sessions a { display: block; padding: 4px 6px; border-radius: 6px; color: inherit; text-decoration: none; }
-#sessions a.on { background: var(--panel); outline: 1px solid var(--line); }
-#sessions small { color: var(--muted); }
+/* the sessions, grouped by workspace, then the channels */
+#sessions a, #channel-list a { display: block; padding: 4px 6px; border-radius: 6px; color: inherit; text-decoration: none; }
+#sessions a.on, #channel-list a.on { background: var(--panel); outline: 1px solid var(--line); }
+#sessions small, #channel-list small { color: var(--muted); }
+h2.with-button { display: flex; align-items: center; justify-content: space-between; margin-top: 16px; }
+h2 .add { padding: 0 7px; font-size: 14px; line-height: 20px; color: var(--muted); }
+
+#about { margin: 0 0 14px; }
+
+/* the channels a session is in, whether it listens in each, and those it can join */
+#memberships { display: flex; flex-direction: column; gap: 4px; margin: 0 0 12px; font-size: 12px; }
+.membership { display: flex; align-items: center; gap: 10px; }
+.membership a, .msg.post .who a, #members a { color: var(--accent); }
+.membership a { margin-right: auto; overflow-wrap: anywhere; }
+.membership label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+.membership .leave { border: 0; background: none; padding: 0 4px; color: var(--muted); }
+.membership .leave:hover { color: var(--warn); }
+.join { display: flex; gap: 6px; }
+.join select { flex: 1; font-size: 12px; padding: 3px 6px; }
+.join button { padding: 2px 9px; }
 .group { margin: 0 0 6px; }
 .group summary { cursor: pointer; padding: 4px 0; list-style: none; }   /* a click on the header folds its group; no arrow */
 .group summary::-webkit-details-marker { display: none; }
@@ -171,7 +187,7 @@ dialog .buttons small { margin-right: auto; }
 form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
 form textarea { resize: vertical; min-height: 42px; }
 #text { resize: none; max-height: 50vh; }   /* as tall as what's in it (fit), then it scrolls */
-#say { align-items: stretch; }   /* its buttons as tall as the message box, which the user can make taller */
+#say, #post { align-items: stretch; }   /* its buttons as tall as the message box, which the user can make taller */
 #status { color: var(--muted); font-size: 12px; padding: 0 16px 8px; min-height: 18px; }
 #status.warn { color: var(--warn); }
 
@@ -204,16 +220,19 @@ pre#detail { white-space: pre-wrap; background: var(--panel); border: 1px solid 
 // of the page a component, a function of what the page shows, written with htm.
 const { h, render, Component } = preact;
 const html = htm.bind(h);
-const current = () => decodeURIComponent(location.hash.slice(1));   // the session the page shows
+const opened = () => decodeURIComponent(location.hash.slice(1));     // what the page shows: a session's name, or c: and a channel's
+const channel = () => opened().startsWith('c:') ? opened().slice(2) : null;   // the channel the page shows, if it shows one
+const current = () => channel() == null ? opened() : '';                   // the session the page shows, if it shows one
 
 let state = null;   // the session as the server has it (a global the browser tests read)
 const page = {
-  sessions: [], providers: [],
+  sessions: [], providers: [], channels: [],
   messages: [],                           // the log's messages the page has, oldest first
+  posts: [],                              // the channel's posts the page has, oldest first
   live: null,                             // the turn running, as the page hears it (follow)
   error: null,                            // why what the page last did failed
   broken: null,                           // why the session's files can't be read as they are
-  notes: { session: '' },                 // under the session form: saved, or why not
+  notes: { session: '', channel: '' },    // under the session form, and the channel's: saved, or why not
   picked: null,                           // the provider chosen on the session form, until it starts again
   creating: null,                         // the new-session dialog, while it's open: {workspace chosen, error}
   settings: null,                         // the settings dialog, while it's open: {notes: under each card, by provider ('' the new one's), made: providers added}
@@ -311,6 +330,7 @@ const PHASES = {
 };
 function status() {
   if (page.error || page.broken) return [page.error || page.broken, true];
+  if (!current()) return ['', false];
   if (page.live) return [PHASES[page.live.phase](page.live), false];
   if (state?.problem) return [state.problem, true];
   return state?.refused ? ['The summarizer refused; memory formation is stopped until surgery.', true] : ['', false];
@@ -324,7 +344,7 @@ function Tab({ side, what }) {
 }
 
 const App = () => {
-  const [line, warn] = status();
+  const [line, warn] = status(), c = channel();
   return html`
     <aside hidden=${!page.panels.left}>
       <div class="top">
@@ -334,24 +354,28 @@ const App = () => {
       ${page.providers.length > 0 && !page.providers.some((p) => p.key) && html`<small class="nokey">Add a provider's API key in Settings to chat.</small>`}
       <h2>Sessions</h2>
       <${Sessions} />
+      <h2 class="with-button">Channels <button id="new-channel" class="add" title="New channel" aria-label="New channel" onClick=${makeChannel}>+</button></h2>
+      <${Channels} />
     </aside>
     <section id="chat">
-      <${Tab} side="left" what="the sessions" />
-      <${Tab} side="right" what="the session's settings and memory" />
-      <${Log} />
+      <${Tab} side="left" what="the sessions and channels" />
+      <${Tab} side="right" what=${c == null ? 'the session\'s settings and memory' : 'the channel\'s members'} />
+      ${c == null ? html`<${Log} />` : html`<${Posts} />`}
       <div id="status" class=${warn ? 'warn' : ''}>${line}</div>
-      <${SayForm} />
+      ${c == null ? html`<${SayForm} />` : html`<${PostForm} key=${c} />`}
     </section>
     <aside id="memory" hidden=${!page.panels.right}>
+      ${c != null ? html`<h2>#${c}</h2><${About} key=${c} /><${Members} />` : html`
       <h2>Session</h2>
       <${Companion} />
+      <${Memberships} />
       <${SessionForm} key=${current()} />
       <h2>Context</h2>
       <${Stats} />
       <h2>Memory pyramid</h2>
       <div class="legend">Each row up merges runs of the row below, each about a chunk's worth of tokens, or, when the context can't fold enough, the oldest leftovers of several rows; bottom row is chunks of raw messages. Outlined: what the context shows. Click for its text.</div>
       <${Pyramid} />
-      <pre id="detail">${page.detail}</pre>
+      <pre id="detail">${page.detail}</pre>`}
     </aside>
     ${page.creating && html`<${NewSession} />`}
     ${page.settings && html`<${Settings} />`}
@@ -374,6 +398,92 @@ function Group({ workspace: w, members }) {
   const title = w ? html`<b>${w.split(/[\\/]/).pop()}</b> · ${members.length}<small>${w}</small>` : html`<b>No workspace</b> · ${members.length}`;
   return html`<details class="group" data-workspace=${w} open=${!page.folded.has(w)} onToggle=${(e) => fold(w, !e.currentTarget.open)}><summary>${title}</summary>${draw(null, 0)}</details>`;
 }
+
+// the channels, each a link to it, with its posts and how many sessions are in it
+function Channels() {
+  return html`<div id="channel-list">${page.channels.length ? page.channels.map((c) => html`<a key=${c.name} href="#c:${c.name}" class=${c.name === channel() ? 'on' : ''}>#${c.name} <small>${c.posts} · ${c.members.length} in it</small></a>`)
+    : html`<small>No channels yet.</small>`}</div>`;
+}
+
+// the channels the session is in (it can post in each, with message_channel), each with whether it
+// has inputs on (it hears every post there but its own) and a button that takes it out; then a choice
+// of the others, to add it to
+function Memberships() {
+  const s = state?.settings;
+  if (!s) return null;
+  const joined = s.channels ?? {}, others = page.channels.map((c) => c.name).filter((c) => !(c in joined));
+  const join = (e) => member(e.target.closest('.join').querySelector('select').value, {});
+  return html`<div id="memberships">
+    ${Object.entries(joined).map(([c, m]) => html`<div class="membership" key=${c} data-channel=${c}>
+      <a href="#c:${c}" title="The session can post here with its message_channel tool">#${c}</a>
+      <label title="Every post in the channel from anyone else comes to this session as a message"><input type="checkbox" data-sub="inputs" checked=${m.inputs} onChange=${(e) => member(c, { inputs: e.target.checked })} /> inputs</label>
+      <button type="button" class="leave" title=${'Take the session out of #' + c} aria-label=${'Leave #' + c} onClick=${() => member(c, null)}>×</button>
+    </div>`)}
+    ${others.length > 0 && html`<div class="join"><select id="join-channel" aria-label="A channel to add the session to">${others.map((c) => html`<option key=${c} value=${c}>#${c}</option>`)}</select>
+      <button type="button" id="join" title="Add the session to the channel" aria-label="Add the session to the channel" onClick=${join}>+</button></div>`}
+    ${!page.channels.length && html`<small class="legend">No channels yet: make one on the left to add the session to.</small>`}
+  </div>`;
+}
+
+// the channel's description, which each post its sessions hear ends with, saved as the session form's
+// fields are: once typing pauses, or as it leaves the field (describe)
+function About() {
+  const c = page.channels.find((x) => x.name === channel());
+  if (!c) return null;
+  const pause = (e) => {
+    clearTimeout(pausing.get(e.target));
+    pausing.set(e.target, setTimeout(() => describe(e.target), PAUSE));
+  };
+  return html`<form id="about" class="settings" data-channel=${c.name} onSubmit=${(e) => e.preventDefault()}>
+    <label title="Each post the sessions here hear ends with it, after the reminder of how to reply">Description, which each post here ends with
+      <textarea name="description" rows="3" defaultValue=${c.description ?? ''} placeholder="Say, post only when you have something new: bees runs on an expensive model" onInput=${pause} onChange=${(e) => describe(e.target)}></textarea></label>
+    <small>${page.notes.channel}</small>
+  </form>`;
+}
+
+// the sessions in the channel the page shows, and whether each has inputs on there (a session's
+// settings change it)
+function Members() {
+  const c = page.channels.find((x) => x.name === channel());
+  if (!c) return html`<small class="legend">No channel ${channel()}.</small>`;
+  return html`<div id="members">
+    ${c.members.length ? c.members.map((m) => html`<div class="stat" key=${m.name}><a href="#${m.name}">${m.name}</a><span>${m.inputs ? 'inputs on' : 'inputs off'}</span></div>`)
+      : html`<small class="legend">No sessions in it yet: add one from a session's settings.</small>`}
+    <p class="legend">Each session here can post with its message_channel tool. A post, yours or a session's, goes at once to every other session here with inputs on, as a message.</p>
+  </div>`;
+}
+
+// the channel's posts, oldest first: who posted each (a session, a link to it; or the user, on the
+// right), then its text, a session's as markdown
+function Posts() {
+  const rows = page.posts.map((p) => html`<div class="msg post" key=${p.id} data-id=${p.id} data-who=${p.from ?? 'user'}>
+    <div class="who">${p.from ? html`<a href="#${p.from}">${p.from}</a>` : 'you'}</div>
+    ${p.from ? html`<div class="bubble md" data-kind="text" dangerouslySetInnerHTML=${{ __html: markdown(p.text) }} />` : html`<div class="bubble" data-kind="text">${p.text}</div>`}
+  </div>`);
+  return html`<div id="log">${rows.length ? rows : html`<div class="earlier">No posts yet. A post goes to each session in the channel that has inputs on.</div>`}</div>`;
+}
+
+// the box that posts to the channel as the user
+function PostForm() {
+  const send = async (e) => {
+    e.preventDefault();
+    const box = e.target.elements.text, text = box.value.trim();
+    if (!text) return;
+    [box.value, page.error, page.scroll] = ['', null, true];
+    fit(box);
+    try { await api(`/api/c/${channel()}/post`, { text }); } catch (err) {
+      box.value = text;
+      fail(err);
+    }
+  };
+  return html`<form id="post" onSubmit=${send}>
+    <textarea id="text" name="text" placeholder=${`Post to #${channel()} (Enter sends, Shift+Enter for a new line)`} onKeyDown=${enters} onInput=${(e) => fit(e.target)}></textarea>
+    <button class="icon send" title="Post (Enter)" aria-label="Post">${ICONS.send()}</button>
+  </form>`;
+}
+
+// Enter in a message box sends it; Shift+Enter starts a new line
+const enters = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.form.requestSubmit(); } };
 
 // a new session, in a dialog in the middle of the page: its name, and its workspace, one the sessions
 // have (the session open's to start with), none, or another directory, typed (page.creating)
@@ -562,9 +672,8 @@ function SayForm() {
       turn(text);
     }
   };
-  const enter = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.form.requestSubmit(); } };
   return html`<form id="say" onSubmit=${say}>
-    <textarea id="text" name="text" placeholder="Message (Enter sends, Shift+Enter for a new line)" onKeyDown=${enter} onInput=${(e) => fit(e.target)}></textarea>
+    <textarea id="text" name="text" placeholder="Message (Enter sends, Shift+Enter for a new line)" onKeyDown=${enters} onInput=${(e) => fit(e.target)}></textarea>
     <button class="icon send" title="Send (Enter)" aria-label="Send">${ICONS.send()}</button>
     <button type="button" id="continue" class="icon" title="Let the model go on, without a message" aria-label="Continue" onClick=${() => turn(null)}>${ICONS.go()}</button>
     <button type="button" id="stop" class="icon stop" title="Stop the turn" aria-label="Stop" disabled=${!page.live} onClick=${stop}>${ICONS.stop()}</button>
@@ -803,6 +912,48 @@ async function listSessions() {
   redraw();
 }
 
+async function listChannels() {
+  page.channels = await api('/api/channels');
+  redraw();
+}
+
+// a new channel, named as the user says, then shown
+async function makeChannel() {
+  const name = prompt('Name for a new channel (letters, digits, - and _)')?.trim();
+  if (!name) return;
+  try {
+    page.channels = await api('/api/channels', { name });
+    location.hash = 'c:' + name;
+  } catch (err) { fail(err); }
+}
+
+// a channel's description saved, from the field `el` (blank: none), unless the channel has it already;
+// the note under it says so, if the page still shows that channel
+async function describe(el) {
+  clearTimeout(pausing.get(el));
+  const name = el.form?.dataset.channel, text = el.value.trim(), shown = () => name === channel();
+  if (!name || text === (page.channels.find((c) => c.name === name)?.description ?? '')) return;
+  if (shown()) page.notes.channel = 'Saving…';
+  draw();
+  try {
+    page.channels = await api(`/api/c/${name}/describe`, { description: text });
+    if (shown()) page.notes.channel = 'Saved.';
+  } catch (err) {
+    if (shown()) page.notes.channel = err.message;
+  }
+  draw();
+}
+
+// the session the page shows put in channel `name`, its subscriptions there changed as `change` says
+// ({inputs?}), or, with null, taken out
+async function member(name, change) {
+  try {
+    state = await api(`/api/s/${current()}/channel`, change ? { channel: name, ...change } : { channel: name, leave: true });
+    listChannels();
+  } catch (err) { fail(err); }
+  draw();
+}
+
 async function loadProviders() {
   ({ providers: page.providers } = await api('/api/settings'));
   redraw();
@@ -960,7 +1111,33 @@ async function turn(text) {
 function subscribe() {
   stream?.abort();
   stream = null;
-  if (current() && !document.hidden) follow(current(), (stream = new AbortController()).signal);
+  if (document.hidden) return;
+  if (channel() != null) watch(channel(), (stream = new AbortController()).signal);
+  else if (current()) follow(current(), (stream = new AbortController()).signal);
+}
+
+// a channel as it goes on: a JSON object a line, each a post ({"post"}), its newest 200 first, then each
+// as it's logged; with each, the channels are listed again (their counts). A stream that ends unasked (the server restarted)
+// is followed again shortly; a channel there isn't says so.
+async function watch(name, signal) {
+  try {
+    const r = await fetch(`/api/c/${name}/stream`, { signal });
+    if (!r.ok) return fail(new Error((await r.json()).error));
+    const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buffered = '';
+    for (let read; !(read = await reader.read()).done;) {
+      const lines = (buffered + read.value).split('\n');
+      buffered = lines.pop();
+      for (const { post } of lines.filter((line) => line.trim()).map((line) => JSON.parse(line))) {
+        if (post && post.id > (page.posts.at(-1)?.id ?? -1)) page.posts = [...page.posts, post];
+      }
+      listChannels();
+      redraw();
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+  }
+  setTimeout(() => stream?.signal === signal && subscribe(), 2000);
 }
 
 // a session as it goes on (Event in hub.rs): a JSON object a line, each field handled by its handler in
@@ -1076,14 +1253,16 @@ function grow(part, piece) {
 try { page.folded = new Set(JSON.parse(localStorage.getItem('folded')) || []); } catch { /* no storage here: groups start open */ }
 try { Object.assign(page.panels, JSON.parse(localStorage.getItem('panels'))); } catch { /* no storage here: both sides show */ }
 window.onhashchange = () => {
-  [page.notes.session, page.picked, page.live, page.error, page.accompanying, page.messages] = ['', null, null, null, null, []];
+  [page.notes.session, page.notes.channel, page.picked, page.live, page.error, page.accompanying, page.messages, page.posts] = ['', '', null, null, null, null, [], []];
   listSessions();
+  listChannels();
   subscribe();
 };
 document.onvisibilitychange = subscribe;
 redraw();
 loadProviders();
 listSessions();
+listChannels();
 subscribe();
 </script>
 </body>

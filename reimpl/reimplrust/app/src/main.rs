@@ -7,14 +7,15 @@
 //! Whatever changes has one thread that owns it, and threads tell each other things through channels,
 //! sharing nothing that changes:
 //! - each request's thread (api.rs) reads files and tells the hub what it wants of a session;
-//! - the hub (hub.rs) owns what changes quickly: the settings files, which sessions have a thread, and
-//!   the pages following each session and what they hear;
+//! - the hub (hub.rs) owns what changes quickly: the settings files, the channels' logs, which sessions
+//!   have a thread, and the pages following each session or channel and what they hear;
 //! - each session's thread (work.rs) does its jobs one at a time, the only one to write its log.
 //!
 //! A session's files are its only record, what its requests used among them (costs.rs): the hub keeps
 //! beside them only what they don't hold yet.
 
 mod api;
+mod channels;
 mod companion;
 mod costs;
 mod hub;

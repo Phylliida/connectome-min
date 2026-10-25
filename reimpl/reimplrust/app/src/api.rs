@@ -4,7 +4,7 @@
 //! carry an x-connectome header (another site's page can't send one without a CORS preflight, which
 //! this server never approves), since a POST can change where the key goes.
 
-use crate::{companion, costs::{self, Compile, Fold, Spent}, hub::{Event, Job, Msg, Routed}, settings::{self, SessionSettings}, work::Setup, App};
+use crate::{channels::{self, Post}, companion, costs::{self, Compile, Fold, Spent}, hub::{Event, Job, Msg, Routed}, settings::{self, SessionSettings}, work::Setup, App};
 use connectome::{config::Config, json::{self, sparse, Json, Value}, memory::Recorded, obj, planner::chunks, store::Session};
 use serde::{Serialize, Serializer};
 use std::{collections::{BTreeSet, HashMap}, net::TcpStream, path::Path, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
@@ -82,8 +82,12 @@ pub fn handle(app: &App, mut stream: TcpStream) -> io::Result<()> {
         ("GET", ["api", "settings"]) => app.settings().map(|all| Some(all.providers())),
         ("POST", ["api", "settings"]) => app.ask(|reply| Routed::Provide(body.clone(), reply)).map(|all| Some(all.providers())),
         ("POST", ["api", "sessions"]) => create(app, &body).map(Some),
+        ("GET", ["api", "channels"]) => Ok(Some(channels::listing(app))),
+        ("POST", ["api", "channels"]) => founded(app, &body).map(Some),
         (_, ["api", "s", name, rest @ ..]) if named(name) && app.root.join(name).is_dir() => session(app, method, name, rest, &body, &query, &mut stream),
         (_, ["api", "s", name, ..]) => Err(format!("no session {name}")),
+        (_, ["api", "c", name, rest @ ..]) if named(name) && app.channel_exists(name) => in_channel(app, method, name, rest, &body, &query, &mut stream),
+        (_, ["api", "c", name, ..]) => Err(format!("no channel {name}")),
         _ => Err("not found".into()),
     };
     match reply {
@@ -143,8 +147,37 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
             let (id, answer) = (body["id"].as_str().unwrap_or("").into(), body["answer"].as_str().unwrap_or("deny").into());
             app.ask_session(name, |reply| Msg::Approve { id, answer, reply }).map(|()| Some(obj! {}))
         }
+        ("POST", ["channel"]) => {   // {channel, inputs?}, or {channel, leave: true}
+            let channel = body["channel"].as_str().ok_or("which channel?")?.to_string();
+            let change = if body["leave"] == true { Value::Null } else { obj! {"inputs" => body["inputs"].as_bool()} };
+            app.ask_session(name, |reply| Msg::Member { channel, change, reply }).map(|()| Some(state(app, name, &s)))
+        }
         _ => Err("not found".into()),
     }
+}
+
+/// A channel's routes: its posts, a page following it, a post of the user's, and its description set
+/// (answered with the channels).
+fn in_channel(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, query: &Query, stream: &mut TcpStream) -> Route {
+    match (method, rest) {
+        ("GET", ["posts"]) => send_all(stream, listing(&app.channel(name), "posts", 200, query).1),
+        ("GET", ["stream"]) => watch(app, name, query, stream),
+        ("POST", ["post"]) => {
+            let text = body["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or("say something")?.to_string();
+            app.ask(|reply| Routed::Post(Post { channel: name.into(), from: None, text }, reply)).map(|(post, _)| Some(post))
+        }
+        ("POST", ["describe"]) => {
+            let description = body["description"].as_str().unwrap_or("").to_string();
+            app.ask(|reply| Routed::Describe(name.into(), description, reply)).map(|()| Some(channels::listing(app)))
+        }
+        _ => Err("not found".into()),
+    }
+}
+
+/// The channels, once the one `v` names is made.
+fn founded(app: &App, v: &Value) -> Result<Value, String> {
+    let name = v["name"].as_str().filter(|name| named(name)).ok_or("a channel's name is letters, digits, - and _")?;
+    channels::make(app, name).map(|()| channels::listing(app))
 }
 
 /// A session as the page shows it, its settings, if it's new, the defaults with the workspace `v` gives.
@@ -210,7 +243,7 @@ fn covers(s: &Session, cfg: &Config) -> Vec<Vec<(u64, u64)>> {
 /// Every session: its name, messages, the session it forked from, its workspace, and its companion or
 /// the session it accompanies.
 fn sessions(app: &App) -> Value {
-    let names: BTreeSet<String> = std::fs::read_dir(&app.root).into_iter().flatten().flatten().filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().into_string().ok()).collect();
+    let names: BTreeSet<String> = std::fs::read_dir(&app.root).into_iter().flatten().flatten().filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().into_string().ok()).filter(|n| named(n)).collect();
     Value::Array(names.iter().map(|name| {
         let (s, own) = (app.session(name), app.profile(name).ok());
         let workspace = own.as_ref().and_then(|p| p.workspace.as_ref()).map(|w| w.to_string_lossy().into_owned());
@@ -337,6 +370,36 @@ fn follow(app: &App, name: &str, query: &Query, page: &mut TcpStream) -> Route {
                 if let Event::Logged(_) = event { catch_up(&mut out, false)? }
                 line(&event, &mut out)?;
                 if let Event::Done(_) = event { catch_up(&mut out, true)? }
+            }
+        }
+    })();
+    Ok(None)
+}
+
+/// A channel as it goes on, to a page that follows it until it goes, a JSON line each: its posts from
+/// the query's `from` (by default its newest 200), then each as it's logged ({"post"}). The page follows
+/// the channel before its posts are read, so it misses none, and it takes each once.
+fn watch(app: &App, name: &str, query: &Query, page: &mut TcpStream) -> Route {
+    let (sender, posts) = channel();
+    app.ask(|followed| Routed::Watch(name.into(), sender, followed));
+    let log = app.channel(name);
+    let _ = (page.set_write_timeout(Some(PAGE_WAIT)), page.set_nodelay(true));
+    let mut out = BufWriter::new(page);
+    let mut next = 0; // the first post the page doesn't have
+    let mut send = |post: Value, out: &mut BufWriter<&mut TcpStream>| -> io::Result<()> {
+        if post.id() < next { return Ok(()) }
+        next = post.id() + 1;
+        json::write(&obj! {"post" => post}, &mut *out).and_then(|()| out.write_all(b"\n"))
+    };
+    let _ = (|| -> io::Result<()> {
+        out.write_all(head("200 OK", "application/x-ndjson", None).as_bytes())?;
+        listing(&log, "posts", 200, query).1.try_for_each(|post| send(post, &mut out))?;
+        loop {
+            out.flush()?;
+            match posts.recv_timeout(HEARTBEAT) {
+                Ok(post) => send(post, &mut out)?,
+                Err(RecvTimeoutError::Timeout) => out.write_all(b"\n")?,
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
             }
         }
     })();

@@ -14,7 +14,7 @@
 //!     one layer above the highest it takes, so it waits with that layer's (lifted);
 //!   - else, when the last compile couldn't fold enough, the same merge or lift of two at least, so
 //!     folding never waits on a third memory (escalated: what was due at min_merge_memories first).
-//!   A memory held back (blocked) holds back those after it, but not a lift, which goes ahead past it.
+//!     A memory held back (blocked) holds back those after it, but not a lift, which goes ahead past it.
 //!
 //! A memory asks the summarizer what the agent saw before the stretch, replayed (a recall pair for each
 //! unmerged memory the recall budget fits, newest first), then the stretch and an instruction. A
