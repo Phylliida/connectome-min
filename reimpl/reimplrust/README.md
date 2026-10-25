@@ -307,7 +307,11 @@ Code's least system prompt (`--system-prompt ""`), no session kept (`--no-sessio
 the memory's max tokens (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`), in the session's sandbox and through the
 gateway like its turns. Claude Code takes only user messages, so the library's request goes as one,
 a transcript: a line on how it's laid out, then each turn headed by who says it, calls and their
-results in brackets, reasoning left out. Its cost joins the session's, for memories. Not yet: what
+results in brackets, reasoning left out. Its cost joins the session's, for memories. The page draws
+Claude Code's calls by what they do: an Edit as a diff, colored in its file's language, as it draws
+edit's, a Write as a new file's, all of it put in, and Bash, Read, Grep, Glob, WebSearch, WebFetch and
+Agent by their command, path, pattern, query, address or task; and the session's sandbox switch
+says it holds Claude Code. Not yet: what
 Claude Code sees is still its own conversation (the gateway forwards its requests unchanged), forks,
 a companion, and Continue without a message.
 

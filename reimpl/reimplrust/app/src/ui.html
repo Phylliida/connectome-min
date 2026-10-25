@@ -807,6 +807,7 @@ function Provider({ p }) {
 function SessionForm() {
   const s = state?.settings ?? {}, provider = page.picked ?? s.provider;
   const listed = page.providers.find((p) => p.name === provider)?.models ?? [];
+  const inClaude = !!page.providers.find((p) => p.name === provider)?.command;   // a Claude Code session's sandbox holds all of Claude Code
   const models = provider === s.provider && s.model && !listed.includes(s.model) ? [s.model, ...listed] : listed;
   const pick = (e) => {
     page.picked = e.target.value;
@@ -817,7 +818,7 @@ function SessionForm() {
     <label>Model ${models.length ? html`<select name="model" key=${provider}>${models.map((m) => html`<option selected=${m === s.model}>${m}</option>`)}</select>`
       : html`<input name="model" defaultValue=${s.model ?? ''} placeholder="its name, as the provider has it" />`}</label>
     <label>Workspace <input name="workspace" defaultValue=${s.workspace ?? ''} placeholder="none: no bash" /></label>
-    <label><input name="sandbox" type="checkbox" defaultChecked=${!!s.sandbox} /> bash in the sandbox</label>
+    <label><input name="sandbox" type="checkbox" defaultChecked=${!!s.sandbox} /> ${inClaude ? 'Claude Code' : 'bash'} in the sandbox</label>
     <label>Window <input name="window" type="number" defaultValue=${s.window ?? ''} /></label>
     <label>Reply reserve <input name="reserve" type="number" defaultValue=${s.reserve ?? ''} /></label>
     <label title="The newest this many tokens of the context stay as they were, never folded">Raw tail
@@ -1022,14 +1023,25 @@ const note = (b) => b.type === 'image' ? `[image, ${b.kb} KB]` : `[${b.type}]`;
 const said = (result) => typeof result.content === 'string' ? result.content : result.content.map((c) => c.text ?? note(c)).join('\n');
 
 // a call's card as its tool shows it: the line it shows folded (open, all of it), and what it holds
-// above the result; any other tool's, its name and its input
+// above the result; any other tool's, its name and its input. Claude Code's tools (claude.rs) are
+// capitalized: an Edit is a diff as edit's is, a Write a new file's, all of it put in
 const views = {
   bash: ({ command = '' }) => [html`<span class="cmd">${command}</span>`],
   web_search: ({ query = '' }) => [html`<span class="query">${ICONS.search()}${query}</span>`],
   edit: (input, result) => [`edit ${input.path ?? ''}`, html`<${Change} edit=${input} result=${result} />`],
+  Bash: (input) => views.bash(input),
+  WebSearch: (input) => views.web_search(input),
+  Edit: ({ file_path = '', old_string = '', new_string = '', replace_all }, result) =>
+    [`Edit ${file_path}${replace_all ? ' (every match)' : ''}`, html`<${Change} edit=${{ path: file_path, old: old_string, new: new_string }} result=${result} />`],
+  Write: ({ file_path = '', content = '' }, result) => [`Write ${file_path}`, html`<${Change} edit=${{ path: file_path, old: '', new: content }} result=${result} />`],
+  Read: ({ file_path = '', offset, limit }) => [`Read ${file_path}${offset ? ` from line ${offset}` : ''}${limit ? `, ${limit} lines` : ''}`],
+  Grep: ({ pattern = '', path }) => [`Grep ${pattern}${path ? ` in ${path}` : ''}`],
+  Glob: ({ pattern = '', path }) => [`Glob ${pattern}${path ? ` in ${path}` : ''}`],
+  WebFetch: ({ url = '', prompt }) => [`Fetch ${url}`, prompt && html`<pre>${prompt}</pre>`],
+  Agent: ({ description = '', prompt }) => [`Agent: ${description}`, prompt && html`<pre>${prompt}</pre>`],
 };
 
-// a call's card, open until its result joins it, then folded unless it shows a diff, with the buttons
+// a call's card, open until its result joins it, then folded unless it shows a diff (Change), with the buttons
 // that answer whether it may run while it's `asking`, and saying so while it's `running`; a result
 // without its call on the page is a card of its own
 function Card({ call, result, asking, running }) {
@@ -1037,7 +1049,7 @@ function Card({ call, result, asking, running }) {
   const [head, body] = call ? view(call.input, result) : ['an earlier call'];
   const text = result && said(result), failed = result?.isError ? ' failed' : '';
   const answer = (answer, label) => html`<button data-answer=${answer} onClick=${() => approve(call.id, answer)}>${label}</button>`;
-  return html`<details class=${'tool' + failed} id=${call && 'call-' + call.id} data-kind=${call ? 'tool_use' : 'tool_result'} open=${!result || view === views.edit}>
+  return html`<details class=${'tool' + failed} id=${call && 'call-' + call.id} data-kind=${call ? 'tool_use' : 'tool_result'} open=${!result || body?.type === Change}>
     <summary>${head}${result && html`<span class="out"> → ${text.split('\n')[0].slice(0, 100)}</span>`}</summary>
     ${body}
     ${asking && !result && html`<div class="ask">${answer('allow', 'Allow')}${answer('always', 'Always allow')}${answer('deny', 'Deny')}</div>`}
@@ -1048,11 +1060,12 @@ function Card({ call, result, asking, running }) {
 
 // an edit's change as a diff: the lines it takes out and puts in (all in, for a new file), colored in
 // its file's language, each marked in a gutter the page draws and a copy leaves out (data-mark, then
-// data-n: its number, from where its result says the edit starts: "at line N", or 1 for a file it made;
-// a line taken out by the file's old count, any other by its new)
+// data-n: its number, from where its result says the edit starts: "at line N", or 1 for a file it made
+// (edit's "made …", Claude Code's Write's "File created …"); a line taken out by the file's old count,
+// any other by its new)
 function Change({ edit: { path = '', old = '', new: text = '' }, result }) {
   const done = result && !result.isError ? said(result) : '';
-  const start = Number(/at line (\d+)$/.exec(done)?.[1] ?? (done.startsWith('made ') ? 1 : 0));
+  const start = Number(/at line (\d+)$/.exec(done)?.[1] ?? (done.startsWith('made ') || done.startsWith('File created') ? 1 : 0));
   let [before, after] = [start, start];
   const lines = Diff.diffLines(String(old), String(text)).flatMap((part) => {
     const [mark, kind] = part.added ? ['+', 'add'] : part.removed ? ['-', 'del'] : [' ', ''];
