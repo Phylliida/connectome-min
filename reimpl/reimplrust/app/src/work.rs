@@ -307,8 +307,8 @@ impl Worker<'_> {
         let room = (setup.settings.window - setup.overhead - reserve) / lag / (1.0 + cfg.over_budget_grace);
         // past fold_above (a prompt, so less what every request carries, and the lag) it folds, down to fold_to
         let context = |prompt: f64| ((prompt - setup.overhead) / lag).min(room);
-        let over = setup.settings.fold_above.map_or(room, context);
-        let to = setup.settings.fold_to.map_or(over * (1.0 - cfg.slack), |to| context(to).min(over));
+        let over = context(setup.settings.fold_above);
+        let to = context(setup.settings.fold_to).min(over);
         let fit = Fit { over, to, limit: (room * (1.0 + cfg.over_budget_grace)).floor(), reach: true };
         let mut compiled = select(s, &fit, reported.map_or(last, |u| last.observe(u)), cfg);
         // a context that folds (past fold_above) short of fold_to is refused, which escalates the session, so the

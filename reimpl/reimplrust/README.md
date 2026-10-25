@@ -83,9 +83,9 @@ since one holds the keys:
   on Linux, bash in the sandbox.
 - `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its
-  `window`, `reserve`, the band its prompt folds in (`fold_above` and `fold_to`: past `fold_above`
-  tokens the context folds, down to `fold_to`; by default past what the window leaves the reply, down
-  to `config.slack` under that), its `system` prompt, and the library's settings (`config`). A new session's
+  `window`, `reserve`, the band its prompt folds in (`fold_above` and `fold_to`, always numbers: past
+  `fold_above` tokens the context folds, down to `fold_to`; the band the window gives is what it leaves
+  the reply, down to `config.slack`, 10%, under that), its `system` prompt, and the library's settings (`config`). A new session's
   file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its
   parent's; a session without one has none to run with, and the page says so. The page edits the
   main fields, the chunk size (`config.target_chunk_tokens`: the tokens of text a chunk closes at,
@@ -94,8 +94,9 @@ since one holds the keys:
   where it only lowers the 16000 a memory gets by default, it's the max_tokens a memory asks for), each saved alone as it changes (a choice at once, typing once it pauses for 2.5 s or
   leaves the field, a number only once it is one), its model one its provider lists (or any, typed,
   for a provider that lists none); `config.merge_threshold` can't change once memories have merged,
-  nor `config.merge_by_count` turn on; `fold_to` stays at most `fold_above`, and that at most
-  what the window leaves the reply; a chunk holds more than 0 tokens; and a merge takes 2 memories or more.
+  nor `config.merge_by_count` turn on; `fold_above` and `fold_to` can't be blank, `fold_to` stays at
+  most `fold_above`, and that at most what the window leaves the reply (so a smaller window needs a
+  lower band first); a chunk holds more than 0 tokens; and a merge takes 2 memories or more.
 
 Tools (`app/src/tools/`): the model can call `bash` (a command in a new shell in the session's
 workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in the workspace changed

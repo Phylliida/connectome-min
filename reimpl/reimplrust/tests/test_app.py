@@ -340,15 +340,15 @@ def launch(root, port, ca, *flags) -> subprocess.Popen:
 def configure(root, base, window, recent, chunk):
     """settings.json as the app's first run wrote it, edited as a user would: the default provider at
     `base`, and new sessions on the mock's model in `window` tokens, 1000 of them the reply's, folding
-    in the band the window gives (no fold_above or fold_to), with `chunk`s and a recent window of
-    `recent` sized for it."""
+    in the band the window gives (fold_above the window less the reply, fold_to config.slack, 10%,
+    under that), with `chunk`s and a recent window of `recent` sized for it."""
     path = Path(root, 'settings.json')
     everything = json.loads(path.read_text())
     if everything['defaults']['sandbox'] != sys.platform.startswith('linux') or everything['providers']['default']['models'] != [everything['defaults']['model']] \
             or everything['defaults']['config']['target_chunk_tokens'] != 3000 or (everything['defaults']['fold_above'], everything['defaults']['fold_to']) != (90000, 65000):
         raise SystemExit(f'a first run wrote {everything["defaults"]["sandbox"]=}, {everything["providers"]["default"]["models"]=} and chunks of {everything["defaults"]["config"]["target_chunk_tokens"]}')
     everything['providers']['default']['base'] = base
-    everything['defaults'].update(model='mock', window=window, reserve=1000, fold_above=None, fold_to=None)   # the window's own band
+    everything['defaults'].update(model='mock', window=window, reserve=1000, fold_above=window - 1000, fold_to=(window - 1000) * 0.9)   # the window's own band
     everything['defaults']['config'].update(recent_window_tokens=recent, target_chunk_tokens=chunk)
     path.write_text(json.dumps(everything))
 
@@ -532,7 +532,7 @@ def lifted(tls, ca) -> str:
                 raise
         seen['long-winded'] = False
         call(port, '/api/sessions', {'name': 'banded'})                  # a band in a big window: past fold_above it folds, down to fold_to
-        for wrong in ({'fold_above': 19500}, {'fold_above': 4000, 'fold_to': 4500}, {'config': {'target_chunk_tokens': 0}}):
+        for wrong in ({'fold_above': 19500}, {'fold_above': 4000, 'fold_to': 4500}, {'fold_above': None}, {'fold_to': None}, {'config': {'target_chunk_tokens': 0}}):   # never blank
             try:
                 call(port, '/api/s/banded/settings', {'window': 20000, **wrong})
                 raise SystemExit(f'the settings took {wrong} in a window of 20000, 1000 of it the reply\'s')
@@ -1214,7 +1214,7 @@ def chatted(turns, tls, ca, baseline) -> str:
         if (edited := call(port, '/api/s/unpriced'))['spent']['total'] != spent or edited['prompt'] is None:
             raise SystemExit(f'after a hand edit to its costs the session shows {edited["spent"]}, its prompt {edited["prompt"]}')
         call(port, '/api/sessions', {'name': 'tight'})                   # a message bigger than the window leaves the context
-        call(port, '/api/s/tight/settings', {'window': 3000, 'reserve': 1000})
+        call(port, '/api/s/tight/settings', {'window': 3000, 'reserve': 1000, 'fold_above': 2000, 'fold_to': 1800})   # the band the window gives
         try:
             say(port, 'tight', 'too long ' * 2000)
             raise SystemExit('a context that does not fit was sent')

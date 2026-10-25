@@ -25,7 +25,7 @@ impl Settings {
         let (defaults, base) = (SessionSettings::default(), "https://api.anthropic.com".into());
         let config = Config { summary_participant: "assistant".into(), recent_window_tokens: 20000.0, target_chunk_tokens: 3000.0, min_merge_memories: 3, compression_max_tokens: Some(20000.0), ..Config::default() };
         let providers = BTreeMap::from([("default".into(), Provider { base, key: String::new(), models: vec![defaults.model.clone()], command: None })]);
-        let defaults = SessionSettings { fold_above: Some(90000.0), fold_to: Some(65000.0), config, ..defaults };
+        let defaults = SessionSettings { fold_above: 90000.0, fold_to: 65000.0, config, ..defaults };
         Settings { providers, defaults, sandbox: Sandbox::default(), search: None }
     }
 
@@ -86,10 +86,10 @@ pub struct SessionSettings {
     pub allow: BTreeSet<String>,          // the tools that run without asking
     #[default(180000.0)] pub window: f64, // tokens a request may take, the reply's included
     #[default(30000.0)] pub reserve: f64, // tokens for the reply (its reasoning too)
-    // a prompt (the system prompt and tools with the context) past fold_above folds, down to fold_to; by
-    // default past what the window leaves the reply, down to config.slack under that
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub fold_above: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub fold_to: Option<f64>,
+    // a prompt (the system prompt and tools with the context) past fold_above folds, down to fold_to: at
+    // most what the window leaves the reply, which is fold_above's default, and fold_to's config.slack (10%) under that
+    #[default(150000.0)] pub fold_above: f64,
+    #[default(135000.0)] pub fold_to: f64,
     pub system: Option<String>,
     pub config: Config,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub companion: Option<String>,   // the session that is this one's companion (companion.rs)
@@ -133,7 +133,7 @@ impl SessionSettings {
                 _ => new[k] = x.clone(),
             }
         }
-        let mut new: SessionSettings = serde_json::from_value(new).map_err(|e| e.to_string())?;
+        let mut new: SessionSettings = serde_json::from_value(new).map_err(|e| format!("the settings {}: {e}", connectome::json::to_string(v)))?;
         if let Some(path) = v["workspace"].as_str().map(str::trim) {
             let dir: PathBuf = std::path::absolute(expand(path)).map_err(|e| format!("{path}: {e}"))?.components().collect();
             if !dir.is_dir() {
@@ -145,11 +145,11 @@ impl SessionSettings {
             return Err(format!("no provider {}", new.provider));
         }
         let room = new.window - new.reserve;
-        if let Some(above) = new.fold_above.filter(|&a| !(0.0..=room).contains(&a)) {
-            return Err(format!("fold_above ({above}) must be at most what the window leaves the reply ({room})"));
+        if !(0.0..=room).contains(&new.fold_above) {
+            return Err(format!("fold_above ({}) must be at most what the window leaves the reply ({room})", new.fold_above));
         }
-        if let Some(to) = new.fold_to.filter(|&t| !(0.0..=new.fold_above.unwrap_or(room)).contains(&t)) {
-            return Err(format!("fold_to ({to}) must be at most fold_above ({})", new.fold_above.unwrap_or(room)));
+        if !(0.0..=new.fold_above).contains(&new.fold_to) {
+            return Err(format!("fold_to ({}) must be at most fold_above ({})", new.fold_to, new.fold_above));
         }
         if new.config.target_chunk_tokens <= 0.0 {
             return Err(format!("a chunk ({} tokens) must hold more than 0", new.config.target_chunk_tokens));
