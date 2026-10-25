@@ -175,7 +175,7 @@ pub enum Streamed {
 }
 
 #[derive(Deserialize)]
-pub struct Started { #[serde(default)] usage: Counted }
+pub struct Started { #[serde(default)] pub usage: Counted }
 
 #[derive(Deserialize)]
 pub struct Stopped { stop_reason: Option<String> }
@@ -186,9 +186,9 @@ pub struct Failure { #[serde(rename = "type", default)] kind: String, #[serde(de
 /// The tokens and dollars an event reports; any of them may be missing.
 #[derive(Deserialize, Default)]
 pub struct Counted {
-    input_tokens: Option<f64>,
-    cache_read_input_tokens: Option<f64>,
-    cache_creation_input_tokens: Option<f64>,
+    pub input_tokens: Option<f64>,
+    pub cache_read_input_tokens: Option<f64>,
+    pub cache_creation_input_tokens: Option<f64>,
     output_tokens: Option<f64>,
     cost: Option<f64>,
 }

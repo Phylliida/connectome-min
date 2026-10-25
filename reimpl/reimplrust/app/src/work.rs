@@ -409,7 +409,7 @@ impl Worker<'_> {
     /// session's costs log; the pages hear the totals, and a reply's prompt.
     fn spend(&self, setup: &Setup, what: For) {
         let used = setup.llm.spent.take();
-        if let Some(spent) = costs::spend(&self.s, what, used) {
+        if let Some(spent) = costs::spend(&self.s, what, used, None) {
             self.event(Event::Spent(spent));
             if what == For::Reply { self.event(Event::Prompt(used.input)) }
         }

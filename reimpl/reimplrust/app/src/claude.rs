@@ -164,6 +164,7 @@ impl Worker<'_> {
         self.tell(Msg::Taking); // what the user says from now on comes here, at once
         let mut version = String::new();
         let mut reply = Reply::default();
+        let mut last_prompt = None; // the latest request's prompt
         let ended = match started { Err(e) => Err(format!("telling Claude Code what was said: {e}")), Ok(()) => 'turn: loop {
             if self.stopped() { break Err(STOPPED.into()) }
             // what's said meanwhile goes to Claude Code as it comes; a fork, or a turn that continues
@@ -204,9 +205,19 @@ impl Worker<'_> {
                         }
                     }
                 }
-                Said::StreamEvent { event, parent_tool_use_id: None } => {
-                    if let Some(piece) = serde_json::from_value(event).ok().and_then(piece) { self.event(Event::Piece(piece)) }
-                }
+                Said::StreamEvent { event, parent_tool_use_id: None } => match serde_json::from_value(event) {
+                    // a request starts: its prompt is the context Claude Code has now (the result's tokens sum the turn's requests)
+                    Ok(Streamed::MessageStart { message }) => {
+                        let counted = |n: Option<f64>| n.unwrap_or(0.0);
+                        let prompt = counted(message.usage.input_tokens) + counted(message.usage.cache_read_input_tokens) + counted(message.usage.cache_creation_input_tokens);
+                        self.event(Event::Prompt(prompt));
+                        last_prompt = Some(prompt);
+                    }
+                    Ok(event) => {
+                        if let Some(piece) = piece(event) { self.event(Event::Piece(piece)) }
+                    }
+                    Err(_) => {} // an event the stream's types don't cover passes
+                },
                 Said::Assistant { message, parent_tool_use_id: None } => {
                     if reply.id != message.id { self.log_reply(&mut reply) }
                     reply.id = message.id;
@@ -259,7 +270,7 @@ impl Worker<'_> {
                     self.log_reply(&mut reply);
                     let prompts = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
                     let used = Usage { cost: total_cost_usd, input: prompts, cached: usage.cache_read_input_tokens, output: usage.output_tokens };
-                    if let Some(spent) = costs::spend(&self.s, For::Reply, used) { self.event(Event::Spent(spent)) }
+                    if let Some(spent) = costs::spend(&self.s, For::Reply, used, last_prompt) { self.event(Event::Spent(spent)) }
                     if is_error { break Err(result.unwrap_or(subtype)) }
                     // what Claude Code was told after its reply ends it takes in next, as a turn of its own in the same run
                     if told.iter().all(|t| t.logged) { break Ok(()) }

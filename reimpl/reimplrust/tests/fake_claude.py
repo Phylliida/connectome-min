@@ -14,7 +14,8 @@ step it's on (a call's result), or as a turn of its own once the turn's reply is
 - 'hang': text, then nothing, as a turn the user will stop;
 - anything else: 'You said: …'.
 
-Each run first writes into its working directory's claude-runs.jsonl what it was run with (its
+Each request's prompt is 1000 tokens, 1200 after a call's result, while the result's tokens sum the
+turn's (as Claude Code's do), here always 15 in. Each run first writes into its working directory's claude-runs.jsonl what it was run with (its
 arguments, whether a write outside that directory failed, as in a sandbox, and the status of a request
 to its ANTHROPIC_BASE_URL with ANTHROPIC_CUSTOM_HEADERS), then streams its reply in pieces and gives
 each finished block as Claude Code does. It ends with a result once the turn has, and exits when its
@@ -83,6 +84,13 @@ def outside():
         return True
 
 
+def start(prompt):
+    """A request starts, its prompt `prompt` tokens (most of them read from the cache): its reply's id."""
+    global reply_id
+    reply_id = f'msg_{time.monotonic_ns()}'
+    say({'type': 'stream_event', 'event': {'type': 'message_start', 'message': {'id': reply_id, 'usage': {'input_tokens': 2, 'cache_read_input_tokens': prompt - 2}}}, 'parent_tool_use_id': None})
+
+
 def streamed(i, block, pieces):
     """Block `i` of the reply, streamed in `pieces` (text, or a call's input JSON), then given whole."""
     say({'type': 'stream_event', 'event': {'type': 'content_block_start', 'index': i, 'content_block': {**block, **({'input': {}} if block['type'] == 'tool_use' else {'text': ''})}}, 'parent_tool_use_id': None})
@@ -102,8 +110,7 @@ say({'type': 'system', 'subtype': 'init', 'session_id': session, 'claude_code_ve
 while (message := waiting.pop(0) if waiting else inbox.get()) is not None:
     waiting.insert(0, message)
     text = take_in()[0]
-    reply_id = f'msg_{time.monotonic_ns()}'
-    say({'type': 'stream_event', 'event': {'type': 'message_start', 'message': {'id': reply_id, 'usage': {'input_tokens': 10}}}, 'parent_tool_use_id': None})
+    start(1000)
     if text.startswith('call '):
         tool = text.split()[1]
         streamed(0, {'type': 'text', 'text': 'Calling.'}, ['Call', 'ing.'])
@@ -114,7 +121,7 @@ while (message := waiting.pop(0) if waiting else inbox.get()) is not None:
         allowed = decided['behavior'] == 'allow'
         result = {'tool_use_id': 'toolu_1', 'type': 'tool_result', 'content': 'did it' if allowed else decided['message'], 'is_error': not allowed}
         say({'type': 'user', 'message': {'role': 'user', 'content': [result]}, 'parent_tool_use_id': None, 'session_id': session})
-        reply_id = f'msg_{time.monotonic_ns()}'
+        start(1200)   # after a call's result, the next request's prompt holds it
         streamed(0, {'type': 'text', 'text': 'It ran.' if allowed else 'Not allowed.'}, ['It ran.' if allowed else 'Not allowed.'])
         said = 'done'
     elif text.startswith('delegate '):
@@ -129,7 +136,7 @@ while (message := waiting.pop(0) if waiting else inbox.get()) is not None:
         say({'type': 'user', 'message': {'role': 'user', 'content': [{'tool_use_id': 'toolu_sub', 'type': 'tool_result', 'content': 'ok'}]}, 'parent_tool_use_id': 'toolu_agent', 'session_id': session})
         done = 'The subagent did it.' if allowed else 'The subagent was denied.'
         say({'type': 'user', 'message': {'role': 'user', 'content': [{'tool_use_id': 'toolu_agent', 'type': 'tool_result', 'content': done}]}, 'parent_tool_use_id': None, 'session_id': session})
-        reply_id = f'msg_{time.monotonic_ns()}'
+        start(1200)   # after a call's result, the next request's prompt holds it
         streamed(0, {'type': 'text', 'text': done}, [done])
         said = 'done'
     elif text == 'wait':
@@ -142,7 +149,7 @@ while (message := waiting.pop(0) if waiting else inbox.get()) is not None:
             pass
         say({'type': 'user', 'message': {'role': 'user', 'content': [{'tool_use_id': 'toolu_wait', 'type': 'tool_result', 'content': 'slept'}]}, 'parent_tool_use_id': None, 'session_id': session})
         extra = take_in()
-        reply_id = f'msg_{time.monotonic_ns()}'
+        start(1200)   # after a call's result, the next request's prompt holds it
         said = f'Also: {" ".join(extra)}.' if extra else 'Nothing more.'
         streamed(0, {'type': 'text', 'text': said}, [said])
     elif text == 'linger':

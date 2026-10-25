@@ -1629,7 +1629,8 @@ def clauded(tls, ca) -> str:
     own messages, doesn't have it; the subagent's stream stays out of the page. What the user says while
     a turn runs goes to Claude Code at once, shown as with Claude Code until it takes it in, after the
     call it's on, where the log has it, the turn going on with it; said during the turn's reply, it's
-    a turn of its own in the same run, which the turn waits for. A stopped turn ends at once, its reply as
+    a turn of its own in the same run, which the turn waits for. The context shown is the last request's
+    prompt, not the sum of the turn's that Claude Code's result counts. A stopped turn ends at once, its reply as
     far as it came in the log, and what Claude Code hadn't taken in yet is the next turn. A Claude Code session can't fork, have a companion, or go on without a
     message."""
     streamed.set()   # the upstream answers at once: this part has its own process, so the gateway part waits as before
@@ -1719,6 +1720,8 @@ def clauded(tls, ca) -> str:
                               ('user', text('and also this')), ('assistant', text('Also: and also this.'))] \
                 or len(turns) != 1 or end['end'] is not None or [q['text'] for q in handed[:1]] != ['and also this'] or queues[-1] != []:
             raise SystemExit(f'a message said during a call was logged as {log()[before:]}, in turns {turns}, the queue heard as {queues}')
+        if (prompt := call(port, '/api/s/cc')['prompt']) != 1200:   # the context is the last request's prompt, not the turn's sum (15)
+            raise SystemExit(f'after a turn of two requests, of 1000 and 1200 tokens, the session shows a context of {prompt}')
         before = len(log())
         turns, queues, end = meanwhile('linger', 'Lingering', lambda: call(port, '/api/s/cc/say', {'text': 'after the reply'}), until='done')
         if log()[before:] != [('user', text('linger')), ('assistant', text('Lingering done.')), ('user', text('after the reply')), ('assistant', text('You said: after the reply'))] \

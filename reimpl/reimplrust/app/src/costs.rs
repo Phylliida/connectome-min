@@ -16,12 +16,15 @@ use std::collections::{BTreeMap, HashMap};
 pub enum For { Reply, Memories }
 
 /// A record of the costs log: what requests `used`, and the session's running totals by what they
-/// were for; a reply's also says which message it is and which compile its request was built from.
+/// were for; a reply's also says which message it is and which compile its request was built from,
+/// and, for a reply that took several requests (a Claude Code turn's, whose `used` sums them), the
+/// last one's prompt, the context it ended with.
 #[derive(Serialize, Deserialize)]
 struct Cost {
     #[serde(rename = "for")] what: For,
     #[serde(default, skip_serializing_if = "Option::is_none")] message: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")] compile: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] prompt: Option<f64>,
     used: Usage,
     total: BTreeMap<For, Usage>,
 }
@@ -70,14 +73,15 @@ fn replies(s: &Session) -> impl Iterator<Item = Cost> + '_ {
 }
 
 /// What requests `used` for `what` joins the costs log, if they used anything, with the running
-/// totals; and the totals as the page shows them.
-pub fn spend(s: &Session, what: For, used: Usage) -> Option<Spent> {
+/// totals and, for a reply of several requests, the last one's `prompt`; and the totals as the page
+/// shows them.
+pub fn spend(s: &Session, what: For, used: Usage, prompt: Option<f64>) -> Option<Spent> {
     if used.input + used.output == 0.0 { return None }
     let mut total = costs(s).next().map(|c| c.total).unwrap_or_default();
     total.entry(what).and_modify(|t| *t = *t + used).or_insert(used);
     let reply = what == For::Reply;
     let (message, compile) = (reply.then(|| s.count("messages")), reply.then(|| s.count("compiles").checked_sub(1)).flatten());
-    let cost = Cost { what, message, compile, used, total };
+    let cost = Cost { what, message, compile, prompt, used, total };
     s.append("costs", serde_json::to_value(&cost).expect("a cost is JSON"));
     Spent::of(cost.total)
 }
@@ -87,9 +91,9 @@ pub fn spent(s: &Session) -> Option<Spent> {
     Spent::of(costs(s).next()?.total)
 }
 
-/// The last reply's prompt in tokens, as its provider counted it; None before any.
+/// The last reply's prompt in tokens, as its provider counted it (its last request's); None before any.
 pub fn prompted(s: &Session) -> Option<f64> {
-    replies(s).next().map(|c| c.used.input)
+    replies(s).next().map(|c| c.prompt.unwrap_or(c.used.input))
 }
 
 /// The last reply's prompt, unless a compile has learnt from it: the one its request was built from is
