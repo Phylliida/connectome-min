@@ -26,9 +26,11 @@ small for a memory no merge has taken on each layer and the tail, the oldest of 
 layers (lifted), and every turn still gets its reply. In a channel, each post, the user's or a
 session's (message_channel), goes to the sessions there with inputs on but its poster. On a board,
 sessions work on tasks as files, and a task's owner hears when it's handed to them or commented on.
+Through the gateway, a request goes upstream as it came, but for this connection's headers, and its
+answer streams back as it comes, the exchange recorded without credentials.
 
-The seven parts (the chat, the tool calls, the large contexts, the companion, the lifted memories,
-the channels, the boards) run at once, in processes of their own, each with its own mock; the first to fail stops the rest.
+The eight parts (the chat, the tool calls, the large contexts, the companion, the lifted memories,
+the channels, the boards, the gateway) run at once, in processes of their own, each with its own mock; the first to fail stops the rest.
 
     python3 tests/test_app.py [turns]
 """
@@ -289,9 +291,9 @@ def certificates(folder: str) -> tuple[str, str, str]:
     return paths[0], paths[1], paths[2]
 
 
-def serve(port: int, tls: tuple[str, str] | None = None) -> ThreadingHTTPServer:
+def serve(port: int, tls: tuple[str, str] | None = None, handler=Mock) -> ThreadingHTTPServer:
     """The mock on `port`, over TLS 1.3 with (certificate, key) if given."""
-    server = ThreadingHTTPServer(('127.0.0.1', port), Mock)
+    server = ThreadingHTTPServer(('127.0.0.1', port), handler)
     if tls:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_3
@@ -1504,6 +1506,135 @@ def boarded(tls, ca) -> str:
         mock.shutdown()
 
 
+forwarded = []   # what the gateway's upstream got: (method, path, headers, body)
+streamed, held = threading.Event(), []   # set once the gateway's client has the first event; whether the upstream waited in vain
+EVENTS = ['event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":5}}}\n\n',
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"h\u00e9"}}\n\n',
+          'event: message_stop\ndata: {"type":"message_stop"}\n\n']
+
+
+class Upstream(BaseHTTPRequestHandler):
+    """What the gateway forwards to: it keeps each request as it came (forwarded) and answers
+    /v1/messages with EVENTS, chunked, the rest only once the client has the first (or after 5 s,
+    which held notes); a model of 'refused' with a 401, as the API answers a bad key, and one of
+    'vanish' not at all, the connection closed; and a GET with a list of models."""
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *args):
+        pass
+
+    def keep(self, body):
+        forwarded.append((self.command, self.path, {k.lower(): v for k, v in self.headers.items()}, body))
+
+    def do_GET(self):
+        self.keep(b'')
+        self.whole(200, json.dumps({'data': [{'id': 'claude-test'}]}).encode())
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers['content-length']))
+        self.keep(body)
+        if json.loads(body)['model'] == 'vanish':
+            self.close_connection = True
+            return
+        if json.loads(body)['model'] == 'refused':
+            return self.whole(401, json.dumps({'type': 'error', 'error': {'type': 'authentication_error', 'message': 'invalid x-api-key'}}).encode())
+        self.send_response(200)
+        for name, value in (('content-type', 'text/event-stream'), ('request-id', 'req_1'), ('transfer-encoding', 'chunked')):
+            self.send_header(name, value)
+        self.end_headers()
+        for i, event in enumerate(EVENTS):
+            data = event.encode()
+            self.wfile.write(b'%x\r\n%s\r\n' % (len(data), data))
+            self.wfile.flush()
+            if i == 0:
+                held.append(not streamed.wait(5))
+        self.wfile.write(b'0\r\n\r\n')
+
+    def whole(self, code, body):
+        self.send_response(code)
+        self.send_header('content-type', 'application/json')
+        self.send_header('content-length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def gatewayed(tls, ca) -> str:
+    """The gateway, to an upstream over TLS (--upstream, trusted through --ca): a request goes on with
+    its body byte for byte and its headers, credentials and the session's id among them, but this
+    connection's (host, x-connectome, accept-encoding); the answer comes back with its status, its
+    headers but the connection's, and its body as the upstream sent it, each event as it comes, a 401
+    as one; an upstream that never answers is a 502 that says why. Each exchange joins its session's recording, credentials left out; one without a session id,
+    or with one that isn't a name, joins 'unnamed'. A POST without x-connectome goes nowhere."""
+    import http.client
+    port, root, mock_port = free_port(), tempfile.mkdtemp(), free_port()
+    mock = serve(mock_port, tls, Upstream)
+    app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--upstream', f'https://localhost:{mock_port}', '--no-open'], stderr=subprocess.DEVNULL)
+
+    def through(method, path, body=None, headers=None):
+        connection = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+        connection.request(method, path, body=body, headers=headers or {})
+        return connection.getresponse()
+
+    def recorded(session, count):
+        path = Path(root) / '.gateway' / session / 'exchanges.jsonl'
+        for _ in range(100):   # the hub writes it once the answer has gone
+            if path.exists() and len(lines := path.read_text().splitlines()) >= count:
+                return [json.loads(line) for line in lines]
+            time.sleep(0.05)
+        raise SystemExit(f'{session} recorded {path.read_text() if path.exists() else "nothing"}')
+    for _ in range(100):
+        try:
+            call(port, '/api/sessions')
+            break
+        except OSError:
+            time.sleep(0.05)
+    try:
+        body = '{"model": "claude-test",   "stream": true, "messages": [{"role": "user", "content": "h\u00e9 é"}]}'.encode()
+        sent = {'authorization': 'Bearer secret-token', 'anthropic-beta': 'oauth-2025-04-20,fine-grained', 'x-claude-code-session-id': 'abc-123',
+                'content-type': 'application/json', 'user-agent': 'claude-cli/test', 'accept-encoding': 'gzip, br', 'x-connectome': '1'}
+        answer = through('POST', '/gateway/v1/messages?beta=true', body, sent)
+        first = answer.readline() + answer.readline() + answer.readline()
+        streamed.set()
+        rest = answer.read()
+        method, path, headers, got = forwarded[0]
+        kept = {k: v for k, v in sent.items() if k not in ('accept-encoding', 'x-connectome')}
+        if (method, path, got) != ('POST', '/v1/messages?beta=true', body) or any(headers.get(k) != v for k, v in kept.items()) \
+                or 'x-connectome' in headers or headers.get('host') != f'localhost:{mock_port}' or 'gzip' in headers.get('accept-encoding', ''):
+            raise SystemExit(f'the upstream got {forwarded[0]}')
+        if answer.status != 200 or answer.getheader('content-type') != 'text/event-stream' or answer.getheader('request-id') != 'req_1' \
+                or answer.getheader('transfer-encoding') or (first + rest).decode() != ''.join(EVENTS) or held != [False]:
+            raise SystemExit(f'the client got {answer.status} {answer.getheaders()} {first + rest!r}, the first event held back: {held}')
+        refused = through('POST', '/gateway/v1/messages', b'{"model":"refused"}', {'x-api-key': 'secret-key', 'x-claude-code-session-id': 'abc-123', 'x-connectome': '1'})
+        if refused.status != 401 or json.loads(refused.read())['error']['type'] != 'authentication_error':
+            raise SystemExit(f'a 401 upstream came back as {refused.status}')
+        listed = through('GET', '/gateway/v1/models', headers={'x-claude-code-session-id': '../away'})
+        if listed.status != 200 or json.loads(listed.read()) != {'data': [{'id': 'claude-test'}]} or forwarded[2][:2] != ('GET', '/v1/models'):
+            raise SystemExit(f'a GET came back as {listed.status}, the upstream got {forwarded[2:]}')
+        if through('POST', '/gateway/v1/messages', b'{}').status != 403 or len(forwarded) != 3:
+            raise SystemExit(f'a POST without x-connectome went on: {forwarded[3:]}')
+        gone = through('POST', '/gateway/v1/messages', b'{"model":"vanish"}', {'x-claude-code-session-id': 'abc-123', 'x-connectome': '1'})
+        if gone.status != 502 or json.loads(gone.read())['error']['type'] != 'api_error':
+            raise SystemExit(f'an upstream that never answered came back as {gone.status}')
+        stream, failed, vanished = recorded('abc-123', 3)
+        if (stream['method'], stream['path'], stream['body'], stream['status'], stream['answer'], stream['failed']) != ('POST', '/v1/messages?beta=true', json.loads(body), 200, ''.join(EVENTS), None) \
+                or stream['headers'].get('authorization') != '(left out)' or stream['headers'].get('anthropic-beta') != sent['anthropic-beta'] \
+                or stream['answer_headers'].get('content-type') != 'text/event-stream' or 'x-connectome' in stream['headers']:
+            raise SystemExit(f'the stream was recorded as {stream}')
+        if failed['status'] != 401 or failed['headers'].get('x-api-key') != '(left out)':
+            raise SystemExit(f'the 401 was recorded as {failed}')
+        if vanished['status'] is not None or not vanished['failed']:
+            raise SystemExit(f'the upstream that never answered was recorded as {vanished}')
+        if [r['path'] for r in recorded('unnamed', 1)] != ['/v1/models'] or (Path(root) / 'away').exists():
+            raise SystemExit(f'the GET was recorded in {os.listdir(Path(root) / ".gateway")}')
+        leaked = [str(f) for f in Path(root).rglob('*') if f.is_file() and b'secret-' in f.read_bytes()]
+        if leaked:
+            raise SystemExit(f'credentials written to {leaked}')
+        return f'{len(forwarded)} requests through the gateway'
+    finally:
+        app.terminate()
+        mock.shutdown()
+
+
 def part(name, run, done):
     """A part of the test in a process group of its own, which its apps and their servers join, so
     that killing the group stops them all: (name, its summary or None, why it failed or None, counts)."""
@@ -1529,7 +1660,7 @@ def main(turns=60):
     done, baseline = forked.Queue(), forked.Queue()
     parts = {'chat': lambda: chatted(turns, (cert, key), ca, baseline), 'tools': lambda: tooled((cert, key), ca, baseline), 'large': lambda: streamed_large((cert, key), ca),
              'companion': lambda: accompanied((cert, key), ca), 'lifted': lambda: lifted((cert, key), ca), 'channels': lambda: channeled((cert, key), ca),
-             'boards': lambda: boarded((cert, key), ca)}
+             'boards': lambda: boarded((cert, key), ca), 'gateway': lambda: gatewayed((cert, key), ca)}
     running = [forked.Process(target=part, args=(name, run, done)) for name, run in parts.items()]
     summaries, totals, failure = {}, {'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0}, None
     try:
@@ -1554,7 +1685,7 @@ def main(turns=60):
         print(failure)
         return 1
     print(f'{totals["chat"]} chat turns and {totals["memory"]} memory requests; {summaries["chat"]}; {totals["bytes"] // 1024} KB of requests streamed '
-          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}')
+          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}; {summaries["gateway"]}')
     return 0
 
 

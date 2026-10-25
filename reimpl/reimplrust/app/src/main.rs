@@ -20,6 +20,7 @@ mod boards;
 mod channels;
 mod companion;
 mod costs;
+mod gateway;
 mod hub;
 mod llm;
 mod settings;
@@ -35,6 +36,7 @@ pub struct App {
     root: PathBuf,
     addr: String,
     agent: ureq::Agent,
+    upstream: String,      // where the gateway forwards requests (gateway.rs)
     mcp: Vec<mcp::Server>, // every session's MCP servers
     bash: bool,            // whether a session with a workspace has bash
     limit: Duration,       // a tool call's time
@@ -78,7 +80,11 @@ fn main() {
     let mcp = mcp.map_or_else(Vec::new, |config| mcp::servers(&json::parse(&config).expect("--mcp: JSON"), limit));
     let (told, inbox) = channel();
     let (addr, agent) = (arg("--addr", "127.0.0.1:8080"), llm::agent(ca.as_deref()).expect("--ca"));
-    let app: &'static App = Box::leak(Box::new(App { root, addr, agent, mcp, bash: !flag("--no-bash"), limit, hub: told }));
+    let upstream = arg("--upstream", "https://api.anthropic.com");
+    if !ureq::http::Uri::try_from(&upstream).is_ok_and(|u| u.scheme().is_some() && u.host().is_some()) {
+        panic!("--upstream {upstream}: not a URL like https://api.anthropic.com");
+    }
+    let app: &'static App = Box::leak(Box::new(App { root, addr, agent, upstream, mcp, bash: !flag("--no-bash"), limit, hub: told }));
     if !app.settings_path().exists() {
         settings::write(&app.settings_path(), &Settings::first()).expect("settings.json");
     }

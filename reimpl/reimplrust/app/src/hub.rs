@@ -14,8 +14,10 @@ use std::{collections::{HashMap, VecDeque}, sync::mpsc::{channel, Receiver, Send
 /// the back-and-forth needs starting (auto); a post to a channel, answered with the post as logged and
 /// the sessions that heard it (post); a channel's description set (channels::describe); a page that
 /// follows a channel from now on (its posts as they're logged), answered once it does; a change from
-/// the page to a board (boards::apply), whose owners then hear what it changed; or, from a session's
-/// thread, a step that ran tools, after which the boards it's on are looked at again (boards::changes).
+/// the page to a board (boards::apply), whose owners then hear what it changed; from a session's
+/// thread, a step that ran tools, after which the boards it's on are looked at again (boards::changes);
+/// or, from the gateway, an exchange it forwarded, which joins the recording of the Claude Code
+/// session that sent it (gateway.rs).
 pub enum Routed {
     To(String, Msg),
     Provide(Value, Sender<Result<Settings, String>>),
@@ -25,6 +27,7 @@ pub enum Routed {
     Watch(String, Sender<Value>, Sender<()>),
     Board(String, Value, Sender<Result<(), String>>),
     Stepped(String),
+    Exchange(String, Value),
 }
 
 /// A job for a session's thread: a turn with a message, or without (None) one that continues the log;
@@ -158,6 +161,7 @@ pub fn hub(app: &'static App, inbox: Receiver<Routed>) {
                 }
                 let _ = reply.send(changed);
             }
+            Routed::Exchange(session, record) => drop(app.gateway(&session).append("exchanges", record)),
             Routed::Stepped(by) => {
                 for board in app.profile(&by).map(|s| boards::of(app, &s)).unwrap_or_default() {
                     let told = boards::changes(app, &board, Some(&by), seen.entry(board.clone()).or_default());

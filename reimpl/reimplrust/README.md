@@ -255,9 +255,24 @@ follows its session again on its own. If a session's files are
 edited into something the library can't read, its stream says so, and reads them again at the next
 event.
 
+The gateway (`app/src/gateway.rs`), for now, only records. Claude Code (or the Agent SDK, which runs
+it, or anything else that speaks the Messages API) run with
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8080/gateway` and `ANTHROPIC_CUSTOM_HEADERS='x-connectome: 1'`
+(the header every POST here carries) sends its requests here, and each goes on to `--upstream` as it
+came: its body byte for byte, and its headers but this connection's (host, connection, content-length,
+transfer-encoding and the like; accept-encoding, so the answer comes uncompressed; and x-connectome),
+so its own credentials go with it, an API key or a Claude login's token. The answer streams back as it
+arrives, with its status and headers. Each exchange joins
+`ROOT/.gateway/SESSION/exchanges.jsonl` (SESSION is the request's `x-claude-code-session-id`, or
+`unnamed`): `{id, at, method, path, headers, body, status, answer_headers, answer, failed}`, its
+`authorization` and `x-api-key` left out, so a real session's requests can be read before the
+gateway changes any of them. A record holds the whole request, which for Claude Code is the whole
+conversation so far, so a long session's recording grows fast.
+
 Flags: `--root DIR` (sessions and settings; `sessions` by default), `--addr` (`127.0.0.1:8080`),
 `--ca PEM` (root certificates to trust instead of Mozilla's: a company proxy's, a test server's),
-`--mcp FILE`, `--tool-timeout SECONDS`, `--no-bash`, and `--no-open` (else the page opens in the
+`--mcp FILE`, `--tool-timeout SECONDS`, `--no-bash`, `--upstream URL` (where the gateway sends
+requests on; `https://api.anthropic.com` by default), and `--no-open` (else the page opens in the
 browser). The server answers only its own page: requests must name it as their Host, and POSTs must
 carry its `x-connectome` header. A request's body takes 32 MiB at most.
 
@@ -266,7 +281,7 @@ Tests:
 ```sh
 cargo test                  # unit tests of the JavaScript and Python arithmetic the ports share
 python3 tests/test_rust.py  # every compile, request and file record the same as reimplclean2's, handoffs both ways, the planner
-python3 tests/test_app.py   # the app against mock APIs over HTTPS, its parts at once: chat, memories, forks, settings, certificates, bash, its sandbox, approvals, timeouts and tools through fake MCP servers, flat memory
+python3 tests/test_app.py   # the app against mock APIs over HTTPS, its parts at once: chat, memories, forks, settings, certificates, bash, its sandbox, approvals, timeouts and tools through fake MCP servers, flat memory, the gateway
 python3 tests/mutants.py tests/test_app.py app/src/work.rs=mutants.json   # mutation testing, each mutant in a copy of its own, many at once
 ```
 

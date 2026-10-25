@@ -4,7 +4,7 @@
 //! carry an x-connectome header (another site's page can't send one without a CORS preflight, which
 //! this server never approves), since a POST can change where the key goes.
 
-use crate::{boards, channels::{self, Post}, companion, costs::{self, Compile, Fold, Spent}, hub::{Event, Job, Msg, Queued, Routed}, settings::{self, SessionSettings}, work::Setup, App};
+use crate::{boards, channels::{self, Post}, companion, costs::{self, Compile, Fold, Spent}, gateway, hub::{Event, Job, Msg, Queued, Routed}, settings::{self, SessionSettings}, work::Setup, App};
 use connectome::{config::Config, json::{self, sparse, Json, Value}, memory::Recorded, obj, planner::chunks, store::Session};
 use serde::{Serialize, Serializer};
 use std::{collections::{BTreeSet, HashMap}, net::TcpStream, path::Path, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
@@ -61,6 +61,9 @@ pub fn handle(app: &App, mut stream: TcpStream) -> io::Result<()> {
     }
     if length > BODY_LIMIT {
         return fail(&mut stream, "413 Content Too Large", &format!("a request's body takes {} MiB at most", BODY_LIMIT >> 20));
+    }
+    if let Some(forwarded) = target.strip_prefix("/gateway/") { // its body goes on as it came, unparsed
+        return gateway::forward(app, method, &format!("/{forwarded}"), &headers, &raw, &mut stream);
     }
     let body = match json::parse(&raw) {
         Ok(body) => body,
@@ -353,7 +356,7 @@ pub fn brief(mut b: Value) -> Value {
 }
 
 /// A session's name: letters, digits, - and _.
-fn named(name: &str) -> bool {
+pub fn named(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
@@ -363,7 +366,7 @@ fn head(status: &str, kind: &str, length: Option<usize>) -> String {
     format!("HTTP/1.1 {status}\r\ncontent-type: {kind}\r\n{length}cache-control: no-cache\r\nconnection: close\r\n\r\n")
 }
 
-fn send(stream: &mut TcpStream, status: &str, kind: &str, body: &[u8]) -> io::Result<()> {
+pub fn send(stream: &mut TcpStream, status: &str, kind: &str, body: &[u8]) -> io::Result<()> {
     stream.write_all(head(status, kind, Some(body.len())).as_bytes())?;
     stream.write_all(body)
 }
