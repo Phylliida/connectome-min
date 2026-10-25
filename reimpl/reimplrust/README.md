@@ -274,7 +274,8 @@ Claude Code sessions (`app/src/claude.rs`) take their turns in Claude Code: a pr
 settings.json with a `command`, how to run Claude Code (`["claude"]`, or whatever runs it here, say
 a loader and the binary on NixOS), makes every session on it one, its `models` what Claude Code's
 `--model` takes (`opus`, `sonnet`, `haiku` or full names); `base` and `key` go unused, so there's
-nothing more to install than Claude Code itself. Each turn runs the command headless in the
+nothing more to install than Claude Code itself. The page's Settings shows such a provider's
+command, which only settings.json sets, and wants no key for it. Each turn runs the command headless in the
 session's workspace, speaking JSON lines on its stdin and stdout as the Agent SDK does
 (`--print --input-format stream-json --output-format stream-json`, its control requests asking
 before a tool runs), with the session's model and its system prompt appended to Claude Code's

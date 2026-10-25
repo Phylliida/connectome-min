@@ -60,6 +60,7 @@ dialog .buttons small { margin-right: auto; }
 .card.adding { border-style: dashed; }
 .card h3 { font-size: 14px; margin: 0; }
 .card h3 small { font-weight: normal; color: var(--warn); margin-left: 6px; }
+.card h3 small.kind { color: var(--muted); }
 .models { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .model { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; padding: 1px 2px 1px 10px; background: var(--bg); font: 12px ui-monospace, monospace; }
 .model button { border: 0; background: none; padding: 0 6px; color: var(--muted); }
@@ -401,7 +402,7 @@ const App = () => {
         <button id="new-session" class="new" onClick=${creating}>New session</button>
         <button id="open-settings" class="icon" title="Settings: providers and their models" aria-label="Settings" onClick=${opening}>${ICONS.gear()}</button>
       </div>
-      ${page.providers.length > 0 && !page.providers.some((p) => p.key) && html`<small class="nokey">Add a provider's API key in Settings to chat.</small>`}
+      ${page.providers.length > 0 && !page.providers.some(ready) && html`<small class="nokey">Add a provider's API key in Settings to chat.</small>`}
       <h2>Sessions</h2>
       <${Sessions} />
       <h2 class="with-button">Channels <button id="new-channel" class="add" title="New channel" aria-label="New channel" onClick=${makeChannel}>+</button></h2>
@@ -745,22 +746,26 @@ function creating() {
   draw();
 }
 
+// whether sessions can chat on a provider: it has a key, or it's Claude Code (a command), which logs in itself
+const ready = (p) => p.key || p.command;
+
 // the settings, in a dialog in the middle of the page (page.settings): a card per provider sessions
 // choose from, then one that adds a provider
 function Settings() {
-  const keyless = !page.providers.some((p) => p.key);
+  const keyless = !page.providers.some(ready);
   return html`<dialog id="settings" ref=${(d) => d && !d.open && d.showModal()} onClose=${() => { page.settings = null; draw(); }}>
     <h2>Providers</h2>
-    <small>${keyless ? 'Add a provider\'s API key to chat. DeepSeek: https://api.deepseek.com/anthropic, OpenRouter: https://openrouter.ai/api/v1' : 'A session runs on a provider\'s API, on one of the models it lists.'}</small>
+    <small>${keyless ? 'Add a provider\'s API key to chat. DeepSeek: https://api.deepseek.com/anthropic, OpenRouter: https://openrouter.ai/api/v1' : 'A session runs on a provider\'s API, or in Claude Code, on one of the models it lists.'}</small>
     ${page.providers.map((p) => html`<${Provider} key=${p.name} p=${p} />`)}
     <${Provider} key=${'new-' + page.settings.made} />
     <div class="buttons"><button type="button" onClick=${(e) => e.target.closest('dialog').close()}>Done</button></div>
   </dialog>`;
 }
 
-// a provider's card: its base URL and its key (which the page never sees), saved by its button, and its
-// models, saved as each is added (Enter, or +) or taken off (×); and a button that deletes it, once the
-// user confirms; without `p`, a new provider's, named
+// a provider's card: its base URL and its key (which the page never sees), saved by its button, or, for
+// Claude Code, the command that runs it (settings.json's, shown); its models, saved as each is added
+// (Enter, or +) or taken off (×); and a button that deletes it, once the user confirms; without `p`, a
+// new provider's, named
 function Provider({ p }) {
   const card = p?.name ?? '';
   const save = async (e) => {
@@ -775,10 +780,11 @@ function Provider({ p }) {
   const enter = (e) => { if (e.key === 'Enter') { e.preventDefault(); add(e); } };
   const forget = () => confirm(`Delete the provider ${card}? Sessions on it will need another.`) && provide(card, { name: card, delete: true });
   return html`<form class=${p ? 'card settings' : 'card settings adding'} data-provider=${card} onSubmit=${save}>
-    <h3>${p ? p.name : 'New provider'}${p && !p.key && html`<small>no key</small>`}</h3>
+    <h3>${p ? p.name : 'New provider'}${p?.command ? html`<small class="kind">Claude Code</small>` : p && !p.key && html`<small>no key</small>`}</h3>
     ${!p && html`<label>Name <input name="name" placeholder="openrouter" /></label>`}
-    <label>Base URL <input name="base" defaultValue=${p?.base ?? ''} placeholder="https://openrouter.ai/api/v1" /></label>
-    <label>API key <input name="key" type="password" autocomplete="off" placeholder=${p?.key ? 'unchanged if empty' : ''} /></label>
+    ${p?.command ? html`<label title="Claude Code logs in itself; its command is set in settings.json">Command <input name="command" readOnly defaultValue=${p.command.join(' ')} /></label>` : html`
+      <label>Base URL <input name="base" defaultValue=${p?.base ?? ''} placeholder="https://openrouter.ai/api/v1" /></label>
+      <label>API key <input name="key" type="password" autocomplete="off" placeholder=${p?.key ? 'unchanged if empty' : ''} /></label>`}
     ${p && html`<label>Models</label><div class="models">
       ${p.models.map((m) => html`<span class="model" key=${m}>${m}<button type="button" title=${'Take ' + m + ' off the list'} aria-label=${'Take ' + m + ' off'}
         onClick=${() => provide(card, { name: card, models: p.models.filter((x) => x !== m) })}>×</button></span>`)}
@@ -788,7 +794,7 @@ function Provider({ p }) {
     <div class="buttons">
       ${p && html`<button type="button" class="icon delete" title=${'Delete ' + card} aria-label=${'Delete ' + card} onClick=${forget}>${ICONS.trash()}</button>`}
       <small>${page.settings.notes[card]}</small>
-      <button class="primary">${p ? 'Save' : 'Add provider'}</button>
+      ${!p?.command && html`<button class="primary">${p ? 'Save' : 'Add provider'}</button>`}
     </div>
   </form>`;
 }
