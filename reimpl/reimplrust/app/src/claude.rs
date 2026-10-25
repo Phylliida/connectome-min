@@ -22,12 +22,13 @@
 //! call's result), or once its reply is done, as a turn of its own in the same run; it echoes each as
 //! it does, and the log has it there, so the turn ends once Claude Code has taken in all it was told.
 //! Claude Code keeps the conversation (its session, ID, in ~/.claude), so each turn starts it again,
-//! resuming that session.
+//! resuming that session. After a turn, memories form, each written by a run of Claude Code of its
+//! own (claude_memory.rs).
 
 use crate::{api::brief, boards, companion::Heard, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Content, Delta, Piece, Streamed, Usage}, settings::Sandbox, tools::{bash, POLL}, work::{said, Worker, APPROVAL_WAIT, DENIED, STOPPED}, App};
 use connectome::{drive::append, json::{self, sparse, Json, Value}, obj};
 use serde::Deserialize;
-use std::{collections::VecDeque, hash::{BuildHasher, Hasher}, io::{BufRead, BufReader, Read, Write}, path::Path, process::{ChildStdin, Command, Stdio}, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
+use std::{collections::VecDeque, hash::{BuildHasher, Hasher}, io::{BufRead, BufReader, Read, Write}, path::Path, process::{Child, ChildStdin, Command, Stdio}, sync::mpsc::{channel, Receiver, RecvTimeoutError}, time::Duration};
 use wait_timeout::ChildExt;
 
 /// Why a Claude Code session can't go on without a message: Claude Code takes a turn from one.
@@ -37,7 +38,7 @@ pub const NO_CONTINUE: &str = "a Claude Code session goes on from a message: say
 /// session's sandbox is bubblewrap around all of Claude Code (with its own on, Claude Code would also
 /// run Bash without asking, sandbox.autoAllowBashIfSandboxed). The user's settings files don't load
 /// (--setting-sources "").
-const SETTINGS: &str = r#"{"sandbox":{"enabled":false}}"#;
+pub const SETTINGS: &str = r#"{"sandbox":{"enabled":false}}"#;
 
 /// How long Claude Code has to exit once its input closes after a turn.
 const EXIT_WAIT: Duration = Duration::from_secs(10);
@@ -59,20 +60,20 @@ pub fn command(app: &App, name: &str) -> Result<Option<Vec<String>>, String> {
 /// subagent's messages and stream (parent_tool_use_id) stay in Claude Code.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum Said {
+pub enum Said {
     System { #[serde(default)] subtype: String, #[serde(default)] claude_code_version: String },
     StreamEvent { event: Value, parent_tool_use_id: Option<String> },
     Assistant { message: Message, parent_tool_use_id: Option<String> },
     User { message: Message, parent_tool_use_id: Option<String>, #[serde(default, rename = "isReplay")] is_replay: bool },
     ControlRequest { request_id: String, request: Value },
-    Result { #[serde(default)] subtype: String, #[serde(default)] is_error: bool, result: Option<String>, total_cost_usd: Option<f64>, #[serde(default)] usage: Used },
+    Result { #[serde(default)] subtype: String, #[serde(default)] is_error: bool, result: Option<String>, stop_reason: Option<String>, total_cost_usd: Option<f64>, #[serde(default)] usage: Used },
     #[serde(other)] Other,
 }
 
 /// An API message as Claude Code passes it on: an assistant's holds one block (its content), each
 /// block of a reply coming once it's finished, all with the reply's id; a user's holds tool results.
 #[derive(Deserialize)]
-struct Message { #[serde(default)] id: String, content: Value }
+pub struct Message { #[serde(default)] pub id: String, pub content: Value }
 
 /// A control request of Claude Code's that connectome-web answers; others get an error.
 #[derive(Deserialize)]
@@ -84,11 +85,11 @@ enum Asked {
 
 /// A turn's tokens, all its requests', as Claude Code's result counts them.
 #[derive(Deserialize, Default)]
-struct Used {
-    #[serde(default)] input_tokens: f64,
-    #[serde(default)] cache_read_input_tokens: f64,
-    #[serde(default)] cache_creation_input_tokens: f64,
-    #[serde(default)] output_tokens: f64,
+pub struct Used {
+    #[serde(default)] pub input_tokens: f64,
+    #[serde(default)] pub cache_read_input_tokens: f64,
+    #[serde(default)] pub cache_creation_input_tokens: f64,
+    #[serde(default)] pub output_tokens: f64,
 }
 
 impl Worker<'_> {
@@ -97,8 +98,7 @@ impl Worker<'_> {
     /// it, and heard until its result, or until the user stops the turn, when it's killed and what came
     /// of the reply joins the log as it is.
     pub fn claude_turn(&self, command: &[String], message: &Value) -> Result<(), String> {
-        let (all, own) = (self.app.settings()?, self.app.profile(self.name)?);
-        let workspace = own.workspace.clone().ok_or("a Claude Code session runs in its workspace: set one in the session's settings")?;
+        let own = self.app.profile(self.name)?;
         let boards = boards::of(self.app, &own);
         // 1) Claude Code, as the provider's command runs it
         let (id, resuming) = match &own.claude_session {
@@ -116,50 +116,10 @@ impl Worker<'_> {
             args.extend(["--append-system-prompt".into(), system.join("\n\n")]);
         }
         args.extend([if resuming { "--resume" } else { "--session-id" }.into(), id.clone()]);
-        let mut claude = if own.sandbox {
-            if !cfg!(target_os = "linux") {
-                return Err("the session's sandbox is bubblewrap, which runs only on Linux: turn the sandbox off in its settings".into());
-            }
-            let mut sandbox: Sandbox = all.sandbox.clone();
-            sandbox.rw.extend(boards.iter().map(|b| self.app.board_path(b).to_string_lossy().into_owned()));
-            sandbox.ro.extend(command.iter().filter(|c| Path::new(c).is_absolute()).cloned()); // the program, and a script or loader it names
-            sandbox.rw.extend(["~/.claude".into(), "~/.claude.json".into()]); // its sessions, settings and login
-            sandbox.network = true; // the gateway is this server, on the network's loopback
-            let mut wrapped = Command::new("bwrap");
-            wrapped.args(bash::bwrap(&workspace, &sandbox)).args(command);
-            wrapped
-        } else {
-            let mut plain = Command::new(&command[0]);
-            plain.args(&command[1..]);
-            plain
-        };
-        claude.args(&args).current_dir(&workspace).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        claude.env("ANTHROPIC_BASE_URL", format!("http://{}/gateway", self.app.addr));
-        claude.env("ANTHROPIC_CUSTOM_HEADERS", format!("x-connectome: 1\nx-connectome-session: {}", self.name));
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut claude, 0); // so a stop kills what it started too
-        let provider = &own.provider;
-        let mut child = claude.spawn().map_err(|e| format!("can't start Claude Code ({}): {e}; provider {provider}'s command in settings.json says how to run it", command.join(" ")))?;
-        // its output a line at a time, and the end of its stderr, each read by a thread of its own, so
-        // neither pipe fills while the other is read
-        let (stdout, mut stderr) = (child.stdout.take().expect("piped"), child.stderr.take().expect("piped"));
-        let (line_sender, lines) = channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                if line_sender.send(line).is_err() { break }
-            }
-        });
-        let (error_sender, errors) = channel();
-        std::thread::spawn(move || {
-            let mut text = String::new();
-            let _ = stderr.read_to_string(&mut text); // till every process holding the pipe has gone
-            let cut = text.chars().count().saturating_sub(STDERR_KEPT);
-            let _ = error_sender.send(text.chars().skip(cut).collect::<String>());
-        });
+        let mut claude = self.start_claude(command, &args, &[])?;
         // 2) what was said, then what Claude Code says, until its result
-        let mut stdin = child.stdin.take().expect("piped");
         let initialize = obj! {"type" => "control_request", "request_id" => "initialize", "request" => obj! {"subtype" => "initialize"}};
-        let started = send(&mut stdin, &initialize).and_then(|()| send(&mut stdin, &told_line(message)));
+        let started = claude.send(&initialize).and_then(|()| claude.send(&told_line(message)));
         let mut told = VecDeque::from([Told { message: message.clone(), logged: true, job: None }]);
         self.tell(Msg::Taking); // what the user says from now on comes here, at once
         let mut version = String::new();
@@ -179,12 +139,12 @@ impl Worker<'_> {
                         continue;
                     }
                 };
-                if let Err(e) = send(&mut stdin, &told_line(&message)) {
+                if let Err(e) = claude.send(&told_line(&message)) {
                     break 'turn Err(format!("telling Claude Code what was said: {e}"));
                 }
                 told.push_back(Told { message, logged: false, job: users });
             }
-            let line = match lines.recv_timeout(POLL) {
+            let line = match claude.lines.recv_timeout(POLL) {
                 Ok(Ok(line)) => line,
                 Ok(Err(e)) => break Err(format!("reading Claude Code's output: {e}")),
                 Err(RecvTimeoutError::Timeout) => continue,
@@ -262,11 +222,11 @@ impl Worker<'_> {
                         }
                         _ => obj! {"subtype" => "error", "request_id" => request_id, "error" => "connectome-web doesn't answer this request"},
                     };
-                    if let Err(e) = send(&mut stdin, &obj! {"type" => "control_response", "response" => response}) {
+                    if let Err(e) = claude.send(&obj! {"type" => "control_response", "response" => response}) {
                         break Err(format!("answering Claude Code: {e}"));
                     }
                 }
-                Said::Result { subtype, is_error, result, total_cost_usd, usage } => {
+                Said::Result { subtype, is_error, result, total_cost_usd, usage, .. } => {
                     self.log_reply(&mut reply);
                     let prompts = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
                     let used = Usage { cost: total_cost_usd, input: prompts, cached: usage.cache_read_input_tokens, output: usage.output_tokens };
@@ -288,16 +248,66 @@ impl Worker<'_> {
             };
             self.later.borrow_mut().push_back((left.job.unwrap_or(0), job));
         }
-        // 3) Claude Code done with: its input closed, so it exits; killed at once if the turn failed
-        drop(stdin);
-        if ended.is_err() { kill(&mut child) }
-        if !matches!(child.wait_timeout(EXIT_WAIT), Ok(Some(_))) { kill(&mut child) }
-        // a process Claude Code started outside a sandbox may hold its stderr open after it exits
-        let errors = errors.recv_timeout(STDERR_WAIT).unwrap_or_default();
+        // 3) Claude Code done with, killed at once if the turn failed
+        let errors = claude.finish(ended.is_err());
         match ended {
             Err(why) if why != STOPPED && !errors.trim().is_empty() => Err(format!("{why}. Claude Code said: {}", errors.trim())),
             ended => ended,
         }
+    }
+
+    /// Claude Code, as `command` runs it with `args` (and `env`), in the session's workspace, its
+    /// requests sent to this server's gateway, and in the session's sandbox if it has one: bubblewrap
+    /// around all of it, with bash's paths, Claude Code's own files and the network the gateway takes.
+    /// A turn runs it so, and so does each memory a Claude Code session forms (claude_memory.rs).
+    pub fn start_claude(&self, command: &[String], args: &[String], env: &[(&str, String)]) -> Result<Claude, String> {
+        let (all, own) = (self.app.settings()?, self.app.profile(self.name)?);
+        let workspace = own.workspace.clone().ok_or("a Claude Code session runs in its workspace: set one in the session's settings")?;
+        let mut claude = if own.sandbox {
+            if !cfg!(target_os = "linux") {
+                return Err("the session's sandbox is bubblewrap, which runs only on Linux: turn the sandbox off in its settings".into());
+            }
+            let mut sandbox: Sandbox = all.sandbox.clone();
+            sandbox.rw.extend(boards::of(self.app, &own).iter().map(|b| self.app.board_path(b).to_string_lossy().into_owned()));
+            sandbox.ro.extend(command.iter().filter(|c| Path::new(c).is_absolute()).cloned()); // the program, and a script or loader it names
+            sandbox.rw.extend(["~/.claude".into(), "~/.claude.json".into()]); // its sessions, settings and login
+            sandbox.network = true; // the gateway is this server, on the network's loopback
+            let mut wrapped = Command::new("bwrap");
+            wrapped.args(bash::bwrap(&workspace, &sandbox)).args(command);
+            wrapped
+        } else {
+            let mut plain = Command::new(&command[0]);
+            plain.args(&command[1..]);
+            plain
+        };
+        claude.args(args).current_dir(&workspace).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        claude.env("ANTHROPIC_BASE_URL", format!("http://{}/gateway", self.app.addr));
+        claude.env("ANTHROPIC_CUSTOM_HEADERS", format!("x-connectome: 1\nx-connectome-session: {}", self.name));
+        for (name, value) in env {
+            claude.env(name, value);
+        }
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut claude, 0); // so a stop kills what it started too
+        let provider = &own.provider;
+        let mut child = claude.spawn().map_err(|e| format!("can't start Claude Code ({}): {e}; provider {provider}'s command in settings.json says how to run it", command.join(" ")))?;
+        // its output a line at a time, and the end of its stderr, each read by a thread of its own, so
+        // neither pipe fills while the other is read
+        let (stdout, mut stderr) = (child.stdout.take().expect("piped"), child.stderr.take().expect("piped"));
+        let (line_sender, lines) = channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line_sender.send(line).is_err() { break }
+            }
+        });
+        let (error_sender, errors) = channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text); // till every process holding the pipe has gone
+            let cut = text.chars().count().saturating_sub(STDERR_KEPT);
+            let _ = error_sender.send(text.chars().skip(cut).collect::<String>());
+        });
+        let stdin = child.stdin.take();
+        Ok(Claude { child, stdin, lines, errors })
     }
 
     /// The reply streaming in, its blocks so far, joins the log, if it has any.
@@ -324,7 +334,7 @@ impl Worker<'_> {
 struct Told { message: Value, logged: bool, job: Option<u64> }
 
 /// A message as Claude Code takes it on its stdin.
-fn told_line(message: &Value) -> Value {
+pub fn told_line(message: &Value) -> Value {
     obj! {"type" => "user", "message" => obj! {"role" => "user", "content" => message["content"].clone()}, "parent_tool_use_id" => Value::Null, "session_id" => ""}
 }
 
@@ -365,15 +375,32 @@ fn logged_result(b: &Value) -> Value {
     sparse(obj! {"type" => "tool_result", "toolUseId" => b["tool_use_id"].clone(), "content" => content, "isError" => b["is_error"].as_bool().filter(|&e| e)})
 }
 
-/// A line to Claude Code.
-fn send(stdin: &mut ChildStdin, line: &Value) -> std::io::Result<()> {
-    let mut text = json::to_string(line);
-    text.push('\n');
-    stdin.write_all(text.as_bytes()).and_then(|()| stdin.flush())
+/// A Claude Code running (Worker::start_claude): its stdout's lines come on `lines`, as a thread reads
+/// them, and the end of its stderr on `errors`, once it has gone.
+pub struct Claude { child: Child, stdin: Option<ChildStdin>, pub lines: Receiver<std::io::Result<String>>, errors: Receiver<String> }
+
+impl Claude {
+    /// A line to Claude Code.
+    pub fn send(&mut self, line: &Value) -> std::io::Result<()> {
+        let mut text = json::to_string(line);
+        text.push('\n');
+        let stdin = self.stdin.as_mut().expect("open until finish");
+        stdin.write_all(text.as_bytes()).and_then(|()| stdin.flush())
+    }
+
+    /// Claude Code done with: its input closed, so it exits, killed at once if the work `failed`, or
+    /// if it doesn't exit within EXIT_WAIT; the end of what it wrote on stderr.
+    pub fn finish(mut self, failed: bool) -> String {
+        drop(self.stdin.take());
+        if failed { kill(&mut self.child) }
+        if !matches!(self.child.wait_timeout(EXIT_WAIT), Ok(Some(_))) { kill(&mut self.child) }
+        // a process Claude Code started outside a sandbox may hold its stderr open after it exits
+        self.errors.recv_timeout(STDERR_WAIT).unwrap_or_default()
+    }
 }
 
 /// Claude Code killed, with what it started (its process group; bubblewrap's PID namespace goes with it).
-fn kill(child: &mut std::process::Child) {
+fn kill(child: &mut Child) {
     #[cfg(unix)]
     unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
     let _ = child.kill();

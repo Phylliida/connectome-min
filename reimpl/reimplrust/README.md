@@ -300,8 +300,16 @@ tells the session, goes to Claude Code at once (`--replay-user-messages`): the u
 message box as "with Claude Code" until Claude Code takes it in, after the step it's on (a call's
 result), or, once its reply is done, as a turn of its own in the same run; it echoes each as it does,
 and the log has it there. The turn ends once Claude Code has taken in all it was told; what a stopped
-turn's Claude Code hadn't taken in is the next turn. Not yet: forks, a companion, Continue without a message, and
-memories (the gateway forwards the requests unchanged).
+turn's Claude Code hadn't taken in is the next turn. A Claude Code session's memories form after its
+turns, each written by a run of Claude Code of its own (`app/src/claude_memory.rs`), on the session's
+model (or `config.compression_model`), so they're the same model's: no tools (`--tools ""`), Claude
+Code's least system prompt (`--system-prompt ""`), no session kept (`--no-session-persistence`), and
+the memory's max tokens (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`), in the session's sandbox and through the
+gateway like its turns. Claude Code takes only user messages, so the library's request goes as one,
+a transcript: a line on how it's laid out, then each turn headed by who says it, calls and their
+results in brackets, reasoning left out. Its cost joins the session's, for memories. Not yet: what
+Claude Code sees is still its own conversation (the gateway forwards its requests unchanged), forks,
+a companion, and Continue without a message.
 
 Flags: `--root DIR` (sessions and settings; `sessions` by default), `--addr` (`127.0.0.1:8080`),
 `--ca PEM` (root certificates to trust instead of Mozilla's: a company proxy's, a test server's),

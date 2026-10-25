@@ -14,6 +14,10 @@ step it's on (a call's result), or as a turn of its own once the turn's reply is
 - 'hang': text, then nothing, as a turn the user will stop;
 - anything else: 'You said: …'.
 
+Run with --no-session-persistence, as a memory's run is, it writes what it was run with and told
+(its arguments, CLAUDE_CODE_MAX_OUTPUT_TOKENS, the transcript) into claude-memories.jsonl instead, and
+answers with a memory (and reasoning, which isn't the memory's): how many parts the user said in it.
+
 Each request's prompt is 1000 tokens, 1200 after a call's result, while the result's tokens sum the
 turn's (as Claude Code's do), here always 15 in. Each run first writes into its working directory's claude-runs.jsonl what it was run with (its
 arguments, whether a write outside that directory failed, as in a sandbox, and the status of a request
@@ -29,7 +33,8 @@ import time
 import urllib.request
 
 args = sys.argv[1:]
-session = args[args.index('--session-id') + 1] if '--session-id' in args else args[args.index('--resume') + 1]
+remembering = '--no-session-persistence' in args
+session = 'memory' if remembering else args[args.index('--session-id') + 1] if '--session-id' in args else args[args.index('--resume') + 1]
 
 
 def say(line):
@@ -102,6 +107,20 @@ def streamed(i, block, pieces):
 
 
 threading.Thread(target=reading, daemon=True).start()
+if remembering:
+    initialize = inbox.get()
+    say({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': initialize['request_id'], 'response': {}}})
+    transcript = inbox.get()['message']['content'][0]['text']
+    with open('claude-memories.jsonl', 'a') as runs:
+        runs.write(json.dumps({'args': args, 'max_tokens': os.environ.get('CLAUDE_CODE_MAX_OUTPUT_TOKENS'), 'transcript': transcript}) + '\n')
+    memory = f'I remember {transcript.count(chr(10) + "[user]")} parts the user said.'
+    say({'type': 'assistant', 'message': {'id': 'msg_memory', 'role': 'assistant', 'content': [{'type': 'thinking', 'thinking': 'Let me recall.', 'signature': 'c2ln'}]}, 'parent_tool_use_id': None, 'session_id': session})
+    say({'type': 'assistant', 'message': {'id': 'msg_memory', 'role': 'assistant', 'content': [{'type': 'text', 'text': memory}]}, 'parent_tool_use_id': None, 'session_id': session})
+    say({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': memory, 'stop_reason': 'end_turn', 'session_id': session, 'total_cost_usd': 0.002,
+         'usage': {'input_tokens': 300, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0, 'output_tokens': 20}})
+    while inbox.get() is not None:
+        pass
+    sys.exit()
 with open('claude-runs.jsonl', 'a') as runs:
     runs.write(json.dumps({'args': args, 'outside_failed': outside(), 'gateway': gateway()}) + '\n')
 initialize = inbox.get()

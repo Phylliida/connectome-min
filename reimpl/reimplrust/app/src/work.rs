@@ -10,7 +10,7 @@
 //! hub what the pages following the job see (Msg). The user can stop a turn: it ends where it is
 //! (Worker::stopped). A Claude Code session's turn is Claude Code's instead (claude.rs).
 
-use crate::{api::brief, boards, channels, claude, companion::{self, Heard, How}, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
+use crate::{api::brief, boards, channels, claude, claude_memory::Remembering, companion::{self, Heard, How}, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, store::Session};
 use std::{cell::{Cell, RefCell}, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
@@ -204,9 +204,7 @@ impl Worker<'_> {
         let auto = self.app.ask_session(self.name, Msg::Ended);
         self.event(Event::End(ended.clone().err()));
         self.hand_over(start, ended, auto);
-        // a Claude Code session forms no memories yet: its provider makes no requests of its own to write them
-        let in_claude = claude::command(self.app, self.name).ok().flatten().is_some();
-        if !in_claude && let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup); }
+        if let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup); }
     }
 
     /// A chat turn: the log mended if the server stopped in a step (mend), its message joins the log,
@@ -386,10 +384,21 @@ impl Worker<'_> {
         if self.stopped() { return Formed::Nothing }
         self.event(Event::Forming(true));
         let tried = self.s.count("attempts");
-        let mut summarizer = Summarizer { setup, stopped: &|| self.stopped(), ended: None };
-        let formed = match drive(&self.s, &mut summarizer, &setup.settings.config) {
+        // a Claude Code session's memories are written by Claude Code, a run each (claude_memory.rs); others' by requests to the session's provider
+        let cfg = &setup.settings.config;
+        let (drove, ended) = match claude::command(self.app, self.name).ok().flatten() {
+            Some(command) => {
+                let mut remembering = Remembering { worker: self, command, ended: None };
+                (drive(&self.s, &mut remembering, cfg), remembering.ended)
+            }
+            None => {
+                let mut summarizer = Summarizer { setup, stopped: &|| self.stopped(), ended: None };
+                (drive(&self.s, &mut summarizer, cfg), summarizer.ended)
+            }
+        };
+        let formed = match drove {
             Err(why) => Formed::Failed(why),
-            Ok(_) if self.s.count("attempts") > tried => Formed::Unused(match summarizer.ended {
+            Ok(_) if self.s.count("attempts") > tried => Formed::Unused(match ended {
                 Some((ended, _)) if ended == "refusal" => "the summarizer refused to write it, and memories stop forming until that's mended".into(),
                 Some((ended, max)) if ended == "max_tokens" => format!("the summarizer's reply ran out of its {max} tokens, its reasoning included, before it wrote the memory (Memory max tokens, config.compression_max_tokens)"),
                 ended => format!("the summarizer's reply ended ({}) without a memory in it", ended.map_or("nothing".into(), |(ended, _)| ended)),

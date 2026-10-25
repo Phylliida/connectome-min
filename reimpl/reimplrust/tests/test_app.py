@@ -1630,7 +1630,10 @@ def clauded(tls, ca) -> str:
     a turn runs goes to Claude Code at once, shown as with Claude Code until it takes it in, after the
     call it's on, where the log has it, the turn going on with it; said during the turn's reply, it's
     a turn of its own in the same run, which the turn waits for. The context shown is the last request's
-    prompt, not the sum of the turn's that Claude Code's result counts. A stopped turn ends at once, its reply as
+    prompt, not the sum of the turn's that Claude Code's result counts. Its memories form after its
+    turns, each written by a run of Claude Code of its own, on the session's model, with no tools,
+    Claude Code's least system prompt and no session kept, told the library's request as a transcript
+    (calls and results written out), its reasoning left out of the memory. A stopped turn ends at once, its reply as
     far as it came in the log, and what Claude Code hadn't taken in yet is the next turn. A Claude Code session can't fork, have a companion, or go on without a
     message."""
     streamed.set()   # the upstream answers at once: this part has its own process, so the gateway part waits as before
@@ -1746,6 +1749,21 @@ def clauded(tls, ca) -> str:
         if log()[-3:] != expected:
             raise SystemExit(f'after a stop with a message Claude Code hadn\'t taken in, the log ends {log()[-3:]}')
         settle(port, 'cc')   # that turn is done, so a page following the session next hears none of it
+        story = ' '.join(f'word{i}' for i in range(1500))   # past a chunk's 595 tokens, so chunks close and their memories form
+        for n in range(3):
+            say(port, 'cc', f'part {n}: {story}')
+        memories = call(port, '/api/s/cc/layer/1')
+        runs_of = [json.loads(line) for line in Path(work, 'claude-memories.jsonl').read_text().splitlines()]
+        flags = {flag: runs_of[0]['args'][runs_of[0]['args'].index(flag) + 1] for flag in ('--model', '--tools', '--system-prompt')}
+        told = runs_of[0]['transcript']
+        if not memories or not all(m['text'].startswith('I remember ') and 'recall' not in m['text'] for m in memories) or len(runs_of) != len(memories) \
+                or flags != {'--model': 'fake', '--tools': '', '--system-prompt': ''} or runs_of[0]['max_tokens'] != '20000':
+            raise SystemExit(f'memories formed as {[m["text"] for m in memories]}, Claude Code run for them {len(runs_of)} times as {runs_of[:1] and runs_of[0]["args"]}')
+        if abs(call(port, '/api/s/cc')['spent']['memories']['cost'] - 0.002 * len(runs_of)) > 1e-9:
+            raise SystemExit(f'{len(runs_of)} memories\' runs cost the session {call(port, "/api/s/cc")["spent"].get("memories")}')
+        if not told.startswith('This is part of your conversation in this session') or '\n\n[user]\nhello' not in told or '[Context Manager]\nSystem: You will soon form a new memory' not in told \
+                or '[called Write with {"file_path":"x.txt"}]' not in told or "[Write's result: did it]" not in told:
+            raise SystemExit(f'the first memory was asked for as {told[:1500]}')
         refused('/api/s/cc/fork', {'at': 1, 'name': 'cc-fork'})
         refused('/api/s/cc/companion', {'name': 'pal', 'goal': 'help'})
         r, events = following(port, 'cc')

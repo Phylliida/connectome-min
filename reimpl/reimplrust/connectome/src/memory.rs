@@ -54,6 +54,9 @@ Nothing happened worth remembering.)";
 pub trait Host {
     /// The agent's live tool definitions, once declared.
     fn tools(&self) -> Option<&Value> { None }
+    /// Whether a request may carry tool blocks: once the host has declared tools, which a provider
+    /// takes tool blocks only with; a host that writes the request out as text may always.
+    fn carries_tool_blocks(&self) -> bool { self.tools().is_some_and(|tools| !tools.arr().is_empty()) }
     /// The host's system prompt, once declared.
     fn system(&self) -> Option<&str> { None }
     /// The summarizer's response {stopReason, content, usage}, or why the call failed. The request's
@@ -269,14 +272,14 @@ fn quiet(session: &Session, p: u64, cfg: &Config) -> Option<Value> {
     (chars < cfg.min_chunk_chars).then(|| memory(first, last, &QUIET.replace("{n}", &(last - first + 1).to_string()), Value::Null, 40.0, Value::Null, cfg))
 }
 
-/// compressChunkHierarchical's request for chunk p, or None to defer it while the host has declared
-/// no tools and the request carries tool blocks, which a provider takes only with their tools.
+/// compressChunkHierarchical's request for chunk p, or None to defer it while the request carries tool
+/// blocks and the host can't (Host::carries_tool_blocks).
 fn l1_request(session: &Session, p: u64, host: &dyn Host, cfg: &Config) -> Option<Request> {
     let (first, last) = span(session, &[(0, p)], cfg);
     let task = [vec![say(MARKER)], raw(session, first, last), vec![say(&INSTRUCTION.replace("{target}", &number(cfg.summary_target_tokens)))]];
     let request = ask(session, first, task.concat(), host, cfg);
     let tools_used = request.messages.iter().flat_map(|t| &t.content).any(|b| b.kind == "tool_use" || b.kind == "tool_result");
-    (host.tools().is_some_and(|tools| !tools.arr().is_empty()) || !tools_used).then_some(request)
+    (host.carries_tool_blocks() || !tools_used).then_some(request)
 }
 
 /// executeMerge's request for a memory of layer `level` that merges `members`: what they hold, one
