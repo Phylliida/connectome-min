@@ -13,7 +13,7 @@
 use crate::{api::brief, boards, channels, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, store::Session};
-use std::{cell::RefCell, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
+use std::{cell::{Cell, RefCell}, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
 
 /// A message from `who` of `text`, as the log keeps it.
 fn said(who: &str, text: String) -> Value { obj! {"participant" => who, "content" => vec![obj! {"type" => "text", "text" => text}]} }
@@ -129,14 +129,20 @@ pub fn overhead(system: Option<&str>, definitions: &Option<Value>) -> f64 {
 
 /// A session's thread, which does its `jobs` (Worker), and first those a turn took from them but left
 /// for after it (`later`). A job that panics (a file edited into something the library can't read)
-/// fails, and the next runs.
+/// fails, and the next runs. Out of jobs, it tells the hub how many it has taken (Msg::Idle), so the
+/// hub sends it the user's next queued turn, if it was sent no other.
 pub fn work(app: &App, name: &str, jobs: Receiver<(u64, Job)>) {
-    let later = RefCell::new(VecDeque::new());
+    let (later, taken) = (RefCell::new(VecDeque::new()), Cell::new(0));
+    let took = |job: (u64, Job)| { taken.set(taken.get() + 1); job };
     loop {
-        let next = later.borrow_mut().pop_front();
-        let Some((id, job)) = next.or_else(|| jobs.recv().ok()) else { return };
+        let next = later.borrow_mut().pop_front().or_else(|| jobs.try_recv().ok().map(took));
+        let next = next.or_else(|| {
+            app.tell(name, Msg::Idle(taken.get()));
+            jobs.recv().ok().map(took)
+        });
+        let Some((id, job)) = next else { return };
         let (stop, halt) = channel();
-        let done = catch_unwind(AssertUnwindSafe(|| Worker { app, name, s: app.session(name), halt, jobs: &jobs, later: &later }.run(id, job, stop)));
+        let done = catch_unwind(AssertUnwindSafe(|| Worker { app, name, s: app.session(name), halt, jobs: &jobs, taken: &taken, later: &later }.run(id, job, stop)));
         if done.is_err() {
             app.tell(name, Msg::Event(Event::Forming(false)));
             app.tell(name, Msg::Event(Event::End(Some("the session's thread failed; the server's output says why".into()))));
@@ -154,6 +160,7 @@ struct Worker<'a> {
     s: Session,
     halt: Receiver<()>,
     jobs: &'a Receiver<(u64, Job)>,
+    taken: &'a Cell<u64>, // how many jobs the thread has taken from `jobs`
     later: &'a RefCell<VecDeque<(u64, Job)>>,
 }
 
@@ -239,6 +246,7 @@ impl Worker<'_> {
     fn deliver(&self) -> Result<bool, String> {
         let mut heard = false;
         while let Ok((id, job)) = self.jobs.try_recv() {
+            self.taken.set(self.taken.get() + 1);
             match job {
                 Job::Hear(Heard { from, text }) | Job::Notice(Heard { from, text }) => {
                     append(&self.s, &said(&from, text), &self.app.profile(self.name)?.config);

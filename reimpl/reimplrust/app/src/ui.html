@@ -222,6 +222,16 @@ form textarea { resize: vertical; min-height: 42px; }
 #text { resize: none; max-height: 50vh; }   /* as tall as what's in it (fit), then it scrolls */
 #say, #post { align-items: stretch; }   /* its buttons as tall as the message box, which the user can make taller */
 #status { color: var(--muted); font-size: 12px; padding: 0 16px 8px; min-height: 18px; }
+
+/* the messages queued for after the turn running, above the message box */
+#queued { display: flex; flex-direction: column; gap: 4px; padding: 0 16px 6px; }
+.queued { display: flex; align-items: center; gap: 6px; border: 1px dashed var(--line); border-radius: 6px; padding: 3px 4px 3px 10px; font-size: 13px; background: var(--panel); }
+.queued .text { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.queued small { color: var(--muted); font-size: 11px; }
+.queued button { border: 0; background: none; padding: 2px 5px; color: var(--muted); }
+.queued button:hover { color: var(--accent); }
+.queued button svg { width: 15px; height: 15px; }
+.queued textarea { flex: 1; resize: vertical; min-height: 34px; }
 #status.warn { color: var(--warn); }
 
 /* the session's numbers, its tools, and its memory pyramid */
@@ -271,6 +281,7 @@ const page = {
   notes: { session: '', about: '' },     // under the session form, and a channel's or board's description: saved, or why not
   picked: null,                           // the provider chosen on the session form, until it starts again
   creating: null,                         // the new-session dialog, while it's open: {workspace chosen, error}
+  editing: null,                          // the queued message being edited in place, by its number
   settings: null,                         // the settings dialog, while it's open: {notes: under each card, by provider ('' the new one's), made: providers added}
   accompanying: null,                     // the dialog that makes the session's companion, while it's open: {error}
   detail: 'Select a memory or chunk.',    // the memory or chunk the pyramid last showed
@@ -403,6 +414,7 @@ const App = () => {
       <${Tab} side="right" what=${b != null ? 'the board\'s description and members' : c != null ? 'the channel\'s members' : 'the session\'s settings and memory'} />
       ${b != null ? html`<${BoardView} />` : c != null ? html`<${Posts} />` : html`<${Log} />`}
       <div id="status" class=${warn ? 'warn' : ''}>${line}</div>
+      ${b == null && c == null && html`<${QueuedList} />`}
       ${b != null ? null : c != null ? html`<${PostForm} key=${c} />` : html`<${SayForm} />`}
     </section>
     <aside id="memory" hidden=${!page.panels.right}>
@@ -819,6 +831,29 @@ function SessionForm() {
   </form>`;
 }
 
+// the messages (and continues) the user sent that wait for the turn running: each with a button that
+// edits it in place (Enter saves, Shift+Enter a new line, Escape leaves it as it was) and one that
+// takes it back; one that goes to the model meanwhile leaves the list
+function QueuedList() {
+  const queued = state?.queued ?? [];
+  if (!queued.length) return null;
+  const keys = (id) => (e) => {
+    if (e.key === 'Escape') {
+      page.editing = null;
+      draw();
+    } else if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      requeue(id, e.target.value);
+    }
+  };
+  return html`<div id="queued">${queued.map((q) => q.id === page.editing
+    ? html`<div class="queued" key=${q.id} data-id=${q.id}><textarea rows="2" defaultValue=${q.text ?? ''} onKeyDown=${keys(q.id)} ref=${(t) => t && !t.dataset.shown && (t.dataset.shown = '1', t.focus())}></textarea>
+        <button title="Save it (Enter)" aria-label="Save the queued message" onClick=${(e) => requeue(q.id, e.target.closest('.queued').querySelector('textarea').value)}>Save</button></div>`
+    : html`<div class="queued" key=${q.id} data-id=${q.id}><span class="text" title=${q.text ?? ''}>${q.text ?? '(continue)'}</span><small>queued</small>
+        ${q.text != null && html`<button class="edit" title="Edit it" aria-label="Edit the queued message" onClick=${() => { page.editing = q.id; draw(); }}>${ICONS.pencil()}</button>`}
+        <button class="cancel" title="Take it back" aria-label="Cancel the queued message" onClick=${() => requeue(q.id, null)}>×</button></div>`)}</div>`;
+}
+
 function SayForm() {
   const say = (e) => {
     e.preventDefault();
@@ -870,6 +905,8 @@ const ICONS = {
   gear: () => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true">
     <path d="M10.14 5.05 10.44 2.12h3.12l.3 2.93A7.2 7.2 0 0 1 15.6 5.76l2.28-1.85 2.21 2.21-1.85 2.28a7.2 7.2 0 0 1 .71 1.74l2.93.3v3.12l-2.93.3a7.2 7.2 0 0 1-.71 1.74l1.85 2.28-2.21 2.21-2.28-1.85a7.2 7.2 0 0 1-1.74.71l-.3 2.93h-3.12l-.3-2.93a7.2 7.2 0 0 1-1.74-.71l-2.28 1.85-2.21-2.21 1.85-2.28a7.2 7.2 0 0 1-.71-1.74l-2.93-.3v-3.12l2.93-.3a7.2 7.2 0 0 1 .71-1.74L3.91 6.12l2.21-2.21L8.4 5.76a7.2 7.2 0 0 1 1.74-.71z" fill="currentColor" fill-opacity=".14" />
     <circle cx="12" cy="12" r="2.9" /></svg>`,
+  pencil: () => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M15.5 4.5l4 4L9 19H5v-4z" fill="currentColor" fill-opacity=".14" /><path d="M13.5 6.5l4 4" /></svg>`,
   trash: () => html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <path d="M3.5 6.5h17M9.5 6.5V4.4c0-.6.5-1.1 1.1-1.1h2.8c.6 0 1.1.5 1.1 1.1v2.1" transform="rotate(-10 3.5 6.5)" />
     <path d="M5.8 8.8l.9 10.9c.1 1 .9 1.8 1.9 1.8h6.8c1 0 1.8-.8 1.9-1.8l.9-10.9z" fill="currentColor" fill-opacity=".14" />
@@ -1329,6 +1366,15 @@ async function tune(el) {
   draw();
 }
 
+// a queued message changed to `text` (left as it was, if blank), or, with null, taken back; one that
+// has gone to the model meanwhile says so on the line under the chat
+async function requeue(id, text) {
+  page.editing = null;
+  if (text != null && !text.trim()) return draw();
+  try { state = await api(`/api/s/${current()}/queued`, text == null ? { id, cancel: true } : { id, text }); } catch (err) { fail(err); }
+  draw();
+}
+
 // Auto turned on or off, for the session and its partner
 async function auto(on) {
   try { state = await api(`/api/s/${current()}/auto`, { on }); } catch (err) { fail(err); }
@@ -1484,6 +1530,10 @@ async function follow(name, signal) {
       listSessions();
     },
     spent: (spent) => { state.spent = spent; },
+    queue: (queued) => {
+      if (state) state.queued = queued;
+      if (!queued.some((q) => q.id === page.editing)) page.editing = null;   // it went to the model while being edited
+    },
     prompt: (prompt) => { state.prompt = prompt; },
   };
   // what happens in a turn
@@ -1556,7 +1606,7 @@ try { page.folded = new Set(JSON.parse(localStorage.getItem('folded')) || []); }
 try { page.collapsed = new Set(JSON.parse(localStorage.getItem('collapsed')) || []); } catch { /* no storage here: columns start expanded */ }
 try { Object.assign(page.panels, JSON.parse(localStorage.getItem('panels'))); } catch { /* no storage here: both sides show */ }
 window.onhashchange = () => {
-  [page.notes.session, page.notes.about, page.picked, page.live, page.error, page.accompanying, page.messages, page.posts, page.board, page.task] = ['', '', null, null, null, null, [], [], null, null];
+  [page.notes.session, page.notes.about, page.picked, page.live, page.error, page.accompanying, page.messages, page.posts, page.board, page.task, page.editing] = ['', '', null, null, null, null, [], [], null, null, null];
   listSessions();
   listChannels();
   listBoards();

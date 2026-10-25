@@ -760,12 +760,14 @@ def tooled(tls, ca, baseline) -> str:
                     break
         starter.join()
         waiter.join()
-        # it hears the session (the turn running), then the turn's start and where the log stands (the message and the
-        # reply that calls logged, none of the reply's pieces), then what the first page hears from there on, but the
-        # messages, which each page reads from the log from where it started
-        outline = lambda events: [e for e in events if not {'text', 'thinking', 'message', 'state'} & set(e)]
+        # it hears the session (the turn running, and the message queued for after it), then the turn's start and where
+        # the log stands (the message and the reply that calls logged, none of the reply's pieces), then what the first
+        # page hears from there on, but the messages, which each page reads from the log from where it started, and the
+        # queue, which a page hears in the session as it comes in and then as it changes
+        outline = lambda events: [e for e in events if not {'text', 'thinking', 'message', 'state', 'queue'} & set(e)]
         kinds = [next(iter(e)) for e in outline(late) if not {'logged', 'forming', 'spent', 'prompt'} & set(e)]
-        if outline(first)[-len(outline(late)) + 1:] != outline(late)[1:] or not late[0]['state']['running'] or outline(late)[:2] != [{'turn': job[0]}, {'logged': state['messages'] + 2}] \
+        if outline(first)[-len(outline(late)) + 1:] != outline(late)[1:] or not late[0]['state']['running'] or [q['text'] for q in late[0]['state']['queued']] != [queued] \
+                or outline(late)[:2] != [{'turn': job[0]}, {'logged': state['messages'] + 2}] \
                 or 'approve' not in outline(late)[2] or kinds != ['turn', 'approve', 'answered', 'running', 'result', 'end', 'done'] or call(port, '/api/s/tools')['running']:
             raise SystemExit(f'a page that came in during the turn got {kinds} from {late[:3]}; the page that started it {len(first)} events, it {len(late)}')
         told = call(port, f'/api/s/tools/messages?from={state["messages"]}')
@@ -924,7 +926,8 @@ def accompanied(tls, ca) -> str:
     that comes during a turn's last step, the turn goes on to answer. Auto
     turned on from the page sends the session's last turn, with what it ran, to the companion; a turn
     that fails turns Auto off for both. A session paired already, one paired by the other side, a
-    name taken and a missing goal are refused, as is Auto without a companion; a fork has none."""
+    name taken and a missing goal are refused, as is Auto without a companion; a fork has none. Messages
+    sent during a turn wait, queued, and can be changed or taken back until they go."""
     port, root, mock_port, work = free_port(), tempfile.mkdtemp(), free_port(), tempfile.mkdtemp()
     mock = serve(mock_port, tls)
     app = subprocess.Popen([str(APP), '--root', root, '--addr', f'127.0.0.1:{port}', '--ca', ca, '--no-open'], stderr=subprocess.DEVNULL)
@@ -1015,6 +1018,23 @@ def accompanied(tls, ca) -> str:
         call(port, '/api/s/pair/fork', {'at': 1, 'name': 'pair-fork'})
         if (forked := call(port, '/api/s/pair-fork')['settings']).get('companion') or forked.get('auto'):
             raise SystemExit(f'a fork of a session with a companion has {forked}')
+        call(port, '/api/s/lone/say', {'text': 'echo first, slowly'})   # messages sent during a turn wait, queued: one changed, one taken back
+        time.sleep(0.3)
+        second, third = (call(port, '/api/s/lone/say', {'text': f'echo {n}'})['job'] for n in ('second', 'third'))
+        if call(port, '/api/s/lone')['queued'] != [{'id': second, 'text': 'echo second'}, {'id': third, 'text': 'echo third'}]:
+            raise SystemExit(f'queued during a turn: {call(port, "/api/s/lone")["queued"]}')
+        call(port, '/api/s/lone/queued', {'id': second, 'text': 'echo second, edited'})
+        call(port, '/api/s/lone/queued', {'id': third, 'cancel': True})
+        quiet('lone')
+        if log('lone') != [('user', 'echo first, slowly'), ('assistant', 'first, slowly'), ('user', 'echo second, edited'), ('assistant', 'second, edited')] or call(port, '/api/s/lone')['queued']:
+            raise SystemExit(f'the queued messages went on as {log("lone")}, {call(port, "/api/s/lone")["queued"]} left queued')
+        for wrong in ({'id': third, 'cancel': True}, {'id': second, 'text': 'too late'}):   # taken back, or gone to the model
+            try:
+                call(port, '/api/s/lone/queued', wrong)
+                raise SystemExit(f'a queued message took {wrong} once it had gone')
+            except urllib.error.HTTPError as error:
+                if error.code != 400:
+                    raise
         return f'a session and its companion: {len(log("pair"))} and {len(log("pal"))} messages'
     finally:
         app.terminate()

@@ -231,7 +231,12 @@ can't read fails, and the session goes on once the log is mended. The page's Sto
 log so, without a call it was still writing; a call not yet run doesn't run, its result saying so;
 one running ends (bash kills its command and what it started, and an MCP call is left to the
 server's timeout); a memory forming is dropped, not counted as a failed attempt; and no step comes
-after.
+after. A message (or Continue) sent while the session is busy waits, queued, above the message box,
+where you can edit it (✎, in place) or take it back (×) until it goes to the model: the hub holds it
+until the session's thread has done everything it was sent (`POST /api/s/NAME/queued` with `{id,
+text}` or `{id, cancel: true}`; the session lists them as `queued`, and the stream says
+`{"queue": […]}` as they change). What a companion, a channel or a board tells a session still joins
+the turn running.
 
 A page follows its session on one stream (`GET /api/s/NAME/stream`, JSON lines; `hub::Event` lists
 them): the log's newest messages, read from disk, then the session, then whatever happens in it,

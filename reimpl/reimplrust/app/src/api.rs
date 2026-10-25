@@ -4,7 +4,7 @@
 //! carry an x-connectome header (another site's page can't send one without a CORS preflight, which
 //! this server never approves), since a POST can change where the key goes.
 
-use crate::{boards, channels::{self, Post}, companion, costs::{self, Compile, Fold, Spent}, hub::{Event, Job, Msg, Routed}, settings::{self, SessionSettings}, work::Setup, App};
+use crate::{boards, channels::{self, Post}, companion, costs::{self, Compile, Fold, Spent}, hub::{Event, Job, Msg, Queued, Routed}, settings::{self, SessionSettings}, work::Setup, App};
 use connectome::{config::Config, json::{self, sparse, Json, Value}, memory::Recorded, obj, planner::chunks, store::Session};
 use serde::{Serialize, Serializer};
 use std::{collections::{BTreeSet, HashMap}, net::TcpStream, path::Path, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
@@ -147,6 +147,14 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
             }
             Ok(Some(state(app, name, &s)))
         }
+        ("POST", ["queued"]) => {   // {id, text}: a queued message changed; {id, cancel: true}: taken back
+            let id = body["id"].as_f64().ok_or("which queued message?")? as u64;
+            let text = match body["cancel"] == true {
+                true => None,
+                false => Some(body["text"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or("say something")?.to_string()),
+            };
+            app.ask_session(name, |reply| Msg::Queued { id, text, reply }).map(|()| Some(state(app, name, &s)))
+        }
         ("POST", ["approve"]) => {
             let (id, answer) = (body["id"].as_str().unwrap_or("").into(), body["answer"].as_str().unwrap_or("deny").into());
             app.ask_session(name, |reply| Msg::Approve { id, answer, reply }).map(|()| Some(obj! {}))
@@ -235,7 +243,7 @@ fn create(app: &App, v: &Value) -> Result<Value, String> {
 /// What the page shows of a session: counts, each layer's size, the last compile's frontier and
 /// calibration, its settings as its file has them, the tools that ask before they run and the tokens
 /// every request carries (or the problem that keeps it from running), whether a turn runs (with its
-/// memories forming after it), what its requests have used, and the last reply's prompt as its
+/// memories forming after it), the turns the user asked for that wait for it, what its requests have used, and the last reply's prompt as its
 /// provider counted it.
 #[derive(Serialize)]
 struct State<'a> {
@@ -244,6 +252,7 @@ struct State<'a> {
     #[serde(flatten)] last: Option<Compile>,
     refused: bool,
     running: bool,
+    queued: Vec<Queued>,
     spent: Option<Spent>,
     prompt: Option<f64>,
     settings: Option<SessionSettings>,
@@ -255,13 +264,14 @@ struct State<'a> {
 
 /// A session's State, as JSON.
 fn state(app: &App, name: &str, s: &Session) -> Value {
-    let setup = Setup::new(app, name);
+    let (setup, (running, queued)) = (Setup::new(app, name), app.ask_session(name, Msg::Status));
     let state = State {
         messages: s.count("messages"),
         layers: (0..).map(|n| s.count(&format!("layer{n}"))).take_while(|&c| c > 0).collect(),
         last: s.last("compiles").and_then(|c| serde_json::from_value(c).ok()),
         refused: s.last("attempts").is_some_and(|a| a["outcome"] == "refusal"),
-        running: app.ask_session(name, Msg::Status),
+        running,
+        queued,
         spent: costs::spent(s),
         prompt: costs::prompted(s),
         settings: app.profile(name).ok(),

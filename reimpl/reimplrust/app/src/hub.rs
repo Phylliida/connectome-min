@@ -7,7 +7,7 @@
 use crate::{api::Shown, boards, channels::{self, Post, Posted}, companion::Heard, costs::{Fold, Spent}, llm::Piece, settings::{self, SessionSettings, Settings}, work::{work, DENIED, STOPPED}, App};
 use connectome::json::Value;
 use serde::Serialize;
-use std::{collections::HashMap, sync::mpsc::{channel, Receiver, SendError, Sender}};
+use std::{collections::{HashMap, VecDeque}, sync::mpsc::{channel, Receiver, SendError, Sender}};
 
 /// What the hub is told: a message about a session; a change to settings.json, answered with the
 /// settings it leaves; Auto turned on or off for a session and its partner, answered with whether
@@ -42,8 +42,16 @@ pub enum Job {
 pub enum Msg {
     /// A job for the session's thread, which does them in the order they come, numbered from 1 (the
     /// number answered) for as long as the server runs; but what its partner tells it while one of its
-    /// calls waits for the answer goes to that call (answered 0).
+    /// calls waits for the answer goes to that call (answered 0), and a turn the user asks for (Say)
+    /// waits here, queued, while the thread is busy, so the user can still change it or take it back
+    /// (Queued).
     Job(Job, Sender<u64>),
+    /// From the session's thread: it has taken this many jobs, done them, and waits for another; if
+    /// that's every job it was sent, the user's next queued turn goes to it.
+    Idle(u64),
+    /// A queued turn (by its number) changed to the user's message `text`, or, None, taken back;
+    /// refused once it has gone to the thread.
+    Queued { id: u64, text: Option<String>, reply: Sender<Result<(), String>> },
     /// From the session's thread: a call waits for what the partner tells it next.
     Await(Sender<Heard>),
     /// The session's companion made (companion::make): the two are paired, Auto on; answered with
@@ -58,8 +66,8 @@ pub enum Msg {
     Follow(Sender<Event>, Sender<()>),
     /// A page's answer whether call `id` may run: allow, always (its tool, from then on) or deny.
     Approve { id: String, answer: String, reply: Sender<Result<(), String>> },
-    /// Whether a job runs.
-    Status(Sender<bool>),
+    /// Whether a job runs, and the turns queued.
+    Status(Sender<(bool, Vec<Queued>)>),
     /// A change to the session's settings (SessionSettings::tuned), and whether its memories have merged.
     Tune(Value, bool, Sender<Result<(), String>>),
     /// A change to the session's place in a channel (channels::member).
@@ -121,6 +129,9 @@ pub enum Event {
     End(Option<String>),
     /// Job `id` is done, its memories formed.
     Done(u64),
+    /// The turns queued now, each time they change: the user's messages (or continues) that wait for
+    /// the session's thread.
+    Queue(Vec<Queued>),
     /// A piece of the reply streaming in: {"thinking"}, {"text"}, {"calling"} or {"input"}.
     #[serde(untagged)] Piece(Piece),
 }
@@ -218,11 +229,23 @@ impl App {
     }
 }
 
-/// A session as the hub knows it: where its thread takes jobs and how many it has had, the pages
-/// following it, and its turn while one runs (with its memories forming after it).
+/// A turn the user asked for that waits for the session's thread: its number, and its message (None:
+/// a turn that continues the log).
+#[derive(Clone, Serialize)]
+pub struct Queued {
+    pub id: u64,
+    pub text: Option<String>,
+}
+
+/// A session as the hub knows it: where its thread takes jobs, how many it has had, how many were sent
+/// to it, and whether it waits for one, having taken them all; the turns the user asked for that wait
+/// for it; the pages following it; and its turn while one runs (with its memories forming after it).
 struct Live {
     jobs: Sender<(u64, Job)>,
     numbered: u64,
+    sent: u64,
+    idle: bool,
+    queued: VecDeque<Queued>,
     pages: Vec<Sender<Event>>,
     turn: Option<Turn>,
     awaiting: Option<Sender<Heard>>, // a call waiting for what the partner tells it next
@@ -244,7 +267,23 @@ impl Live {
         let (jobs, queue) = channel();
         let name = name.to_string();
         std::thread::spawn(move || work(app, &name, queue));
-        Live { jobs, numbered: 0, pages: vec![], turn: None, awaiting: None }
+        Live { jobs, numbered: 0, sent: 0, idle: false, queued: VecDeque::new(), pages: vec![], turn: None, awaiting: None }
+    }
+
+    /// Job `id` to the session's thread.
+    fn dispatch(&mut self, id: u64, job: Job) {
+        (self.sent, self.idle) = (self.sent + 1, false);
+        let _ = self.jobs.send((id, job));
+    }
+
+    /// The next queued turn to the session's thread, if it waits for one; the pages hear the queue as
+    /// it is then.
+    fn release(&mut self) {
+        if self.idle && let Some(Queued { id, text }) = self.queued.pop_front() {
+            self.dispatch(id, Job::Say { text });
+        }
+        let queue = Event::Queue(self.queued.iter().cloned().collect());
+        self.pages.retain(|page| page.send(queue.clone()).is_ok());
     }
 
     fn handle(&mut self, app: &App, name: &str, msg: Msg) {
@@ -267,10 +306,31 @@ impl Live {
                 }
                 let _ = reply.send(app.profile(name).is_ok_and(|s| s.auto));
             }
+            Msg::Job(Job::Say { text }, reply) => {
+                self.numbered += 1;
+                self.queued.push_back(Queued { id: self.numbered, text });
+                let _ = reply.send(self.numbered);
+                self.release();
+            }
             Msg::Job(job, reply) => {
                 self.numbered += 1;
-                let _ = self.jobs.send((self.numbered, job));
+                self.dispatch(self.numbered, job);
                 let _ = reply.send(self.numbered);
+            }
+            Msg::Idle(taken) => {
+                self.idle = taken == self.sent;
+                self.release();
+            }
+            Msg::Queued { id, text, reply } => {
+                let Some(at) = self.queued.iter().position(|q| q.id == id) else {
+                    return drop(reply.send(Err("that message has gone to the model already".into())));
+                };
+                match text {
+                    Some(text) => self.queued[at].text = Some(text),
+                    None => drop(self.queued.remove(at)),
+                }
+                let _ = reply.send(Ok(()));
+                self.release();
             }
             Msg::Follow(page, followed) => {
                 if self.turn.iter().flat_map(|t| &t.events).all(|e| page.send(e.clone()).is_ok()) {
@@ -278,7 +338,7 @@ impl Live {
                 }
                 let _ = followed.send(());
             }
-            Msg::Status(reply) => drop(reply.send(self.turn.is_some())),
+            Msg::Status(reply) => drop(reply.send((self.turn.is_some(), self.queued.iter().cloned().collect()))),
             Msg::Tune(v, merged, reply) => {
                 let tune = |all: Settings| settings::change(&app.profile_path(name), |old: &mut SessionSettings| old.tuned(&v, merged, &all).map(|new| *old = new));
                 let _ = reply.send(app.settings().and_then(tune).map(drop));
