@@ -4,7 +4,7 @@
 //! carry an x-connectome header (another site's page can't send one without a CORS preflight, which
 //! this server never approves), since a POST can change where the key goes.
 
-use crate::{boards, channels::{self, Post}, companion, costs::{self, Compile, Fold, Spent}, gateway, hub::{Event, Job, Msg, Queued, Routed}, settings::{self, SessionSettings}, work::Setup, App};
+use crate::{boards, channels::{self, Post}, claude, companion, costs::{self, Compile, Fold, Spent}, gateway, hub::{Event, Job, Msg, Queued, Routed}, settings::{self, SessionSettings}, work::Setup, App};
 use connectome::{config::Config, json::{self, sparse, Json, Value}, memory::Recorded, obj, planner::chunks, store::Session};
 use serde::{Serialize, Serializer};
 use std::{collections::{BTreeSet, HashMap}, net::TcpStream, path::Path, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
@@ -116,6 +116,9 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
         }
         ("GET", ["layer", n]) => send_all(stream, listing(&s, &format!("layer{n}"), u64::MAX, query).1),
         ("POST", ["fork"]) => {
+            if claude::command(app, name)?.is_some() { // its fork would resume the same conversation, carrying on both
+                return Err(format!("{name} is a Claude Code session, which can't fork yet"));
+            }
             let at = body["at"].as_f64().ok_or("fork at which message?")? as u64;
             let fork = body["name"].as_str().filter(|f| named(f)).ok_or("a fork's name")?;
             if at >= s.count("messages") {
@@ -140,6 +143,9 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
         ("GET", ["stream"]) => follow(app, name, query, stream),
         ("POST", ["stop"]) => app.ask_session(name, Msg::Stop).map(|()| Some(obj! {})),
         ("POST", ["companion"]) => {
+            if claude::command(app, name)?.is_some() {
+                return Err(format!("{name} is a Claude Code session, which has no message tool to talk with a companion yet"));
+            }
             let companion = body["name"].as_str().filter(|c| named(c)).ok_or("a companion's name is letters, digits, - and _")?;
             let goal = body["goal"].as_str().map(str::trim).filter(|g| !g.is_empty()).ok_or("a companion needs the goal")?;
             companion::make(app, name, companion, goal).map(|()| Some(state(app, name, &s)))
@@ -259,7 +265,7 @@ struct State<'a> {
     spent: Option<Spent>,
     prompt: Option<f64>,
     settings: Option<SessionSettings>,
-    tools: Vec<&'a str>,
+    tools: Vec<String>,
     overhead: f64,
     problem: Option<&'a str>,
     covers: Vec<Vec<(u64, u64)>>,
@@ -278,7 +284,11 @@ fn state(app: &App, name: &str, s: &Session) -> Value {
         spent: costs::spent(s),
         prompt: costs::prompted(s),
         settings: app.profile(name).ok(),
-        tools: setup.as_ref().map_or(vec![], |x| x.tools.asking()),
+        // Claude Code's tools are its own, which it asks about as it calls them: those the session always allows
+        tools: match (claude::command(app, name), app.profile(name)) {
+            (Ok(Some(_)), Ok(own)) => own.allow.into_iter().collect(),
+            _ => setup.as_ref().map_or(vec![], |x| x.tools.asking().into_iter().map(String::from).collect()),
+        },
         overhead: setup.as_ref().map_or(0.0, |x| x.overhead),
         problem: setup.as_ref().err().map(String::as_str),
         covers: app.profile(name).map_or(vec![], |own| covers(s, &own.config)),

@@ -27,10 +27,12 @@ layers (lifted), and every turn still gets its reply. In a channel, each post, t
 session's (message_channel), goes to the sessions there with inputs on but its poster. On a board,
 sessions work on tasks as files, and a task's owner hears when it's handed to them or commented on.
 Through the gateway, a request goes upstream as it came, but for this connection's headers, and its
-answer streams back as it comes, the exchange recorded without credentials.
+answer streams back as it comes, the exchange recorded without credentials. A Claude Code session
+(a fake one, fake_claude.py) takes its turns in Claude Code, in its sandbox, through the gateway,
+the page asking before its calls.
 
-The eight parts (the chat, the tool calls, the large contexts, the companion, the lifted memories,
-the channels, the boards, the gateway) run at once, in processes of their own, each with its own mock; the first to fail stops the rest.
+The nine parts (the chat, the tool calls, the large contexts, the companion, the lifted memories,
+the channels, the boards, the gateway, Claude Code) run at once, in processes of their own, each with its own mock; the first to fail stops the rest.
 
     python3 tests/test_app.py [turns]
 """
@@ -1610,6 +1612,102 @@ def gatewayed(tls, ca) -> str:
         mock.shutdown()
 
 
+def clauded(tls, ca) -> str:
+    """A Claude Code session, on a provider whose command runs fake_claude.py, in its sandbox: a turn
+    streams its reply to the page and joins the log, the first starting Claude Code's session and the
+    rest resuming it, Claude Code run with the stream-json flags and the session's model, unable to
+    write outside its workspace, its requests going through the gateway (on the network, though the
+    sandbox has none) (the session named in
+    x-connectome-session) and its cost joining the session's. A call Claude Code asks about waits for
+    the page: allowed, it runs; denied, its result is the denial; always allowed, the next call to its
+    tool doesn't ask, and the tool is the session's to toggle. A stopped turn ends at once, its reply as
+    far as it came in the log. A Claude Code session can't fork, have a companion, or go on without a
+    message."""
+    streamed.set()   # the upstream answers at once: this part has its own process, so the gateway part waits as before
+    port, root, mock_port, work = free_port(), tempfile.mkdtemp(), free_port(), tempfile.mkdtemp()
+    mock = serve(mock_port, tls, Upstream)
+    app = launch(root, port, ca, '--upstream', f'https://localhost:{mock_port}')
+    runs = lambda: [json.loads(line) for line in Path(work, 'claude-runs.jsonl').read_text().splitlines()]
+    log = lambda: [(m['participant'], m['content']) for m in call(port, '/api/s/cc/messages')]
+
+    def refused(path, body):
+        try:
+            call(port, path, body)
+            raise SystemExit(f'{path} took {body}')
+        except urllib.error.HTTPError as error:
+            if error.code != 400:
+                raise
+    try:
+        configure(root, f'https://localhost:{mock_port}', 12000, 2381, 595.25)
+        everything = json.loads(Path(root, 'settings.json').read_text())
+        everything['providers']['code'] = {'base': '', 'key': '', 'models': ['fake'], 'command': [os.path.realpath(sys.executable), str(HERE / 'fake_claude.py')]}
+        everything['sandbox']['rw'] = []   # so the test's temporary directory, beside the workspace, is outside the sandbox
+        everything['sandbox']['network'] = False   # which Claude Code keeps all the same, to reach the gateway
+        Path(root, 'settings.json').write_text(json.dumps(everything))
+        call(port, '/api/sessions', {'name': 'cc', 'workspace': work})
+        call(port, '/api/s/cc/settings', {'provider': 'code', 'model': 'fake', 'sandbox': True})
+        if (said := say(port, 'cc', 'hello')[0]) != 'You said: hello':
+            raise SystemExit(f'Claude Code\'s reply streamed as {said!r}')
+        state = call(port, '/api/s/cc')
+        session, run = state['settings'].get('claude_session'), runs()[0]
+        flags = ['--input-format', 'stream-json', '--output-format', 'stream-json', '--permission-prompt-tool', 'stdio', '--model', 'fake', '--session-id', session,
+                 '--settings', '{"sandbox":{"enabled":false}}', '--setting-sources', '']   # Claude Code's own sandbox off: bubblewrap is the session's
+        if not session or any(run['args'][run['args'].index(flag) + 1] != value for flag, value in zip(flags[::2], flags[1::2])) or '--print' not in run['args']:
+            raise SystemExit(f'Claude Code ran as {run["args"]}, the session keeping {session}')
+        if not run['outside_failed'] or run['gateway'] != 200:
+            raise SystemExit(f'in its sandbox Claude Code wrote outside its workspace ({not run["outside_failed"]}), and the gateway answered {run["gateway"]}')
+        if log() != [('user', [{'type': 'text', 'text': 'hello'}]), ('assistant', [{'type': 'text', 'text': 'You said: hello'}])]:
+            raise SystemExit(f'the log has {log()}')
+        recording = Path(root, '.gateway', session, 'exchanges.jsonl')
+        for _ in range(100):   # the hub writes it once the answer has gone
+            if recording.exists():
+                break
+            time.sleep(0.05)
+        exchange = json.loads(recording.read_text().splitlines()[0])
+        if exchange['headers'].get('x-connectome-session') != 'cc' or state['spent']['total']['cost'] != 0.01:
+            raise SystemExit(f'the gateway recorded {exchange["headers"]}, the session spent {state["spent"]}')
+        asked = len(seen['asked'])
+        if (said := say(port, 'cc', 'call Write')[0]) != 'Calling.It ran.' or seen['asked'][asked:] != ['Write'] or runs()[1]['args'][-2:] != ['--resume', session]:
+            raise SystemExit(f'an allowed call streamed as {said!r}, asked about {seen["asked"][asked:]}, Claude Code run as {runs()[1]["args"]}')
+        call_ = {'type': 'tool_use', 'id': 'toolu_1', 'name': 'Write', 'input': {'file_path': 'x.txt'}}
+        if log()[2:] != [('user', [{'type': 'text', 'text': 'call Write'}]), ('assistant', [{'type': 'text', 'text': 'Calling.'}, call_]),
+                         ('user', [{'type': 'tool_result', 'toolUseId': 'toolu_1', 'content': 'did it'}]), ('assistant', [{'type': 'text', 'text': 'It ran.'}])]:
+            raise SystemExit(f'the allowed call was logged as {log()[2:]}')
+        say(port, 'cc', 'call Write', {'Write': 'deny'})
+        if log()[-2] != ('user', [{'type': 'tool_result', 'toolUseId': 'toolu_1', 'content': "the user didn't allow this call", 'isError': True}]):
+            raise SystemExit(f'the denied call was logged as {log()[-2]}')
+        say(port, 'cc', 'call Edit', {'Edit': 'always'})
+        asked = len(seen['asked'])
+        if say(port, 'cc', 'call Edit')[0] != 'Calling.It ran.' or seen['asked'][asked:] or call(port, '/api/s/cc')['tools'] != ['Edit']:
+            raise SystemExit(f'a call to a tool always allowed asked about {seen["asked"][asked:]}, the tools listed are {call(port, "/api/s/cc")["tools"]}')
+        r, events = following(port, 'cc')
+        with r:
+            next(events)
+            call(port, '/api/s/cc/say', {'text': 'hang'})
+            stopped = time.monotonic()
+            for event in events:
+                if event.get('text') == 'Working':
+                    call(port, '/api/s/cc/stop', {})
+                    stopped = time.monotonic()
+                if 'end' in event:
+                    break
+        if event['end'] != 'Stopped by the user.' or time.monotonic() - stopped > 5 or log()[-1] != ('assistant', [{'type': 'text', 'text': 'Working'}]):
+            raise SystemExit(f'a stopped turn ended {event} after {time.monotonic() - stopped:.1f} s, the log ending {log()[-1]}')
+        refused('/api/s/cc/fork', {'at': 1, 'name': 'cc-fork'})
+        refused('/api/s/cc/companion', {'name': 'pal', 'goal': 'help'})
+        r, events = following(port, 'cc')
+        with r:
+            next(events)
+            call(port, '/api/s/cc/continue', {})
+            ended = next(e for e in events if 'end' in e)['end']
+        if 'goes on from a message' not in (ended or ''):
+            raise SystemExit(f'a Claude Code session went on without a message: {ended}')
+        return f'{len(runs())} Claude Code turns, {len(log())} messages logged'
+    finally:
+        app.terminate()
+        mock.shutdown()
+
+
 def part(name, run, done):
     """A part of the test in a process group of its own, which its apps and their servers join, so
     that killing the group stops them all: (name, its summary or None, why it failed or None, counts)."""
@@ -1636,7 +1734,8 @@ def main(turns=60):
     done, baseline = forked.Queue(), forked.Queue()
     parts = {'chat': lambda: chatted(turns, (cert, key), ca, baseline), 'tools': lambda: tooled((cert, key), ca, baseline), 'large': lambda: streamed_large((cert, key), ca),
              'companion': lambda: accompanied((cert, key), ca), 'lifted': lambda: lifted((cert, key), ca), 'channels': lambda: channeled((cert, key), ca),
-             'boards': lambda: boarded((cert, key), ca), 'gateway': lambda: gatewayed((cert, key), ca)}
+             'boards': lambda: boarded((cert, key), ca), 'gateway': lambda: gatewayed((cert, key), ca),
+             'claude': lambda: clauded((cert, key), ca)}
     running = [forked.Process(target=part, args=(name, run, done)) for name, run in parts.items()]
     summaries, totals, failure = {}, {'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0}, None
     try:
@@ -1661,7 +1760,7 @@ def main(turns=60):
         print(failure)
         return 1
     print(f'{totals["chat"]} chat turns and {totals["memory"]} memory requests; {summaries["chat"]}; {totals["bytes"] // 1024} KB of requests streamed '
-          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}; {summaries["gateway"]}')
+          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}; {summaries["gateway"]}; {summaries["claude"]}')
     return 0
 
 

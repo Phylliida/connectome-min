@@ -18,6 +18,7 @@
 mod api;
 mod boards;
 mod channels;
+mod claude;
 mod companion;
 mod costs;
 mod gateway;
@@ -38,6 +39,7 @@ pub struct App {
     agent: ureq::Agent,
     upstream: String,      // where the gateway forwards requests (gateway.rs)
     mcp: Vec<mcp::Server>, // every session's MCP servers
+    mcp_config: Option<String>, // their config's JSON, which Claude Code sessions are given (claude.rs)
     bash: bool,            // whether a session with a workspace has bash
     limit: Duration,       // a tool call's time
     hub: Sender<hub::Routed>,
@@ -76,15 +78,15 @@ fn main() {
     let root = PathBuf::from(arg("--root", "sessions"));
     std::fs::create_dir_all(&root).expect("--root");
     let limit = Duration::from_secs_f64(arg("--tool-timeout", "600").parse().expect("--tool-timeout"));
-    let mcp = std::fs::read(arg("--mcp", &root.join("mcp.json").to_string_lossy())).ok();
-    let mcp = mcp.map_or_else(Vec::new, |config| mcp::servers(&json::parse(&config).expect("--mcp: JSON"), limit));
+    let mcp_config = std::fs::read_to_string(arg("--mcp", &root.join("mcp.json").to_string_lossy())).ok();
+    let mcp = mcp_config.as_ref().map_or_else(Vec::new, |config| mcp::servers(&json::parse(config.as_bytes()).expect("--mcp: JSON"), limit));
     let (told, inbox) = channel();
     let (addr, agent) = (arg("--addr", "127.0.0.1:8080"), llm::agent(ca.as_deref()).expect("--ca"));
     let upstream = arg("--upstream", "https://api.anthropic.com");
     if !ureq::http::Uri::try_from(&upstream).is_ok_and(|u| u.scheme().is_some() && u.host().is_some()) {
         panic!("--upstream {upstream}: not a URL like https://api.anthropic.com");
     }
-    let app: &'static App = Box::leak(Box::new(App { root, addr, agent, upstream, mcp, bash: !flag("--no-bash"), limit, hub: told }));
+    let app: &'static App = Box::leak(Box::new(App { root, addr, agent, upstream, mcp, mcp_config, bash: !flag("--no-bash"), limit, hub: told }));
     if !app.settings_path().exists() {
         settings::write(&app.settings_path(), &Settings::first()).expect("settings.json");
     }

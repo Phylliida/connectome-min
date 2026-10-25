@@ -2,7 +2,7 @@
 //! only this user can read, since settings.json holds the keys. README.md describes their fields:
 //! ROOT/settings.json is a Settings, each session's ROOT/NAME/session_settings.json a SessionSettings.
 
-use connectome::{config::Config, json::Value, obj};
+use connectome::{config::Config, json::{sparse, Value}, obj};
 use itertools::Itertools;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use smart_default::SmartDefault;
@@ -24,14 +24,14 @@ impl Settings {
     pub fn first() -> Settings {
         let (defaults, base) = (SessionSettings::default(), "https://api.anthropic.com".into());
         let config = Config { summary_participant: "assistant".into(), recent_window_tokens: 20000.0, target_chunk_tokens: 3000.0, min_merge_memories: 3, compression_max_tokens: Some(20000.0), ..Config::default() };
-        let providers = BTreeMap::from([("default".into(), Provider { base, key: String::new(), models: vec![defaults.model.clone()] })]);
+        let providers = BTreeMap::from([("default".into(), Provider { base, key: String::new(), models: vec![defaults.model.clone()], command: None })]);
         let defaults = SessionSettings { fold_above: Some(90000.0), fold_to: Some(65000.0), config, ..defaults };
         Settings { providers, defaults, sandbox: Sandbox::default(), search: None }
     }
 
     /// The providers as the page sees them: never a key, only whether there is one.
     pub fn providers(&self) -> Value {
-        let shown = self.providers.iter().map(|(name, p)| obj! {"name" => name.as_str(), "base" => p.base.as_str(), "key" => !p.key.is_empty(), "models" => p.models.clone()});
+        let shown = self.providers.iter().map(|(name, p)| sparse(obj! {"name" => name.as_str(), "base" => p.base.as_str(), "key" => !p.key.is_empty(), "models" => p.models.clone(), "command" => p.command.clone()}));
         obj! {"providers" => shown.collect::<Vec<_>>()}
     }
 
@@ -53,7 +53,7 @@ impl Settings {
             let listed = models.as_array().ok_or("a provider's models, a list")?.iter().filter_map(Value::as_str).map(str::trim);
             p.models = listed.filter(|m| !m.is_empty()).unique().map(String::from).collect();
         }
-        if p.base.is_empty() { Err("a provider's base URL".into()) } else { Ok(()) }
+        if p.base.is_empty() && p.command.is_none() { Err("a provider's base URL".into()) } else { Ok(()) }
     }
 }
 
@@ -62,6 +62,9 @@ pub struct Provider {
     pub base: String, // e.g. https://api.anthropic.com
     pub key: String,
     #[serde(default)] pub models: Vec<String>, // what the page offers a session on it
+    // a Claude Code provider: how to run Claude Code, say ["claude"]; its sessions take their turns in
+    // it (claude.rs), and `base` and `key` go unused
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub command: Option<Vec<String>>,
 }
 
 /// What a sandboxed command sees besides its workspace: the paths in `ro` that exist, read-only, and
@@ -94,6 +97,7 @@ pub struct SessionSettings {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub auto: bool,               // each turn's end goes to the other
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")] pub channels: BTreeMap<String, Membership>, // the channels it's in, by name (channels.rs)
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")] pub boards: BTreeSet<String>,  // the boards it's on (boards.rs), which take a workspace, and not being a companion
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub claude_session: Option<String>, // on a Claude Code provider, the session Claude Code keeps, once started (claude.rs)
 }
 
 /// A session's place in a channel (channels.rs): whether it hears the channel's posts (`inputs`), and

@@ -8,9 +8,9 @@
 //! the partner (companion.rs), then memories form; they form between steps too. After a step that ran
 //! tools, the hub looks at the boards the session is on again (boards.rs). The thread tells the
 //! hub what the pages following the job see (Msg). The user can stop a turn: it ends where it is
-//! (Worker::stopped).
+//! (Worker::stopped). A Claude Code session's turn is Claude Code's instead (claude.rs).
 
-use crate::{api::brief, boards, channels, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
+use crate::{api::brief, boards, channels, claude, companion::{self, Heard, How}, costs::{self, For}, hub::{Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, store::Session};
 use std::{cell::{Cell, RefCell}, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
@@ -19,7 +19,7 @@ use std::{cell::{Cell, RefCell}, collections::VecDeque, panic::{catch_unwind, As
 fn said(who: &str, text: String) -> Value { obj! {"participant" => who, "content" => vec![obj! {"type" => "text", "text" => text}]} }
 
 /// How long a call waits for the user's answer before it's denied.
-const APPROVAL_WAIT: Duration = Duration::from_secs(600);
+pub const APPROVAL_WAIT: Duration = Duration::from_secs(600);
 
 /// A denied call's result.
 pub const DENIED: &str = "the user didn't allow this call";
@@ -154,10 +154,10 @@ pub fn work(app: &App, name: &str, jobs: Receiver<(u64, Job)>) {
 /// A job in a session, as it reads the session's files again; where it hears that the user has
 /// stopped its turn (the hub holds the other end while the turn runs, and lets go of it to stop it);
 /// and the session's jobs, from which a turn takes what the partner tells it, the rest left for later.
-struct Worker<'a> {
-    app: &'a App,
-    name: &'a str,
-    s: Session,
+pub struct Worker<'a> {
+    pub app: &'a App,
+    pub name: &'a str,
+    pub s: Session,
     halt: Receiver<()>,
     jobs: &'a Receiver<(u64, Job)>,
     taken: &'a Cell<u64>, // how many jobs the thread has taken from `jobs`
@@ -165,18 +165,18 @@ struct Worker<'a> {
 }
 
 impl Worker<'_> {
-    fn tell(&self, msg: Msg) { self.app.tell(self.name, msg) }
+    pub fn tell(&self, msg: Msg) { self.app.tell(self.name, msg) }
 
     /// An event for the pages following the job.
-    fn event(&self, event: Event) { self.tell(Msg::Event(event)) }
+    pub fn event(&self, event: Event) { self.tell(Msg::Event(event)) }
 
     /// The pages told that the log has grown, and to what length.
-    fn logged(&self) { self.tell(Msg::Logged(self.s.count("messages"))) }
+    pub fn logged(&self) { self.tell(Msg::Logged(self.s.count("messages"))) }
 
     /// Whether the user has stopped the turn: then a reply streaming in stops where it is (and joins
     /// the log so), a call not yet run doesn't run (STOPPED is its result), one running ends (its
     /// tool's run hears so), a memory forming is dropped, and no step comes after.
-    fn stopped(&self) -> bool { self.halt.try_recv() == Err(TryRecvError::Disconnected) }
+    pub fn stopped(&self) -> bool { self.halt.try_recv() == Err(TryRecvError::Disconnected) }
 
     /// Job `id`; `stop` the hub holds while its turn runs.
     fn run(&self, id: u64, job: Job, stop: Sender<()>) {
@@ -204,7 +204,9 @@ impl Worker<'_> {
         let auto = self.app.ask_session(self.name, Msg::Ended);
         self.event(Event::End(ended.clone().err()));
         self.hand_over(start, ended, auto);
-        if let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup); }
+        // a Claude Code session forms no memories yet: its provider makes no requests of its own to write them
+        let in_claude = claude::command(self.app, self.name).ok().flatten().is_some();
+        if !in_claude && let Ok(setup) = Setup::new(self.app, self.name) { self.form(&setup); }
     }
 
     /// A chat turn: the log mended if the server stopped in a step (mend), its message joins the log,
@@ -215,6 +217,12 @@ impl Worker<'_> {
     /// prefill).
     fn turn(&self, said: Option<Value>) -> Result<(), String> {
         self.mend()?;
+        if let Some(command) = claude::command(self.app, self.name)? {
+            let said = said.ok_or(claude::NO_CONTINUE)?;
+            append(&self.s, &said, &self.app.profile(self.name)?.config);
+            self.logged();
+            return self.claude_turn(&command, &said);
+        }
         if let Some(said) = said {
             append(&self.s, &said, &self.app.profile(self.name)?.config);
         }

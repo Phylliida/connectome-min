@@ -76,7 +76,7 @@ pub fn spend(s: &Session, what: For, used: Usage) -> Option<Spent> {
     let mut total = costs(s).next().map(|c| c.total).unwrap_or_default();
     total.entry(what).and_modify(|t| *t = *t + used).or_insert(used);
     let reply = what == For::Reply;
-    let (message, compile) = (reply.then(|| s.count("messages")), reply.then(|| s.count("compiles").saturating_sub(1)));
+    let (message, compile) = (reply.then(|| s.count("messages")), reply.then(|| s.count("compiles").checked_sub(1)).flatten());
     let cost = Cost { what, message, compile, used, total };
     s.append("costs", serde_json::to_value(&cost).expect("a cost is JSON"));
     Spent::of(cost.total)

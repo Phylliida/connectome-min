@@ -269,6 +269,32 @@ arrives, with its status and headers. Each exchange joins
 gateway changes any of them. A record holds the whole request, which for Claude Code is the whole
 conversation so far, so a long session's recording grows fast.
 
+Claude Code sessions (`app/src/claude.rs`) take their turns in Claude Code: a provider in
+settings.json with a `command`, how to run Claude Code (`["claude"]`, or whatever runs it here, say
+a loader and the binary on NixOS), makes every session on it one, its `models` what Claude Code's
+`--model` takes (`opus`, `sonnet`, `haiku` or full names); `base` and `key` go unused, so there's
+nothing more to install than Claude Code itself. Each turn runs the command headless in the
+session's workspace, speaking JSON lines on its stdin and stdout as the Agent SDK does
+(`--print --input-format stream-json --output-format stream-json`, its control requests asking
+before a tool runs), with the session's model and its system prompt appended to Claude Code's
+(`--append-system-prompt`, boards' note included), the MCP servers of `mcp.json` and no others
+(`--strict-mcp-config`), none of the user's Claude Code settings files (`--setting-sources ""`),
+and Claude Code's own sandbox off. Its requests go through the gateway (ANTHROPIC_BASE_URL), headed
+`x-connectome-session: NAME`. In the session's sandbox, bubblewrap wraps all of Claude Code, as it
+does bash, with the same paths, besides Claude Code's own: its command's absolute paths, read-only,
+and `~/.claude` and `~/.claude.json`, read-write; and with the network even when the sandbox has
+none, since the gateway is reached on it, so the commands Claude Code runs have it too. Its reply
+streams to the page and joins the log block by block as Claude Code finishes each, its calls'
+results as they come; a call Claude Code asks about shows on its card in the page with Allow,
+Always allow and Deny, as any session's (Claude Code runs read-only ones without asking), and the
+tools the session always allows are its chips. Claude Code keeps the conversation, in a session
+of its own that the first turn starts (`claude_session` in the session's settings, once Claude
+Code has started it) and later turns resume. A turn's cost, as Claude Code's result counts it,
+joins the session's costs. Stop kills Claude Code and what it started, the reply joining the log as
+far as it came. What a channel or a board tells a Claude Code session takes a turn of its own
+rather than joining one running. Not yet: forks, a companion, Continue without a message, and
+memories (the gateway forwards the requests unchanged).
+
 Flags: `--root DIR` (sessions and settings; `sessions` by default), `--addr` (`127.0.0.1:8080`),
 `--ca PEM` (root certificates to trust instead of Mozilla's: a company proxy's, a test server's),
 `--mcp FILE`, `--tool-timeout SECONDS`, `--no-bash`, `--upstream URL` (where the gateway sends
@@ -281,7 +307,7 @@ Tests:
 ```sh
 cargo test                  # unit tests of the JavaScript and Python arithmetic the ports share
 python3 tests/test_rust.py  # every compile, request and file record the same as reimplclean2's, handoffs both ways, the planner
-python3 tests/test_app.py   # the app against mock APIs over HTTPS, its parts at once: chat, memories, forks, settings, certificates, bash, its sandbox, approvals, timeouts and tools through fake MCP servers, flat memory, the gateway
+python3 tests/test_app.py   # the app against mock APIs over HTTPS, its parts at once: chat, memories, forks, settings, certificates, bash, its sandbox, approvals, timeouts and tools through fake MCP servers, flat memory, the gateway, Claude Code sessions through a fake of it (fake_claude.py)
 python3 tests/mutants.py tests/test_app.py app/src/work.rs=mutants.json   # mutation testing, each mutant in a copy of its own, many at once
 ```
 

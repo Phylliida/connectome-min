@@ -161,10 +161,10 @@ fn retried<T>(mut attempt: impl FnMut() -> Result<T, Failed>, stopped: &dyn Fn()
 #[serde(rename_all = "lowercase")]
 pub enum Piece { Thinking(String), Text(String), Calling(String), Input(String) }
 
-/// The server-sent events that build a reply; any other passes.
+/// The server-sent events that build a reply; any other passes. Claude Code passes them on too (claude.rs).
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum Streamed {
+pub enum Streamed {
     MessageStart { message: Started },
     ContentBlockStart { content_block: Content },
     ContentBlockDelta { delta: Delta },
@@ -175,17 +175,17 @@ enum Streamed {
 }
 
 #[derive(Deserialize)]
-struct Started { #[serde(default)] usage: Counted }
+pub struct Started { #[serde(default)] usage: Counted }
 
 #[derive(Deserialize)]
-struct Stopped { stop_reason: Option<String> }
+pub struct Stopped { stop_reason: Option<String> }
 
 #[derive(Deserialize)]
-struct Failure { #[serde(rename = "type", default)] kind: String, #[serde(default)] message: String }
+pub struct Failure { #[serde(rename = "type", default)] kind: String, #[serde(default)] message: String }
 
 /// The tokens and dollars an event reports; any of them may be missing.
 #[derive(Deserialize, Default)]
-struct Counted {
+pub struct Counted {
     input_tokens: Option<f64>,
     cache_read_input_tokens: Option<f64>,
     cache_creation_input_tokens: Option<f64>,
@@ -196,7 +196,7 @@ struct Counted {
 /// A content block as its events build it: started, then extended by deltas of its kind.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum Content {
+pub enum Content {
     Text { text: String },
     Thinking { thinking: String, signature: Option<String> },
     RedactedThinking { data: Value },
@@ -206,7 +206,7 @@ enum Content {
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
-enum Delta {
+pub enum Delta {
     #[serde(rename = "text_delta")] Text { text: String },
     #[serde(rename = "thinking_delta")] Thinking { thinking: String },
     #[serde(rename = "signature_delta")] Signature { signature: String },
