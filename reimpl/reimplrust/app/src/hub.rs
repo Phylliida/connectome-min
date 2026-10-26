@@ -4,7 +4,7 @@
 //! time one is told something), each session's pages and what they hear (Live), and the pages
 //! following each channel.
 
-use crate::{api::Shown, boards, channels::{self, Post, Posted}, companion::Heard, costs::{Fold, Spent}, llm::Piece, settings::{self, SessionSettings, Settings}, work::{work, DENIED, STOPPED}, App};
+use crate::{api::Shown, boards, claude::Limits, channels::{self, Post, Posted}, companion::Heard, costs::{Fold, Spent}, llm::Piece, settings::{self, SessionSettings, Settings}, work::{work, DENIED, STOPPED}, App};
 use connectome::json::Value;
 use serde::Serialize;
 use std::{collections::{HashMap, VecDeque}, sync::mpsc::{channel, Receiver, SendError, Sender}};
@@ -131,6 +131,8 @@ pub enum Event {
     Spent(Spent),
     /// The reply's prompt in tokens, as its provider counted it.
     Prompt(f64),
+    /// The plan's limits, as a run of Claude Code has just said them (claude.rs).
+    Limits(Limits),
     /// A call waits for the user's answer whether it may run.
     Approve(Asking),
     /// A page has answered whether the call with this id may run.

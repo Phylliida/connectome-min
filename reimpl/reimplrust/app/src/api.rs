@@ -4,7 +4,7 @@
 //! carry an x-connectome header (another site's page can't send one without a CORS preflight, which
 //! this server never approves), since a POST can change where the key goes.
 
-use crate::{boards, channels::{self, Post}, claude, companion, costs::{self, Compile, Fold, Spent}, gateway, hub::{Event, Job, Msg, Queued, Routed}, settings::{self, SessionSettings}, work::Setup, App};
+use crate::{boards, channels::{self, Post}, claude::{self, Limits}, companion, costs::{self, Compile, Fold, Spent}, gateway, hub::{Event, Job, Msg, Queued, Routed}, settings::{self, SessionSettings}, work::Setup, App};
 use connectome::{config::Config, json::{self, sparse, Json, Value}, memory::Recorded, obj, planner::chunks, store::Session};
 use serde::{Serialize, Serializer};
 use std::{collections::{BTreeSet, HashMap}, net::TcpStream, path::Path, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
@@ -264,6 +264,7 @@ struct State<'a> {
     queued: Vec<Queued>,
     spent: Option<Spent>,
     prompt: Option<f64>,
+    limits: Option<Limits>,
     settings: Option<SessionSettings>,
     tools: Vec<String>,
     overhead: f64,
@@ -283,6 +284,7 @@ fn state(app: &App, name: &str, s: &Session) -> Value {
         queued,
         spent: costs::spent(s),
         prompt: costs::prompted(s),
+        limits: costs::limits(s),
         settings: app.profile(name).ok(),
         // Claude Code's tools are its own, which it asks about as it calls them: those the session always allows
         tools: match (claude::command(app, name), app.profile(name)) {

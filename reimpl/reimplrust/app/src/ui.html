@@ -1080,6 +1080,13 @@ function Change({ edit: { path = '', old = '', new: text = '' }, result }) {
 }
 
 const tokens = (n) => new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(n);
+// a time, in seconds since 1970, from now: "in 2h 14m", "in 3d 19h"; and one before now: "3 min ago"
+const until = (at) => {
+  const minutes = Math.round(Math.max(0, at - Date.now() / 1000) / 60), [d, h, m] = [Math.floor(minutes / 1440), Math.floor(minutes / 60) % 24, minutes % 60];
+  return minutes < 1 ? 'now' : 'in ' + (d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`);
+};
+const ago = (at) => { const minutes = Math.round((Date.now() / 1000 - at) / 60); return minutes < 1 ? 'just now' : minutes < 120 ? `${minutes} min ago` : `${Math.round(minutes / 60)} h ago`; };
+setInterval(() => state?.limits && draw(), 30000);   // the limits' countdowns go on between events
 // what requests cost, in dollars, if their provider said
 const dollars = (used) => !used ? 'none yet' : used.cost == null ? 'not reported' : '$' + used.cost.toFixed(used.cost < 1 ? 4 : 2);
 
@@ -1095,6 +1102,12 @@ function Stats() {
   return html`<div id="stats">
     ${stat('Last context', `${Math.round(used).toLocaleString()} / ${window.toLocaleString()} tokens${s.prompt == null ? ' (estimated)' : ''}`, s.prompt == null ? 'The last compile\'s estimate' : 'The last request\'s prompt, as the provider counted it')}
     <div class="bar"><div style="width:${Math.min(100, 100 * used / window)}%"></div></div>
+    ${s.limits && [['5-hour limit', s.limits.five_hour], ['7-day limit', s.limits.seven_day]].filter(([, w]) => w).map(([label, w]) => {
+      // a window that has reset since Claude Code said it starts again: what it said is past
+      const [pct, reset] = [Math.round(100 * w.utilization), w.resetsAt * 1000 <= Date.now()];
+      return [stat(label, reset ? `reset since (was ${pct}%)` : `${pct}% used, resets ${until(w.resetsAt)}`, `The plan's, as Claude Code said ${ago(s.limits.at)}`),
+        html`<div class="bar"><div style="width:${reset ? 0 : Math.min(100, pct)}%"></div></div>`];
+    })}
     ${stat('Messages', s.messages)}
     ${stat('Chunks · memories', `${s.layers[0] || 0} · ${s.layers.slice(1).join(' / ') || 0}`)}
     ${stat('Cost of replies', dollars(s.spent?.reply))}
@@ -1564,6 +1577,7 @@ async function follow(name, signal) {
       if (!queued.some((q) => q.id === page.editing)) page.editing = null;   // it went to the model while being edited
     },
     prompt: (prompt) => { state.prompt = prompt; },
+    limits: (limits) => { if (state) state.limits = limits; },
   };
   // what happens in a turn
   const turned = {

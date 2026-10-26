@@ -311,7 +311,11 @@ results in brackets, reasoning left out. Its cost joins the session's, for memor
 Claude Code's calls by what they do: an Edit as a diff, colored in its file's language, as it draws
 edit's, a Write as a new file's, all of it put in, and Bash, Read, Grep, Glob, WebSearch, WebFetch and
 Agent by their command, path, pattern, query, address or task; and the session's sandbox switch
-says it holds Claude Code. Not yet: what
+says it holds Claude Code. On a plan, Claude Code says the plan's limits as each run starts (a
+`rate_limit_event`): the session's panel shows how much of the 5-hour and the 7-day windows is used,
+each with a bar, and the time until it resets, counting down, as the session's last run said them
+(kept in its costs record, `limits`, so they're there after a restart; a window past its reset says
+so). Not yet: what
 Claude Code sees is still its own conversation (the gateway forwards its requests unchanged), forks,
 a companion, and Continue without a message.
 

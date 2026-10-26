@@ -17,6 +17,8 @@ step it's on (a call's result), or as a turn of its own once the turn's reply is
 Run with --no-session-persistence, as a memory's run is, it writes what it was run with and told
 (its arguments, CLAUDE_CODE_MAX_OUTPUT_TOKENS, the transcript) into claude-memories.jsonl instead, and
 answers with a memory (and reasoning, which isn't the memory's): how many parts the user said in it.
+Each run says the plan's limits as it starts (a rate_limit_event): 26% of the 5-hour window, 7% of the
+7-day one.
 
 Each request's prompt is 1000 tokens, 1200 after a call's result, while the result's tokens sum the
 turn's (as Claude Code's do), here always 15 in. Each run first writes into its working directory's claude-runs.jsonl what it was run with (its
@@ -89,6 +91,9 @@ def outside():
         return True
 
 
+LIMITS = {'status': 'allowed', 'unifiedWindows': {'five_hour': {'utilization': 0.26, 'resetsAt': 1792970400}, 'seven_day': {'utilization': 0.07, 'resetsAt': 1793300400}}}
+
+
 def start(prompt):
     """A request starts, its prompt `prompt` tokens (most of them read from the cache): its reply's id."""
     global reply_id
@@ -111,6 +116,7 @@ if remembering:
     initialize = inbox.get()
     say({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': initialize['request_id'], 'response': {}}})
     transcript = inbox.get()['message']['content'][0]['text']
+    say({'type': 'rate_limit_event', 'rate_limit_info': LIMITS, 'session_id': session})
     with open('claude-memories.jsonl', 'a') as runs:
         runs.write(json.dumps({'args': args, 'max_tokens': os.environ.get('CLAUDE_CODE_MAX_OUTPUT_TOKENS'), 'transcript': transcript}) + '\n')
     memory = f'I remember {transcript.count(chr(10) + "[user]")} parts the user said.'
@@ -129,6 +135,7 @@ say({'type': 'system', 'subtype': 'init', 'session_id': session, 'claude_code_ve
 while (message := waiting.pop(0) if waiting else inbox.get()) is not None:
     waiting.insert(0, message)
     text = take_in()[0]
+    say({'type': 'rate_limit_event', 'rate_limit_info': LIMITS, 'session_id': session})
     start(1000)
     if text.startswith('call '):
         tool = text.split()[1]

@@ -37,7 +37,7 @@ impl Host for Remembering<'_, '_> {
         let asked = obj! {"content" => vec![obj! {"type" => "text", "text" => transcript(request, reader)}]};
         let initialize = obj! {"type" => "control_request", "request_id" => "initialize", "request" => obj! {"subtype" => "initialize"}};
         let told = claude.send(&initialize).and_then(|()| claude.send(&told_line(&asked)));
-        let mut written = vec![];
+        let (mut written, mut limits) = (vec![], None);
         let reply = match told { Err(e) => Err(format!("telling Claude Code what to remember: {e}")), Ok(()) => loop {
             if self.worker.stopped() { break Err(INTERRUPTED.into()) }
             let line = match claude.lines.recv_timeout(POLL) {
@@ -54,10 +54,14 @@ impl Host for Remembering<'_, '_> {
                     let refused = obj! {"type" => "control_response", "response" => obj! {"subtype" => "error", "request_id" => request_id, "error" => "a memory's run answers no requests"}};
                     if let Err(e) = claude.send(&refused) { break Err(format!("answering Claude Code: {e}")) }
                 }
+                Ok(Said::RateLimitEvent { rate_limit_info }) => {
+                    limits = rate_limit_info.heard();
+                    if let Some(heard) = &limits { self.worker.event(Event::Limits(heard.clone())) }
+                }
                 Ok(Said::Result { subtype, is_error, result, stop_reason, total_cost_usd, usage }) => {
                     let prompts = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
                     let used = Usage { cost: total_cost_usd, input: prompts, cached: usage.cache_read_input_tokens, output: usage.output_tokens };
-                    if let Some(spent) = costs::spend(&self.worker.s, For::Memories, used, None) { self.worker.event(Event::Spent(spent)) }
+                    if let Some(spent) = costs::spend(&self.worker.s, For::Memories, used, None, limits.take()) { self.worker.event(Event::Spent(spent)) }
                     if is_error { break Err(result.unwrap_or(subtype)) }
                     let stop = stop_reason.unwrap_or_else(|| "end_turn".into());
                     break Ok(obj! {"stopReason" => stop.as_str(), "content" => std::mem::take(&mut written), "usage" => obj! {"inputTokens" => prompts, "outputTokens" => usage.output_tokens}});

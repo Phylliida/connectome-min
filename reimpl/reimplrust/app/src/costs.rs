@@ -4,7 +4,7 @@
 //! after it, and the page shows how the context folded between replies (Fold). A record the app can't
 //! read (a hand edit) is passed over.
 
-use crate::llm::Usage;
+use crate::{claude::Limits, llm::Usage};
 use connectome::{js::py_round, store::Session};
 use itertools::Itertools;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -18,13 +18,15 @@ pub enum For { Reply, Memories }
 /// A record of the costs log: what requests `used`, and the session's running totals by what they
 /// were for; a reply's also says which message it is and which compile its request was built from,
 /// and, for a reply that took several requests (a Claude Code turn's, whose `used` sums them), the
-/// last one's prompt, the context it ended with.
+/// last one's prompt, the context it ended with; and, from a run of Claude Code on a plan, the plan's
+/// limits as it said them.
 #[derive(Serialize, Deserialize)]
 struct Cost {
     #[serde(rename = "for")] what: For,
     #[serde(default, skip_serializing_if = "Option::is_none")] message: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")] compile: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")] prompt: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] limits: Option<Limits>,
     used: Usage,
     total: BTreeMap<For, Usage>,
 }
@@ -73,15 +75,15 @@ fn replies(s: &Session) -> impl Iterator<Item = Cost> + '_ {
 }
 
 /// What requests `used` for `what` joins the costs log, if they used anything, with the running
-/// totals and, for a reply of several requests, the last one's `prompt`; and the totals as the page
-/// shows them.
-pub fn spend(s: &Session, what: For, used: Usage, prompt: Option<f64>) -> Option<Spent> {
+/// totals, for a reply of several requests the last one's `prompt`, and the plan's `limits` Claude Code
+/// said; and the totals as the page shows them.
+pub fn spend(s: &Session, what: For, used: Usage, prompt: Option<f64>, limits: Option<Limits>) -> Option<Spent> {
     if used.input + used.output == 0.0 { return None }
     let mut total = costs(s).next().map(|c| c.total).unwrap_or_default();
     total.entry(what).and_modify(|t| *t = *t + used).or_insert(used);
     let reply = what == For::Reply;
     let (message, compile) = (reply.then(|| s.count("messages")), reply.then(|| s.count("compiles").checked_sub(1)).flatten());
-    let cost = Cost { what, message, compile, prompt, used, total };
+    let cost = Cost { what, message, compile, prompt, limits, used, total };
     s.append("costs", serde_json::to_value(&cost).expect("a cost is JSON"));
     Spent::of(cost.total)
 }
@@ -89,6 +91,11 @@ pub fn spend(s: &Session, what: For, used: Usage, prompt: Option<f64>) -> Option
 /// What the session's requests have used; None before any.
 pub fn spent(s: &Session) -> Option<Spent> {
     Spent::of(costs(s).next()?.total)
+}
+
+/// The plan's limits as the session's last run of Claude Code said them; None without any.
+pub fn limits(s: &Session) -> Option<Limits> {
+    costs(s).next()?.limits
 }
 
 /// The last reply's prompt in tokens, as its provider counted it (its last request's); None before any.

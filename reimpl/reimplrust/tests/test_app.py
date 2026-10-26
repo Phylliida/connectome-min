@@ -1622,7 +1622,7 @@ def clauded(tls, ca) -> str:
     rest resuming it, Claude Code run with the stream-json flags and the session's model, unable to
     write outside its workspace, its requests going through the gateway (on the network, though the
     sandbox has none) (the session named in
-    x-connectome-session) and its cost joining the session's. A call Claude Code asks about waits for
+    x-connectome-session) and its cost joining the session's, with the plan's limits it said. A call Claude Code asks about waits for
     the page: allowed, it runs; denied, its result is the denial; always allowed, the next call to its
     tool doesn't ask, and the tool is the session's to toggle. A call one of Claude Code's subagents makes
     is asked about whole (its tool, input and subagent), since the log, which has only Claude Code's
@@ -1677,6 +1677,9 @@ def clauded(tls, ca) -> str:
                 break
             time.sleep(0.05)
         exchange = json.loads(recording.read_text().splitlines()[0])
+        limits = state.get('limits') or {}
+        if (limits.get('five_hour'), limits.get('seven_day')) != ({'utilization': 0.26, 'resetsAt': 1792970400}, {'utilization': 0.07, 'resetsAt': 1793300400}) or not limits.get('at'):
+            raise SystemExit(f'the plan\'s limits, as Claude Code said them, show as {limits}')
         if exchange['headers'].get('x-connectome-session') != 'cc' or state['spent']['total']['cost'] != 0.01:
             raise SystemExit(f'the gateway recorded {exchange["headers"]}, the session spent {state["spent"]}')
         asked = len(seen['asked'])

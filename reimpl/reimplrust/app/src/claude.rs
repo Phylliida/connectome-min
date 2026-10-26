@@ -27,7 +27,7 @@
 
 use crate::{api::brief, boards, companion::Heard, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Content, Delta, Piece, Streamed, Usage}, settings::Sandbox, tools::{bash, POLL}, work::{said, Worker, APPROVAL_WAIT, DENIED, STOPPED}, App};
 use connectome::{drive::append, json::{self, sparse, Json, Value}, obj};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, hash::{BuildHasher, Hasher}, io::{BufRead, BufReader, Read, Write}, path::Path, process::{Child, ChildStdin, Command, Stdio}, sync::mpsc::{channel, Receiver, RecvTimeoutError}, time::Duration};
 use wait_timeout::ChildExt;
 
@@ -66,8 +66,30 @@ pub enum Said {
     Assistant { message: Message, parent_tool_use_id: Option<String> },
     User { message: Message, parent_tool_use_id: Option<String>, #[serde(default, rename = "isReplay")] is_replay: bool },
     ControlRequest { request_id: String, request: Value },
+    RateLimitEvent { rate_limit_info: RateLimitInfo },
     Result { #[serde(default)] subtype: String, #[serde(default)] is_error: bool, result: Option<String>, stop_reason: Option<String>, total_cost_usd: Option<f64>, #[serde(default)] usage: Used },
     #[serde(other)] Other,
+}
+
+/// What Claude Code says of the plan's limits as a run starts; its windows, if it's on a plan.
+#[derive(Deserialize)]
+pub struct RateLimitInfo { #[serde(rename = "unifiedWindows")] pub unified_windows: Option<Limits> }
+
+/// The plan's limits as Claude Code last said them: how much of the 5-hour and the 7-day windows is
+/// used, and when each resets; and when it said so (`at`), each in seconds since 1970.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Limits { pub five_hour: Option<Window>, pub seven_day: Option<Window>, #[serde(default)] pub at: u64 }
+
+/// A window of the plan's limits: the share of it used (0 to 1), and when it resets.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Window { pub utilization: f64, #[serde(rename = "resetsAt")] pub resets_at: u64 }
+
+impl RateLimitInfo {
+    /// The limits it says, heard now.
+    pub fn heard(self) -> Option<Limits> {
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        self.unified_windows.map(|limits| Limits { at, ..limits })
+    }
 }
 
 /// An API message as Claude Code passes it on: an assistant's holds one block (its content), each
@@ -125,6 +147,7 @@ impl Worker<'_> {
         let mut version = String::new();
         let mut reply = Reply::default();
         let mut last_prompt = None; // the latest request's prompt
+        let mut limits = None; // the plan's, as Claude Code said them
         let ended = match started { Err(e) => Err(format!("telling Claude Code what was said: {e}")), Ok(()) => 'turn: loop {
             if self.stopped() { break Err(STOPPED.into()) }
             // what's said meanwhile goes to Claude Code as it comes; a fork, or a turn that continues
@@ -226,11 +249,15 @@ impl Worker<'_> {
                         break Err(format!("answering Claude Code: {e}"));
                     }
                 }
+                Said::RateLimitEvent { rate_limit_info } => {
+                    limits = rate_limit_info.heard();
+                    if let Some(heard) = &limits { self.event(Event::Limits(heard.clone())) }
+                }
                 Said::Result { subtype, is_error, result, total_cost_usd, usage, .. } => {
                     self.log_reply(&mut reply);
                     let prompts = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
                     let used = Usage { cost: total_cost_usd, input: prompts, cached: usage.cache_read_input_tokens, output: usage.output_tokens };
-                    if let Some(spent) = costs::spend(&self.s, For::Reply, used, last_prompt) { self.event(Event::Spent(spent)) }
+                    if let Some(spent) = costs::spend(&self.s, For::Reply, used, last_prompt, limits.clone()) { self.event(Event::Spent(spent)) }
                     if is_error { break Err(result.unwrap_or(subtype)) }
                     // what Claude Code was told after its reply ends it takes in next, as a turn of its own in the same run
                     if told.iter().all(|t| t.logged) { break Ok(()) }
