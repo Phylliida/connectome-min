@@ -25,7 +25,7 @@
 //! resuming that session. After a turn, memories form, each written by a run of Claude Code of its
 //! own (claude_memory.rs).
 
-use crate::{api::brief, boards, companion::Heard, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Content, Delta, Piece, Streamed, Usage}, settings::Sandbox, tools::{bash, POLL}, work::{said, Worker, APPROVAL_WAIT, DENIED, STOPPED}, App};
+use crate::{api::brief, boards, companion::Heard, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Content, Delta, Piece, Streamed, Usage}, settings::Sandbox, tools::{ask, bash, POLL}, work::{said, Worker, APPROVAL_WAIT, DENIED, STOPPED}, App};
 use connectome::{drive::append, json::{self, sparse, Json, Value}, obj};
 use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, hash::{BuildHasher, Hasher}, io::{BufRead, BufReader, Read, Write}, path::Path, process::{Child, ChildStdin, Command, Stdio}, sync::mpsc::{channel, Receiver, RecvTimeoutError}, time::Duration};
@@ -34,9 +34,6 @@ use wait_timeout::ChildExt;
 /// Claude Code's tool that asks the user questions: the page shows them, and the call runs with the
 /// user's answers in its input ({answers, annotations}, keyed by question), as an Agent SDK host gives them.
 const QUESTIONS: &str = "AskUserQuestion";
-
-/// What Claude Code hears when the user declines to answer its questions.
-const DECLINED: &str = "The user declined to answer the questions.";
 
 /// Why a Claude Code session can't go on without a message: Claude Code takes a turn from one.
 pub const NO_CONTINUE: &str = "a Claude Code session goes on from a message: say what it should do";
@@ -140,6 +137,9 @@ impl Worker<'_> {
             args.extend(["--mcp-config".into(), mcp.clone()]);
         }
         args.extend(["--model".into(), own.model.clone()]);
+        if !own.questions { // the session's questions are off: Claude Code has no tool to ask them
+            args.extend(["--disallowedTools".into(), QUESTIONS.into()]);
+        }
         let system: Vec<String> = [own.system.clone().filter(|s| !s.is_empty()), boards::note(self.app, &boards, self.name)].into_iter().flatten().collect();
         if !system.is_empty() {
             args.extend(["--append-system-prompt".into(), system.join("\n\n")]);
@@ -250,7 +250,7 @@ impl Worker<'_> {
                                     obj! {"behavior" => "allow", "updatedInput" => input, "toolUseID" => tool_use_id}
                                 }
                                 Err(why) => {
-                                    let why = if questions && why == DENIED { DECLINED.to_string() } else { why };
+                                    let why = if questions && why == DENIED { ask::DECLINED.to_string() } else { why };
                                     obj! {"behavior" => "deny", "message" => why, "toolUseID" => tool_use_id}
                                 }
                             };

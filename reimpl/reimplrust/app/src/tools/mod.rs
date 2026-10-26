@@ -11,6 +11,7 @@
 use connectome::{json::{sparse, Value}, obj};
 use std::{ops::Add, panic::{catch_unwind, AssertUnwindSafe}, time::Duration};
 
+pub mod ask;
 pub mod bash;
 pub mod edit;
 pub mod mcp;

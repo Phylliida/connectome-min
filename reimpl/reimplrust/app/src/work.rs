@@ -10,7 +10,7 @@
 //! hub what the pages following the job see (Msg). The user can stop a turn: it ends where it is
 //! (Worker::stopped). A Claude Code session's turn is Claude Code's instead (claude.rs).
 
-use crate::{api::brief, boards, channels, claude, claude_memory::Remembering, companion::{self, Heard, How}, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, bash, edit, mcp, search, Toolbox}, App};
+use crate::{api::brief, boards, channels, claude, claude_memory::Remembering, companion::{self, Heard, How}, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, ask, bash, edit, mcp, search, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, store::Session};
 use std::{cell::{Cell, RefCell}, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
@@ -54,7 +54,8 @@ impl Setup {
         let reach: Vec<PathBuf> = boards.iter().map(|b| app.board_path(b)).collect();
         let mut sandbox = all.sandbox;
         sandbox.rw.extend(reach.iter().map(|p| p.to_string_lossy().into_owned()));
-        let tools = toolbox(app, settings.workspace.as_deref(), settings.sandbox.then_some(sandbox), all.search.as_deref(), &reach) + companion::tools(app, name, &settings) + channels::tools(app, name, &settings);
+        let tools = toolbox(app, settings.workspace.as_deref(), settings.sandbox.then_some(sandbox), all.search.as_deref(), &reach) + companion::tools(app, name, &settings) + channels::tools(app, name, &settings)
+            + if settings.questions { ask::tool() } else { Toolbox::default() };
         let definitions = tools.definitions();
         let parts: Vec<String> = [settings.system.clone().filter(|s| !s.is_empty()), boards::note(app, &boards, name)].into_iter().flatten().collect();
         let system = Some(parts.join("\n\n")).filter(|s| !s.is_empty());
@@ -346,10 +347,10 @@ impl Worker<'_> {
         append(s, &obj! {"participant" => "assistant", "content" => reply["content"].clone()}, cfg);
         self.logged();
         let calls = reply["content"].arr().iter().filter(|b| b.kind() == "tool_use");
-        let run = |call: &Value| self.approve(&setup, call).map_or_else(|why| tools::result(call, Err(why.into())), |()| {
+        let run = |call: &Value| if call["name"] == ask::NAME && setup.settings.questions { self.ask_user(call) } else { self.approve(&setup, call).map_or_else(|why| tools::result(call, Err(why.into())), |()| {
             self.event(Event::Running { id: call["id"].as_str().unwrap_or("").into(), tool: call["name"].as_str().unwrap_or("").into() });
             setup.tools.call(call, &|| self.stopped())
-        });
+        }) };
         let results = calls.map(|call| if self.stopped() { tools::result(call, Err(STOPPED.into())) } else { run(call) });
         let results: Vec<Value> = results.inspect(|result| self.event(Event::Result(brief(result.clone())))).collect();
         let called = !results.is_empty();
@@ -377,6 +378,21 @@ impl Worker<'_> {
         let (answer, answered) = channel();
         self.tell(Msg::Ask { call: Asking { id: id.into(), tool: tool.into(), input: call["input"].clone(), agent: None }, answer });
         answered.recv_timeout(APPROVAL_WAIT).unwrap_or_else(|_| Err(DENIED.into())).map(drop)
+    }
+
+    /// Questions for the user (tools/ask.rs): the hub asks the pages, whatever the session always
+    /// allows, and the result is what the user answered, or that they declined (or that the turn was
+    /// stopped); no answer within APPROVAL_WAIT is a decline.
+    fn ask_user(&self, call: &Value) -> Value {
+        let (answer, answered) = channel();
+        let asking = Asking { id: call["id"].as_str().unwrap_or("").into(), tool: ask::NAME.into(), input: call["input"].clone(), agent: None };
+        self.tell(Msg::Ask { call: asking, answer });
+        let outcome = match answered.recv_timeout(APPROVAL_WAIT).unwrap_or_else(|_| Err(DENIED.into())) {
+            Ok(given) => Ok(ask::told(&given).into()),
+            Err(why) if why == DENIED => Err(ask::DECLINED.into()),
+            Err(why) => Err(why.into()),
+        };
+        tools::result(call, outcome)
     }
 
     /// Memories form (memory::drive), the pages told while they do; none once the turn is stopped.

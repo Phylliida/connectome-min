@@ -82,7 +82,9 @@ since one holds the keys:
   (`config.compression_max_tokens`), and,
   on Linux, bash in the sandbox.
 - `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
-  `workspace`, whether bash runs in the `sandbox`, the tools it always allows (`allow`), its
+  `workspace`, whether bash runs in the `sandbox`, whether the model can ask you `questions` (on
+  unless the file says otherwise; off, it has no tool to: no `ask_user`, and Claude Code is run with
+  `--disallowedTools AskUserQuestion`), the tools it always allows (`allow`), its
   `window`, `reserve`, the band its prompt folds in (`fold_above` and `fold_to`, always numbers: past
   `fold_above` tokens the context folds, down to `fold_to`; the band the window gives is what it leaves
   the reply, down to `config.slack`, 10%, under that), its `system` prompt, and the library's settings (`config`). A new session's
@@ -105,7 +107,11 @@ lead out of the workspace, through `..`, an absolute path or a link; in the sand
 writes through commands run in bash's sandbox, so the kernel keeps it to what a sandboxed command
 may touch), `web_search` (when settings.json names a SearXNG server: a query asked through its JSON
 API, which its settings.yml must allow by listing `json` in `search.formats`, the pages found given
-back as text, each one's title, address, date when known and excerpt) and the tools of the MCP
+back as text, each one's title, address, date when known and excerpt), `ask_user` (while the
+session's `questions` is on: one to four questions, each with two to four options to pick, one or
+several, which the page shows as Claude Code's questions are shown, with an answer of your own and
+notes; the call's result is what you answered, worded as Claude Code words it, or that you declined,
+and it always asks, whatever the session always allows) and the tools of the MCP
 servers in `ROOT/mcp.json` (or `--mcp FILE`), listed all at once at startup (one whose tools can't
 be listed is stopped), in the usual format:
 

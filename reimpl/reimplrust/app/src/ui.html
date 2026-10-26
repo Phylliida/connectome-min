@@ -383,7 +383,7 @@ function escape(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;',
 // keeps the session from running. A call running says its tool (message, the partner it talks with),
 // and a request tried again says why.
 const PHASES = {
-  waiting: () => 'Waiting for the model…', streaming: () => '', asking: () => [...(page.live?.asked.values() ?? [])].some((c) => c.tool === 'AskUserQuestion') ? 'Waiting for your answers…' : 'Waiting for you to allow or deny the call…', denied: () => 'Denied.',
+  waiting: () => 'Waiting for the model…', streaming: () => '', asking: () => [...(page.live?.asked.values() ?? [])].some((c) => QUESTIONS.includes(c.tool)) ? 'Waiting for your answers…' : 'Waiting for you to allow or deny the call…', denied: () => 'Denied.',
   running: ({ running }) => running?.tool === 'message' ? `Messaging ${state?.settings?.companion ?? state?.settings?.accompanies ?? 'its partner'}…` : `Running ${running?.tool ?? 'the call'}…`,
   retrying: ({ retry: { n, of, why } }) => `${why.length > 160 ? why.slice(0, 160) + '…' : why}: trying again (${n} of ${of})…`,
   forming: () => 'Forming memories…', stopping: () => 'Stopping…', ended: () => '',
@@ -828,6 +828,7 @@ function SessionForm() {
       : html`<input name="model" defaultValue=${s.model ?? ''} placeholder="its name, as the provider has it" />`}</label>
     <label>Workspace <input name="workspace" defaultValue=${s.workspace ?? ''} placeholder="none: no bash" /></label>
     <label><input name="sandbox" type="checkbox" defaultChecked=${!!s.sandbox} /> ${inClaude ? 'Claude Code' : 'bash'} in the sandbox</label>
+    <label title="Off, the model has no tool to ask you questions"><input name="questions" type="checkbox" defaultChecked=${s.questions !== false} /> Questions: the model can ask you</label>
     <label>Window <input name="window" type="number" defaultValue=${s.window ?? ''} /></label>
     <label>Reply reserve <input name="reserve" type="number" defaultValue=${s.reserve ?? ''} /></label>
     <label title="The newest this many tokens of the context stay as they were, never folded">Raw tail
@@ -1054,7 +1055,7 @@ const views = {
 // that answer whether it may run while it's `asking`, and saying so while it's `running`; a result
 // without its call on the page is a card of its own
 function Card({ call, result, asking, running }) {
-  if (call?.name === 'AskUserQuestion') return html`<${Questions} call=${call} result=${result} asking=${asking} />`;
+  if (QUESTIONS.includes(call?.name)) return html`<${Questions} call=${call} result=${result} asking=${asking} />`;
   const view = call && (views[call.name] ?? ((input) => [call.name, html`<pre>${JSON.stringify(input)}</pre>`]));
   const [head, body] = call ? view(call.input, result) : ['an earlier call'];
   const text = result && said(result), failed = result?.isError ? ' failed' : '';
@@ -1068,7 +1069,10 @@ function Card({ call, result, asking, running }) {
   </details>`;
 }
 
-// Claude Code's questions (AskUserQuestion, claude.rs): each with its header, its options to pick from
+// the tools that ask the user questions, whose input is the same: Claude Code's (claude.rs), and ask_user (tools/ask.rs)
+const QUESTIONS = ['AskUserQuestion', 'ask_user'];
+
+// questions for the user (QUESTIONS): each with its header, its options to pick from
 // (their descriptions and previews), one or, multiSelect, several, an Other to write in, and notes.
 // While it's `asking`, Answer gives the picks for each question, by its text (several joined ", ", and
 // Other's words with them, or for one pick in place of it), with its notes; Decline declines. After,

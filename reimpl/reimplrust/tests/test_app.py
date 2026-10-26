@@ -509,6 +509,9 @@ def lifted(tls, ca) -> str:
     app = launch(root, port, ca, '--no-bash')
     try:
         configure(root, f'https://localhost:{mock_port}', LIFTED, 400, 200)
+        everything = json.loads(Path(root, 'settings.json').read_text())
+        everything['defaults']['questions'] = False   # its windows are too small for ask_user's definition
+        Path(root, 'settings.json').write_text(json.dumps(everything))
         call(port, '/api/sessions', {'name': 'lifted'})
         state = chat(port, 'lifted', 60, 0, LIFTED)
         layers = [call(port, f'/api/s/lifted/layer/{n}?from=0') for n in range(len(state['layers']))]
@@ -620,7 +623,9 @@ def tooled(tls, ca, baseline) -> str:
     in the log and on the page; the requests fit the window with the tool definitions counted, which
     leave the price multiplier near a session's without them (from `baseline`); a turn that never stops
     calling tools runs on past 64 steps until the user stops it, memories forming between its steps;
-    and memories of the calls form with the tools declared but not callable."""
+    and memories of the calls form with the tools declared but not callable. ask_user's questions wait
+    for the user's answers, which are their result, or their decline, never the allow list; with the
+    session's questions off, it isn't declared."""
     port, root, work, fake, window, mock_port = free_port(), tempfile.mkdtemp(), tempfile.mkdtemp(), str(HERE / 'fake_mcp.py'), 12000, free_port()
     mock = serve(mock_port, tls)
     servers = {'first': {'command': sys.executable, 'args': [fake]}, 'second': {'command': sys.executable, 'args': [fake, '--shadow', '--wordy']},
@@ -631,6 +636,9 @@ def tooled(tls, ca, baseline) -> str:
         return launch(root, port, ca, '--tool-timeout', '1')
     app, seen['limit'] = start(), window
     configure(root, f'https://localhost:{mock_port}', window, 2381, 595.25)
+    everything = json.loads(Path(root, 'settings.json').read_text())
+    everything['defaults']['questions'] = False   # its window's budget is set without ask_user's definition; questions go on where they're tried
+    Path(root, 'settings.json').write_text(json.dumps(everything))
 
     def results(text, answers=None, asked=None):
         """The results the turn's tool calls got, by the call's place in the reply."""
@@ -662,6 +670,27 @@ def tooled(tls, ca, baseline) -> str:
             raise SystemExit(f'tool results: {got}')
         if [e['result']['toolUseId'][-1] for e in seen['events']] != ['0', '1', '2', '3'] or 'iVBORw0KGgo' in json.dumps(seen['events']):
             raise SystemExit(f'the page got {seen["events"]}')
+        call(port, '/api/sessions', {'name': 'asker'})                   # its own session, so the tools session's budget stays as it was
+        call(port, '/api/s/asker/settings', {'questions': True})
+        colors, pets = 'What is your favorite color?', 'Which pets do you like?'
+        questions = {'questions': [{'question': colors, 'header': 'Color', 'options': [{'label': 'Red', 'description': 'Warm'}, {'label': 'Blue', 'description': 'Cool'}]},
+                                   {'question': pets, 'header': 'Pets', 'options': [{'label': 'Cats', 'description': 'Cats'}, {'label': 'Dogs', 'description': 'Dogs'}], 'multiSelect': True}]}
+        given = {'answers': {colors: 'Blue', pets: 'Cats, Dogs'}, 'annotations': {colors: {'notes': 'navy if possible'}}}
+        asking = 'call ' + json.dumps([['ask_user', questions]])
+        before = len(seen['asked'])
+        say(port, 'asker', asking, {'ask_user': given})
+        got = seen['results'][-1][0]
+        if got.get('content') != f'The user answered: "{colors}"="Blue" notes: navy if possible, "{pets}"="Cats, Dogs".' or got.get('is_error') \
+                or seen['approvals'][-1]['input'] != questions or seen['asked'][before:] != ['ask_user']:
+            raise SystemExit(f'ask_user, answered, gave {got}, asked as {seen["approvals"][-1]}')
+        say(port, 'asker', asking, {'ask_user': 'deny'})
+        got = seen['results'][-1][0]
+        if (got.get('content'), got.get('is_error')) != ('The user declined to answer the questions.', True) or 'ask_user' in call(port, '/api/s/asker')['tools']:
+            raise SystemExit(f'ask_user, declined, gave {got}; the tools listed to always allow are {call(port, "/api/s/asker")["tools"]}')
+        call(port, '/api/s/asker/settings', {'questions': False})
+        say(port, 'asker', 'hello')
+        if 'ask_user' in seen['requests'][-1][1] or 'ask_user' not in seen['requests'][-3][1]:
+            raise SystemExit(f'with questions off the session declares {seen["requests"][-1][1]}')
         allowed = json.loads(Path(root, 'tools', 'session_settings.json').read_text())['allow']
         if allowed != ['picture'] or call(port, '/api/s/tools')['settings']['allow'] != ['picture'] or call(port, '/api/s/bare')['settings']['allow']:
             raise SystemExit(f'always allowed: {allowed}, in the session only')
@@ -1629,7 +1658,8 @@ def clauded(tls, ca) -> str:
     is asked about whole (its tool, input and subagent), since the log, which has only Claude Code's
     own messages, doesn't have it; the subagent's stream stays out of the page. Its questions
     (AskUserQuestion) wait for the user's answers, which the call runs with, even when the tool is
-    always allowed; declined, its result says so. What the user says while
+    always allowed; declined, its result says so; with the session's questions off, Claude Code runs
+    without the tool (--disallowedTools AskUserQuestion). What the user says while
     a turn runs goes to Claude Code at once, shown as with Claude Code until it takes it in, after the
     call it's on, where the log has it, the turn going on with it; said during the turn's reply, it's
     a turn of its own in the same run, which the turn waits for. The context shown is the last request's
@@ -1775,6 +1805,11 @@ def clauded(tls, ca) -> str:
         told = f'The user answered: "{colors}"="Blue" notes: navy if possible, "{pets}"="Cats, Dogs"'
         if (said := say(port, 'cc', 'question', {'AskUserQuestion': given})[0]) != f'Heard: {told}' or log()[-2] != ('user', [{'type': 'tool_result', 'toolUseId': 'toolu_q', 'content': told}]):
             raise SystemExit(f'answered questions came back as {said!r}, logged as {log()[-2]}')
+        call(port, '/api/s/cc/settings', {'questions': False})
+        say(port, 'cc', 'hello again')
+        if runs()[-1]['args'][runs()[-1]['args'].index('--disallowedTools') + 1:][:1] != ['AskUserQuestion']:
+            raise SystemExit(f'with questions off, Claude Code ran as {runs()[-1]["args"]}')
+        call(port, '/api/s/cc/settings', {'questions': True})
         call(port, '/api/s/cc/settings', {'allow': ['AskUserQuestion']})   # questions only the user can answer, so they ask all the same
         asked = len(seen['asked'])
         say(port, 'cc', 'question', {'AskUserQuestion': 'deny'})
