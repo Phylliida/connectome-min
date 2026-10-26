@@ -423,7 +423,8 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
                         raise SystemExit(f'{name}: asked about {asked}, which the reply just logged doesn\'t have: {reply}')
                 seen['asked'].append(asked['tool'])
                 seen.setdefault('approvals', []).append(asked)
-                call(port, f'/api/s/{name}/approve', {'id': asked['id'], 'answer': (answers or {}).get(asked['tool'], 'allow')})
+                choice = (answers or {}).get(asked['tool'], 'allow')   # an answer, or for questions what the user gives: {answers, annotations}
+                call(port, f'/api/s/{name}/approve', {'id': asked['id'], 'answer': 'answer', **choice} if isinstance(choice, dict) else {'id': asked['id'], 'answer': choice})
             thoughts.append(last.get('thinking', ''))
     seen['calls'] = calls
     if end.get('end', 'never ended') is not None:
@@ -1626,7 +1627,9 @@ def clauded(tls, ca) -> str:
     the page: allowed, it runs; denied, its result is the denial; always allowed, the next call to its
     tool doesn't ask, and the tool is the session's to toggle. A call one of Claude Code's subagents makes
     is asked about whole (its tool, input and subagent), since the log, which has only Claude Code's
-    own messages, doesn't have it; the subagent's stream stays out of the page. What the user says while
+    own messages, doesn't have it; the subagent's stream stays out of the page. Its questions
+    (AskUserQuestion) wait for the user's answers, which the call runs with, even when the tool is
+    always allowed; declined, its result says so. What the user says while
     a turn runs goes to Claude Code at once, shown as with Claude Code until it takes it in, after the
     call it's on, where the log has it, the turn going on with it; said during the turn's reply, it's
     a turn of its own in the same run, which the turn waits for. The context shown is the last request's
@@ -1767,6 +1770,16 @@ def clauded(tls, ca) -> str:
         if not told.startswith('This is part of your conversation in this session') or '\n\n[user]\nhello' not in told or '[Context Manager]\nSystem: You will soon form a new memory' not in told \
                 or '[called Write with {"file_path":"x.txt"}]' not in told or "[Write's result: did it]" not in told:
             raise SystemExit(f'the first memory was asked for as {told[:1500]}')
+        colors, pets = 'What is your favorite color?', 'Which pets do you like?'
+        given = {'answers': {colors: 'Blue', pets: 'Cats, Dogs'}, 'annotations': {colors: {'notes': 'navy if possible'}}}
+        told = f'The user answered: "{colors}"="Blue" notes: navy if possible, "{pets}"="Cats, Dogs"'
+        if (said := say(port, 'cc', 'question', {'AskUserQuestion': given})[0]) != f'Heard: {told}' or log()[-2] != ('user', [{'type': 'tool_result', 'toolUseId': 'toolu_q', 'content': told}]):
+            raise SystemExit(f'answered questions came back as {said!r}, logged as {log()[-2]}')
+        call(port, '/api/s/cc/settings', {'allow': ['AskUserQuestion']})   # questions only the user can answer, so they ask all the same
+        asked = len(seen['asked'])
+        say(port, 'cc', 'question', {'AskUserQuestion': 'deny'})
+        if seen['asked'][asked:] != ['AskUserQuestion'] or log()[-2] != ('user', [{'type': 'tool_result', 'toolUseId': 'toolu_q', 'content': 'The user declined to answer the questions.', 'isError': True}]):
+            raise SystemExit(f'questions always allowed asked {seen["asked"][asked:]}, declined, were logged as {log()[-2]}')
         refused('/api/s/cc/fork', {'at': 1, 'name': 'cc-fork'})
         refused('/api/s/cc/companion', {'name': 'pal', 'goal': 'help'})
         r, events = following(port, 'cc')

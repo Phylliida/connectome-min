@@ -166,7 +166,8 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
         }
         ("POST", ["approve"]) => {
             let (id, answer) = (body["id"].as_str().unwrap_or("").into(), body["answer"].as_str().unwrap_or("deny").into());
-            app.ask_session(name, |reply| Msg::Approve { id, answer, reply }).map(|()| Some(obj! {}))
+            let given = sparse(obj! {"answers" => body["answers"].clone(), "annotations" => body["annotations"].clone()});   // a question's
+            app.ask_session(name, |reply| Msg::Approve { id, answer, given, reply }).map(|()| Some(obj! {}))
         }
         ("POST", ["board"]) => {   // {board}, or {board, leave: true}
             let (board, on) = (body["board"].as_str().ok_or("which board?")?.to_string(), body["leave"] != true);

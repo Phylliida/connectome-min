@@ -11,8 +11,8 @@
 //!
 //! in the session's workspace, its requests sent to this server's gateway (ANTHROPIC_BASE_URL), with
 //! x-connectome-session naming the session, and in the session's sandbox if it has one: bubblewrap
-//! around all of Claude Code, the same as bash's, with Claude Code's own files (its command's,
-//! ~/.claude and ~/.claude.json) and the network, which reaching the gateway takes. Claude Code's own
+//! around all of Claude Code, the same as bash's, with Claude Code's own files (its command's, and
+//! ~/.claude: its login and sessions) and the network, which reaching the gateway takes. Claude Code's own
 //! sandbox stays off. A turn sends what was said, then streams the reply to the pages,
 //! logs it, block by block as Claude Code finishes them, asks the pages before a call Claude Code
 //! asks about (unless the session always allows its tool; a subagent's call, which stays in Claude
@@ -30,6 +30,13 @@ use connectome::{drive::append, json::{self, sparse, Json, Value}, obj};
 use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, hash::{BuildHasher, Hasher}, io::{BufRead, BufReader, Read, Write}, path::Path, process::{Child, ChildStdin, Command, Stdio}, sync::mpsc::{channel, Receiver, RecvTimeoutError}, time::Duration};
 use wait_timeout::ChildExt;
+
+/// Claude Code's tool that asks the user questions: the page shows them, and the call runs with the
+/// user's answers in its input ({answers, annotations}, keyed by question), as an Agent SDK host gives them.
+const QUESTIONS: &str = "AskUserQuestion";
+
+/// What Claude Code hears when the user declines to answer its questions.
+const DECLINED: &str = "The user declined to answer the questions.";
 
 /// Why a Claude Code session can't go on without a message: Claude Code takes a turn from one.
 pub const NO_CONTINUE: &str = "a Claude Code session goes on from a message: say what it should do";
@@ -231,15 +238,21 @@ impl Worker<'_> {
                     let response = match serde_json::from_value(request) {
                         Ok(Asked::CanUseTool { tool_name, input, tool_use_id, agent_id }) => {
                             let call = Asking { id: tool_use_id.clone(), tool: tool_name.clone(), input: input.clone(), agent: agent_id };
-                            let by_subagent = call.agent.is_some();
+                            let (by_subagent, questions) = (call.agent.is_some(), tool_name == QUESTIONS);
                             let decided = match self.allowed(call) {
-                                Ok(()) => {
-                                    if !by_subagent { // a subagent's call runs in it, out of the page's sight
+                                Ok(given) => {
+                                    if !by_subagent && !questions { // a subagent's call runs in it, out of the page's sight
                                         self.event(Event::Running { id: tool_use_id.clone(), tool: tool_name });
                                     }
+                                    // questions run with the answers the user gave: {answers, annotations}, by question
+                                    let mut input = input;
+                                    if let (Value::Object(fields), Value::Object(given)) = (&mut input, given) { fields.extend(given) }
                                     obj! {"behavior" => "allow", "updatedInput" => input, "toolUseID" => tool_use_id}
                                 }
-                                Err(why) => obj! {"behavior" => "deny", "message" => why, "toolUseID" => tool_use_id},
+                                Err(why) => {
+                                    let why = if questions && why == DENIED { DECLINED.to_string() } else { why };
+                                    obj! {"behavior" => "deny", "message" => why, "toolUseID" => tool_use_id}
+                                }
                             };
                             obj! {"subtype" => "success", "request_id" => request_id, "response" => decided}
                         }
@@ -297,7 +310,9 @@ impl Worker<'_> {
             let mut sandbox: Sandbox = all.sandbox.clone();
             sandbox.rw.extend(boards::of(self.app, &own).iter().map(|b| self.app.board_path(b).to_string_lossy().into_owned()));
             sandbox.ro.extend(command.iter().filter(|c| Path::new(c).is_absolute()).cloned()); // the program, and a script or loader it names
-            sandbox.rw.extend(["~/.claude".into(), "~/.claude.json".into()]); // its sessions, settings and login
+            // its login and sessions; not ~/.claude.json, its global settings, which a headless run does without,
+            // and which Claude Code saves by putting a new file in its place, so a bind of it can go stale
+            sandbox.rw.push("~/.claude".into());
             sandbox.network = true; // the gateway is this server, on the network's loopback
             let mut wrapped = Command::new("bwrap");
             wrapped.args(bash::bwrap(&workspace, &sandbox)).args(command);
@@ -345,10 +360,12 @@ impl Worker<'_> {
         self.logged();
     }
 
-    /// Whether the user lets `call` run: at once if the session always allows its tool; otherwise the
-    /// hub asks the pages and decides by a page's answer, no answer within APPROVAL_WAIT a denial.
-    fn allowed(&self, call: Asking) -> Result<(), String> {
-        if self.app.profile(self.name)?.allow.contains(&call.tool) { return Ok(()) }
+    /// Whether the user lets `call` run, and what they gave it (Claude Code's questions their answers;
+    /// null otherwise): at once if the session always allows its tool, but for questions, which only
+    /// the user can answer; otherwise the hub asks the pages and decides by a page's answer, no answer
+    /// within APPROVAL_WAIT a denial.
+    fn allowed(&self, call: Asking) -> Result<Value, String> {
+        if call.tool != QUESTIONS && self.app.profile(self.name)?.allow.contains(&call.tool) { return Ok(Value::Null) }
         let (answer, answered) = channel();
         self.tell(Msg::Ask { call, answer });
         answered.recv_timeout(APPROVAL_WAIT).unwrap_or_else(|_| Err(DENIED.into()))

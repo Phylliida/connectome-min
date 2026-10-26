@@ -11,6 +11,8 @@ step it's on (a call's result), or as a turn of its own once the turn's reply is
 - 'wait': text, then a call to Bash that doesn't ask, whose result comes once a message has come
   (or after 10 s), which it takes in then, its reply then saying what that message said;
 - 'linger': text that takes 1.5 s to finish, so a message comes during it;
+- 'question': two questions (AskUserQuestion, one of them multiSelect), whose result is what the answer
+  gave, told as Claude Code tells it ("The user answered: …"), or the denial; its reply says it;
 - 'hang': text, then nothing, as a turn the user will stop;
 - anything else: 'You said: …'.
 
@@ -177,6 +179,24 @@ while (message := waiting.pop(0) if waiting else inbox.get()) is not None:
         extra = take_in()
         start(1200)   # after a call's result, the next request's prompt holds it
         said = f'Also: {" ".join(extra)}.' if extra else 'Nothing more.'
+        streamed(0, {'type': 'text', 'text': said}, [said])
+    elif text == 'question':
+        questions = [{'question': 'What is your favorite color?', 'header': 'Color', 'options': [{'label': 'Red', 'description': 'Warm'}, {'label': 'Blue', 'description': 'Cool'}], 'multiSelect': False},
+                     {'question': 'Which pets do you like?', 'header': 'Pets', 'options': [{'label': 'Cats', 'description': 'Cats'}, {'label': 'Dogs', 'description': 'Dogs'}], 'multiSelect': True}]
+        asked = {'type': 'tool_use', 'id': 'toolu_q', 'name': 'AskUserQuestion', 'input': {'questions': questions}}
+        streamed(0, asked, [json.dumps({'questions': questions})])
+        say({'type': 'control_request', 'request_id': 'ask-q', 'request': {'subtype': 'can_use_tool', 'tool_name': 'AskUserQuestion', 'input': asked['input'], 'tool_use_id': 'toolu_q'}})
+        decided = answer()
+        if decided['behavior'] == 'allow':
+            given = decided['updatedInput']
+            notes = lambda q: f" notes: {given['annotations'][q]['notes']}" if q in given.get('annotations', {}) else ''
+            parts = [f'"{q}"="{a}"{notes(q)}' for q, a in given.get('answers', {}).items()]
+            content, failed = ('The user answered: ' + ', '.join(parts)) if parts else 'The user did not answer the questions.', False
+        else:
+            content, failed = decided['message'], True
+        say({'type': 'user', 'message': {'role': 'user', 'content': [{'tool_use_id': 'toolu_q', 'type': 'tool_result', 'content': content, 'is_error': failed}]}, 'parent_tool_use_id': None, 'session_id': session})
+        start(1200)
+        said = f'Heard: {content}'
         streamed(0, {'type': 'text', 'text': said}, [said])
     elif text == 'linger':
         say({'type': 'stream_event', 'event': {'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}}, 'parent_tool_use_id': None})

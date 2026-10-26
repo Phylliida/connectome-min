@@ -376,7 +376,7 @@ impl Worker<'_> {
         }
         let (answer, answered) = channel();
         self.tell(Msg::Ask { call: Asking { id: id.into(), tool: tool.into(), input: call["input"].clone(), agent: None }, answer });
-        answered.recv_timeout(APPROVAL_WAIT).unwrap_or_else(|_| Err(DENIED.into()))
+        answered.recv_timeout(APPROVAL_WAIT).unwrap_or_else(|_| Err(DENIED.into())).map(drop)
     }
 
     /// Memories form (memory::drive), the pages told while they do; none once the turn is stopped.

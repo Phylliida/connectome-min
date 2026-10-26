@@ -67,8 +67,10 @@ pub enum Msg {
     /// A page that follows the session from now on, answered once it does: it hears the turn running
     /// so far first.
     Follow(Sender<Event>, Sender<()>),
-    /// A page's answer whether call `id` may run: allow, always (its tool, from then on) or deny.
-    Approve { id: String, answer: String, reply: Sender<Result<(), String>> },
+    /// A page's answer whether call `id` may run: allow, always (its tool, from then on) or deny; or,
+    /// for Claude Code's questions (AskUserQuestion), answer, with what the user `given`: {answers,
+    /// annotations}.
+    Approve { id: String, answer: String, given: Value, reply: Sender<Result<(), String>> },
     /// Whether a job runs, and the turns queued.
     Status(Sender<(bool, Vec<Queued>)>),
     /// A change to the session's settings (SessionSettings::tuned), and whether its memories have merged.
@@ -86,8 +88,9 @@ pub enum Msg {
     Logged(u64),
     /// From the session's thread: an event for the pages.
     Event(Event),
-    /// From the session's thread: a call's question, and where to answer it (Ok: it runs).
-    Ask { call: Asking, answer: Sender<Result<(), String>> },
+    /// From the session's thread: a call's question, and where to answer it: Ok, it runs (with what the
+    /// user gave, if they answered questions; null otherwise), or why not.
+    Ask { call: Asking, answer: Sender<Result<Value, String>> },
     /// From the session's thread: job `id` is done, its memories formed; no call waits any more.
     Done(u64),
     /// From the session's thread: its turn takes the user's messages as it runs (a Claude Code
@@ -283,7 +286,7 @@ struct Live {
 /// whether it takes the user's messages as it runs (Msg::Taking).
 struct Turn {
     events: Vec<Event>,
-    asked: HashMap<String, (String, Sender<Result<(), String>>)>, // by call id: its tool, where to answer
+    asked: HashMap<String, (String, Sender<Result<Value, String>>)>, // by call id: its tool, where to answer
     stop: Option<Sender<()>>,
     ended: bool,
     taking: bool,
@@ -417,11 +420,12 @@ impl Live {
                 self.handed.retain(|q| q.id != id);
                 self.show_queue();
             }
-            Msg::Approve { id, answer, reply } => match self.turn.as_mut().and_then(|t| t.asked.remove(&id)) {
+            Msg::Approve { id, answer, given, reply } => match self.turn.as_mut().and_then(|t| t.asked.remove(&id)) {
                 Some((tool, waiting)) => {
                     let decided = match answer.as_str() {
-                        "always" => settings::change(&app.profile_path(name), |s: &mut SessionSettings| { s.allow.insert(tool); Ok(()) }).map(drop),
-                        "allow" => Ok(()),
+                        "always" => settings::change(&app.profile_path(name), |s: &mut SessionSettings| { s.allow.insert(tool); Ok(()) }).map(|_| Value::Null),
+                        "allow" => Ok(Value::Null),
+                        "answer" => Ok(given),
                         _ => Err(DENIED.into()),
                     };
                     let _ = waiting.send(decided);

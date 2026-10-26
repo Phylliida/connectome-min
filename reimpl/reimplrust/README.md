@@ -284,13 +284,19 @@ before a tool runs), with the session's model and its system prompt appended to 
 and Claude Code's own sandbox off. Its requests go through the gateway (ANTHROPIC_BASE_URL), headed
 `x-connectome-session: NAME`. In the session's sandbox, bubblewrap wraps all of Claude Code, as it
 does bash, with the same paths, besides Claude Code's own: its command's absolute paths, read-only,
-and `~/.claude` and `~/.claude.json`, read-write; and with the network even when the sandbox has
+and `~/.claude` (its login and sessions), read-write, but not `~/.claude.json`, its global settings,
+which a headless run does without (it says so on stderr) and which Claude Code saves by putting a new
+file in its place, so a bind of it can go stale; and with the network even when the sandbox has
 none, since the gateway is reached on it, so the commands Claude Code runs have it too. Its reply
 streams to the page and joins the log block by block as Claude Code finishes each, its calls'
 results as they come; a call Claude Code asks about shows on its card in the page with Allow,
 Always allow and Deny, as any session's (Claude Code runs read-only ones without asking), a call of
 one of its subagents, which stays in Claude Code and out of the log, on a card of its own below the
-log, headed "a subagent asks"; and the
+log, headed "a subagent asks"; Claude Code's questions (AskUserQuestion) show on their card as
+questions, each with its options to pick (several, when it takes several), an answer of your own and
+notes, with Answer and Decline, and the call runs with your answers (its input's `answers` and
+`annotations`, by question, as an Agent SDK host gives them), even if the session always allows the
+tool, since only you can answer them; and the
 tools the session always allows are its chips. Claude Code keeps the conversation, in a session
 of its own that the first turn starts (`claude_session` in the session's settings, once Claude
 Code has started it) and later turns resume. A turn's cost, as Claude Code's result counts it,

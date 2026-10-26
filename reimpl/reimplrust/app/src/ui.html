@@ -190,6 +190,15 @@ h2 .add { padding: 0 7px; font-size: 14px; line-height: 20px; color: var(--muted
 .query { color: var(--ink); }
 .query svg { width: 13px; height: 13px; vertical-align: -2px; margin-right: 6px; color: var(--muted); }
 .ask { display: flex; gap: 6px; margin: 4px 0 6px; }
+.questions summary { color: var(--ink); }
+.questions form { display: block; padding: 0; border: 0; }   /* not the message box's row */
+.question input[type=radio], .question input[type=checkbox] { width: auto; flex: none; }
+.question { border: 0; padding: 0; margin: 8px 0; min-width: 0; }
+.question legend { padding: 0; margin-bottom: 4px; }
+.question .head { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; margin-right: 4px; }
+.question .option { display: flex; gap: 8px; align-items: baseline; margin: 3px 0; font-size: 13px; }
+.question .preview { margin: 2px 0 6px 24px; padding: 6px; border: 1px solid var(--line); border-radius: 4px; }
+.question input:not([type]) { display: block; width: 100%; margin: 4px 0; box-sizing: border-box; }
 .tool .running { font-size: 12px; color: var(--accent); margin: 4px 0; }
 
 /* the assistant's text as markdown */
@@ -374,7 +383,7 @@ function escape(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;',
 // keeps the session from running. A call running says its tool (message, the partner it talks with),
 // and a request tried again says why.
 const PHASES = {
-  waiting: () => 'Waiting for the model…', streaming: () => '', asking: () => 'Waiting for you to allow or deny the call…', denied: () => 'Denied.',
+  waiting: () => 'Waiting for the model…', streaming: () => '', asking: () => [...(page.live?.asked.values() ?? [])].some((c) => c.tool === 'AskUserQuestion') ? 'Waiting for your answers…' : 'Waiting for you to allow or deny the call…', denied: () => 'Denied.',
   running: ({ running }) => running?.tool === 'message' ? `Messaging ${state?.settings?.companion ?? state?.settings?.accompanies ?? 'its partner'}…` : `Running ${running?.tool ?? 'the call'}…`,
   retrying: ({ retry: { n, of, why } }) => `${why.length > 160 ? why.slice(0, 160) + '…' : why}: trying again (${n} of ${of})…`,
   forming: () => 'Forming memories…', stopping: () => 'Stopping…', ended: () => '',
@@ -1045,6 +1054,7 @@ const views = {
 // that answer whether it may run while it's `asking`, and saying so while it's `running`; a result
 // without its call on the page is a card of its own
 function Card({ call, result, asking, running }) {
+  if (call?.name === 'AskUserQuestion') return html`<${Questions} call=${call} result=${result} asking=${asking} />`;
   const view = call && (views[call.name] ?? ((input) => [call.name, html`<pre>${JSON.stringify(input)}</pre>`]));
   const [head, body] = call ? view(call.input, result) : ['an earlier call'];
   const text = result && said(result), failed = result?.isError ? ' failed' : '';
@@ -1054,6 +1064,43 @@ function Card({ call, result, asking, running }) {
     ${body}
     ${asking && !result && html`<div class="ask">${answer('allow', 'Allow')}${answer('always', 'Always allow')}${answer('deny', 'Deny')}</div>`}
     ${running && !result && html`<div class="running">running…</div>`}
+    ${result && html`<pre class=${'result' + failed}>${text}</pre>`}
+  </details>`;
+}
+
+// Claude Code's questions (AskUserQuestion, claude.rs): each with its header, its options to pick from
+// (their descriptions and previews), one or, multiSelect, several, an Other to write in, and notes.
+// While it's `asking`, Answer gives the picks for each question, by its text (several joined ", ", and
+// Other's words with them, or for one pick in place of it), with its notes; Decline declines. After,
+// the result says what Claude Code was told.
+function Questions({ call, result, asking }) {
+  const questions = call.input?.questions ?? [];
+  const answer = (e) => {
+    e.preventDefault();
+    const [answers, annotations] = [{}, {}];
+    questions.forEach((q, i) => {
+      const picked = [...e.target.querySelectorAll(`[name="q${i}"]:checked`)].map((c) => c.value);
+      const [other, notes] = [e.target.elements[`other${i}`].value.trim(), e.target.elements[`notes${i}`].value.trim()];
+      answers[q.question] = q.multiSelect ? [...picked, other].filter(Boolean).join(', ') : other || picked[0] || '';
+      if (notes) annotations[q.question] = { notes };
+    });
+    approve(call.id, 'answer', { answers, annotations });
+  };
+  const text = result && said(result), failed = result?.isError ? ' failed' : '';
+  return html`<details class=${'tool questions' + failed} id=${'call-' + call.id} data-kind="tool_use" open=${!result}>
+    <summary>Questions: ${questions.map((q) => q.header).join(', ')}${result && html`<span class="out"> → ${text.split('\n')[0].slice(0, 100)}</span>`}</summary>
+    <form onSubmit=${answer}>
+      ${questions.map((q, i) => html`<fieldset class="question" key=${i} disabled=${!asking || result}>
+        <legend><span class="head">${q.header}</span> ${q.question}</legend>
+        ${(q.options ?? []).map((o) => html`<label class="option"><input type=${q.multiSelect ? 'checkbox' : 'radio'} name=${'q' + i} value=${o.label} />
+          <span><b>${o.label}</b>${o.description && o.description !== o.label && html` — ${o.description}`}</span></label>
+          ${o.preview && html`<pre class="preview">${o.preview}</pre>`}`)}
+        ${asking && !result && html`<input name=${'other' + i} placeholder="Other: your own answer" />
+          <input name=${'notes' + i} placeholder="Notes (optional)" />`}
+      </fieldset>`)}
+      ${asking && !result && html`<div class="ask"><button class="primary" data-answer="answer">Answer</button>
+        <button type="button" data-answer="deny" onClick=${() => approve(call.id, 'deny')}>Decline</button></div>`}
+    </form>
     ${result && html`<pre class=${'result' + failed}>${text}</pre>`}
   </details>`;
 }
@@ -1450,11 +1497,11 @@ async function fork(at) {
 }
 
 // a page's answer whether a call may run: its buttons go, and the turn shows the answer until it goes on
-async function approve(id, answer) {
+async function approve(id, answer, given = {}) {
   page.live?.asked.delete(id);
   if (page.live) page.live.phase = answer === 'deny' ? 'denied' : 'running';
   draw();
-  try { await api(`/api/s/${current()}/approve`, { id, answer }); } catch (err) { fail(err); }
+  try { await api(`/api/s/${current()}/approve`, { id, answer, ...given }); } catch (err) { fail(err); }
 }
 
 // the turn running stopped where it is (work.rs's Worker::stopped)
