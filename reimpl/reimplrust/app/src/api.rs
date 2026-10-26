@@ -25,8 +25,11 @@ const LIBS: &str = concat!(
 const KATEX_CSS: &str = include_str!("../vendor/katex/katex.min.css");
 static FONTS: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/vendor/katex/fonts");
 
-/// The largest request body: a message pasted whole.
+/// The largest request body: a message pasted whole; or, to the gateway, Claude Code's whole
+/// conversation, which its requests carry each time until the gateway folds it (claude_fold.rs), its
+/// screenshots and pasted files with it.
 const BODY_LIMIT: u64 = 32 << 20;
+const GATEWAY_BODY_LIMIT: u64 = 1 << 30;
 
 /// How long a page may keep a write waiting before it's left behind.
 const PAGE_WAIT: Duration = Duration::from_secs(30);
@@ -51,18 +54,19 @@ pub fn handle(app: &App, mut stream: TcpStream) -> io::Result<()> {
     let headers: HashMap<String, String> = lines.take_while(|h| !h.is_empty()).filter_map(field).collect();
     let header = |name: &str| headers.get(name).map_or("", String::as_str);
     let length = header("content-length").parse().unwrap_or(0u64);
+    let limit = if target.starts_with("/gateway/") { GATEWAY_BODY_LIMIT } else { BODY_LIMIT };
     let mut raw = vec![];
-    (&mut reader).take(length.min(BODY_LIMIT)).read_to_end(&mut raw)?;
+    (&mut reader).take(length.min(limit)).read_to_end(&mut raw)?;
     // read whole even when refused: a socket closed with a request unread resets, and the refusal can be lost
-    io::copy(&mut (&mut reader).take(length.saturating_sub(BODY_LIMIT)), &mut io::sink())?;
+    io::copy(&mut (&mut reader).take(length.saturating_sub(limit)), &mut io::sink())?;
     let port = app.addr.rsplit(':').next().unwrap_or("");
     if ![app.addr.as_str(), &format!("localhost:{port}")].contains(&header("host")) || method == "POST" && !headers.contains_key("x-connectome") {
         return fail(&mut stream, "403 Forbidden", "this server answers only its own page");
     }
-    if length > BODY_LIMIT {
-        return fail(&mut stream, "413 Content Too Large", &format!("a request's body takes {} MiB at most", BODY_LIMIT >> 20));
+    if length > limit {
+        return fail(&mut stream, "413 Content Too Large", &format!("a request's body takes {} MiB at most", limit >> 20));
     }
-    if let Some(forwarded) = target.strip_prefix("/gateway/") { // its body goes on as it came, unparsed
+    if let Some(forwarded) = target.strip_prefix("/gateway/") { // its body goes on unparsed, or as the gateway compiles it
         return gateway::forward(app, method, &format!("/{forwarded}"), &headers, &raw, &mut stream);
     }
     let body = match json::parse(&raw) {

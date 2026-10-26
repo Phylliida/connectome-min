@@ -33,12 +33,15 @@ pub enum Routed {
 /// A job for a session's thread: a turn with a message, or without (None) one that continues the log;
 /// what its partner tells it (companion.rs), or a notice: a post in a channel it hears (channels.rs),
 /// or what changed on a board it's on (boards.rs); any of which joins a turn running between its steps,
-/// else starts one; or a fork at message `at` as `name`.
+/// else starts one; a fork at message `at` as `name`; or, from the gateway, a request of the Claude
+/// Code session `claude_session` (its `body`), which the turn running it compiles (claude_fold.rs),
+/// answered with the body to send in its place, or none to send it as it came.
 pub enum Job {
     Say { text: Option<String> },
     Hear(Heard),
     Notice(Heard),
     Fork { at: u64, name: String, reply: Sender<Result<(), String>> },
+    Fold { claude_session: String, body: Value, answer: Sender<Result<Option<Vec<u8>>, String>> },
 }
 
 /// What the hub is told about a session, by requests' threads and by the session's.

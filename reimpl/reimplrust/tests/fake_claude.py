@@ -16,8 +16,20 @@ step it's on (a call's result), or as a turn of its own once the turn's reply is
 - 'hang': text, then nothing, as a turn the user will stop;
 - anything else: 'You said: …'.
 
+Run with --converse, it is Claude Code as the gateway sees it instead: it keeps its conversation
+(claude-conversation-SESSION.json in its working directory, which a resumed run reads again) and
+sends all of it with each request to its ANTHROPIC_BASE_URL, a reply each, as Claude Code does: its
+first message with reminder blocks before what the user said and a system message after it, a cache
+breakpoint on its system prompt and its last message; it streams the reply that comes back, asks
+about each call (can_use_tool; but a command 'wait…', which it runs without asking, and which lasts
+until a message comes), sends the results (a command with 'big' in it has a long one), with what it
+was told meanwhile in a system message after them, as Claude Code does, and asks again, until a reply
+calls nothing. Each request goes into claude-requests.jsonl: what it sent, and when it sent it and
+had its answer.
+
 Run with --no-session-persistence, as a memory's run is, it writes what it was run with and told
-(its arguments, CLAUDE_CODE_MAX_OUTPUT_TOKENS, the transcript) into claude-memories.jsonl instead, and
+(its arguments, CLAUDE_CODE_MAX_OUTPUT_TOKENS, the transcript, when, and the status of a request to
+its ANTHROPIC_BASE_URL, as Claude Code makes them) into claude-memories.jsonl instead, and
 answers with a memory (and reasoning, which isn't the memory's): how many parts the user said in it.
 Each run says the plan's limits as it starts (a rate_limit_event): 26% of the 5-hour window, 7% of the
 7-day one.
@@ -37,7 +49,7 @@ import time
 import urllib.request
 
 args = sys.argv[1:]
-remembering = '--no-session-persistence' in args
+remembering, conversing = '--no-session-persistence' in args, '--converse' in args
 session = 'memory' if remembering else args[args.index('--session-id') + 1] if '--session-id' in args else args[args.index('--resume') + 1]
 
 
@@ -104,13 +116,102 @@ def start(prompt):
 
 
 def streamed(i, block, pieces):
-    """Block `i` of the reply, streamed in `pieces` (text, or a call's input JSON), then given whole."""
-    say({'type': 'stream_event', 'event': {'type': 'content_block_start', 'index': i, 'content_block': {**block, **({'input': {}} if block['type'] == 'tool_use' else {'text': ''})}}, 'parent_tool_use_id': None})
+    """Block `i` of the reply, streamed in `pieces` (text, reasoning, or a call's input JSON), then given whole."""
+    start = {'tool_use': {'input': {}}, 'thinking': {'thinking': '', 'signature': ''}}.get(block['type'], {'text': ''})
+    say({'type': 'stream_event', 'event': {'type': 'content_block_start', 'index': i, 'content_block': {**block, **start}}, 'parent_tool_use_id': None})
     for piece in pieces:
-        delta = {'type': 'input_json_delta', 'partial_json': piece} if block['type'] == 'tool_use' else {'type': 'text_delta', 'text': piece}
+        delta = {'tool_use': {'type': 'input_json_delta', 'partial_json': piece}, 'thinking': {'type': 'thinking_delta', 'thinking': piece}}.get(block['type'], {'type': 'text_delta', 'text': piece})
         say({'type': 'stream_event', 'event': {'type': 'content_block_delta', 'index': i, 'delta': delta}, 'parent_tool_use_id': None})
     say({'type': 'assistant', 'message': {'id': reply_id, 'role': 'assistant', 'content': [block]}, 'parent_tool_use_id': None, 'session_id': session})
     say({'type': 'stream_event', 'event': {'type': 'content_block_stop', 'index': i}, 'parent_tool_use_id': None})
+
+
+def request(messages):
+    """What a request of the whole conversation got back through ANTHROPIC_BASE_URL: the reply's
+    blocks and its prompt's usage, as the stream gave them; the request recorded."""
+    headers = dict(h.split(': ', 1) for h in os.environ.get('ANTHROPIC_CUSTOM_HEADERS', '').split('\n') if h)
+    blocks = messages[-1]['content'] if isinstance(messages[-1]['content'], list) else [{'type': 'text', 'text': messages[-1]['content']}]   # a string's, made a block, as Claude Code does
+    last = {**messages[-1], 'content': [*blocks[:-1], {**blocks[-1], 'cache_control': {'type': 'ephemeral'}}]}
+    body = {'model': args[args.index('--model') + 1], 'max_tokens': 32000, 'stream': True, 'thinking': {'type': 'adaptive'},
+            'system': [{'type': 'text', 'text': 'You are a fake of Claude Code.', 'cache_control': {'type': 'ephemeral'}}],
+            'tools': [{'name': 'Bash', 'description': 'Runs a command.', 'input_schema': {'type': 'object', 'properties': {'command': {'type': 'string'}}}}],
+            'messages': [*messages[:-1], last]}
+    sent = time.time()
+    posted = urllib.request.Request(os.environ['ANTHROPIC_BASE_URL'] + '/v1/messages?beta=true', data=json.dumps(body).encode(),
+                                    headers={**headers, 'x-claude-code-session-id': session, 'content-type': 'application/json'})
+    blocks, usage = [], {}
+    with urllib.request.urlopen(posted, timeout=60) as r:
+        for line in r:
+            if not line.startswith(b'data:'):
+                continue
+            event = json.loads(line[5:])
+            if event['type'] == 'message_start':
+                usage = event['message']['usage']
+            elif event['type'] == 'content_block_start':
+                blocks.append(event['content_block'])
+            elif event['type'] == 'content_block_delta':
+                delta, block = event['delta'], blocks[-1]
+                if delta['type'] == 'text_delta':
+                    block['text'] += delta['text']
+                elif delta['type'] == 'thinking_delta':
+                    block['thinking'] += delta['thinking']
+                elif delta['type'] == 'signature_delta':
+                    block['signature'] += delta['signature']
+                elif delta['type'] == 'input_json_delta':
+                    block['json'] = block.get('json', '') + delta['partial_json']
+    for block in blocks:
+        if 'json' in block:
+            block['input'] = json.loads(block.pop('json'))
+    with open('claude-requests.jsonl', 'a') as requests:
+        requests.write(json.dumps({'body': body, 'sent': sent, 'answered': time.time()}) + '\n')
+    return blocks, usage
+
+
+def converse():
+    """Turns on what comes on stdin, each through the gateway, as Claude Code takes them."""
+    kept = f'claude-conversation-{session}.json'
+    messages = json.loads(open(kept).read()) if os.path.exists(kept) else []
+    while (message := waiting.pop(0) if waiting else inbox.get()) is not None:
+        say({**message, 'isReplay': True, 'session_id': session})
+        text = ' '.join(b['text'] for b in message['message']['content'] if b['type'] == 'text')
+        if messages:
+            messages.append({'role': 'user', 'content': [{'type': 'text', 'text': text}]})
+        else:   # as Claude Code begins a session: reminders, what the user said, then where it runs
+            messages += [{'role': 'user', 'content': [{'type': 'text', 'text': '<system-reminder>\nToday is a fake day.\n</system-reminder>'}, {'type': 'text', 'text': text}]},
+                         {'role': 'system', 'content': '# Environment\nYou run in a fake.'}]
+        while True:
+            blocks, usage = request(messages)
+            prompt = usage.get('input_tokens', 0) + usage.get('cache_read_input_tokens', 0) + usage.get('cache_creation_input_tokens', 0)
+            start(prompt)
+            for i, block in enumerate(blocks):
+                streamed(i, block, [json.dumps(block['input']) if block['type'] == 'tool_use' else block[block['type']]])
+            messages.append({'role': 'assistant', 'content': blocks})
+            calls = [b for b in blocks if b['type'] == 'tool_use']
+            if not calls:
+                break
+            results = []
+            for call in calls:
+                command = call['input']['command']
+                if command.startswith('wait'):   # one Claude Code runs without asking, which lasts till a message comes (or 10 s)
+                    try:
+                        waiting.append(inbox.get(timeout=10)) if not waiting else None
+                    except queue.Empty:
+                        pass
+                    allowed = True
+                else:
+                    say({'type': 'control_request', 'request_id': f'ask-{call["id"]}', 'request': {'subtype': 'can_use_tool', 'tool_name': call['name'], 'input': call['input'], 'tool_use_id': call['id']}})
+                    allowed = answer()['behavior'] == 'allow'
+                output = ' '.join(['output'] * 1500) if 'big' in command else ''   # a call whose result fills the context
+                results.append({'tool_use_id': call['id'], 'type': 'tool_result', 'content': f'ran {command} {output}'.strip() if allowed else 'denied'})
+                say({'type': 'user', 'message': {'role': 'user', 'content': [results[-1]]}, 'parent_tool_use_id': None, 'session_id': session})
+            messages.append({'role': 'user', 'content': results})
+            for text in take_in():   # what was said meanwhile, as Claude Code tells it after the results
+                messages.append({'role': 'system', 'content': f'The user sent a new message while you were working:\n{text}'})
+        with open(kept, 'w') as f:
+            f.write(json.dumps(messages))
+        said = ''.join(b.get('text', '') for b in blocks)
+        say({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': said, 'session_id': session, 'total_cost_usd': 0.01,
+             'usage': {'input_tokens': 10, 'cache_read_input_tokens': 5, 'cache_creation_input_tokens': 0, 'output_tokens': 7}})
 
 
 threading.Thread(target=reading, daemon=True).start()
@@ -120,7 +221,7 @@ if remembering:
     transcript = inbox.get()['message']['content'][0]['text']
     say({'type': 'rate_limit_event', 'rate_limit_info': LIMITS, 'session_id': session})
     with open('claude-memories.jsonl', 'a') as runs:
-        runs.write(json.dumps({'args': args, 'max_tokens': os.environ.get('CLAUDE_CODE_MAX_OUTPUT_TOKENS'), 'transcript': transcript}) + '\n')
+        runs.write(json.dumps({'args': args, 'max_tokens': os.environ.get('CLAUDE_CODE_MAX_OUTPUT_TOKENS'), 'transcript': transcript, 'at': time.time(), 'gateway': gateway()}) + '\n')
     memory = f'I remember {transcript.count(chr(10) + "[user]")} parts the user said.'
     say({'type': 'assistant', 'message': {'id': 'msg_memory', 'role': 'assistant', 'content': [{'type': 'thinking', 'thinking': 'Let me recall.', 'signature': 'c2ln'}]}, 'parent_tool_use_id': None, 'session_id': session})
     say({'type': 'assistant', 'message': {'id': 'msg_memory', 'role': 'assistant', 'content': [{'type': 'text', 'text': memory}]}, 'parent_tool_use_id': None, 'session_id': session})
@@ -130,10 +231,13 @@ if remembering:
         pass
     sys.exit()
 with open('claude-runs.jsonl', 'a') as runs:
-    runs.write(json.dumps({'args': args, 'outside_failed': outside(), 'gateway': gateway()}) + '\n')
+    runs.write(json.dumps({'args': args, 'outside_failed': outside(), 'gateway': None if conversing else gateway(), 'compact': os.environ.get('DISABLE_COMPACT')}) + '\n')
 initialize = inbox.get()
 say({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': initialize['request_id'], 'response': {}}})
 say({'type': 'system', 'subtype': 'init', 'session_id': session, 'claude_code_version': 'fake', 'tools': ['Bash', 'Write']})
+if conversing:
+    converse()
+    sys.exit()
 while (message := waiting.pop(0) if waiting else inbox.get()) is not None:
     waiting.insert(0, message)
     text = take_in()[0]

@@ -301,7 +301,7 @@ impl Content {
 }
 
 /// A block of the library's as the API takes it, its content moved, not copied.
-fn to_api(mut b: Value, cache: bool) -> Value {
+pub fn to_api(mut b: Value, cache: bool) -> Value {
     let reasoning = REASONING.contains(&b.kind());
     let mut out = match b.kind() {
         "tool_use" => obj! {"type" => "tool_use", "id" => b["id"].take(), "name" => b["name"].take(), "input" => b["input"].take()},
@@ -336,7 +336,7 @@ const SENT: [&str; 4] = ["text", "tool_use", "tool_result", "image"];
 const REASONING: [&str; 2] = ["thinking", "redacted_thinking"];
 
 /// A turn's blocks a request carries: its kinds SENT, not blank, and if `reasoning` its reasoning.
-fn carried(t: &Turn, reasoning: bool) -> Vec<&Block> {
+pub fn carried(t: &Turn, reasoning: bool) -> Vec<&Block> {
     t.content.iter().filter(|b| if REASONING.contains(&b.kind.as_str()) { reasoning } else { SENT.contains(&b.kind.as_str()) && !b.blank }).collect()
 }
 

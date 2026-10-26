@@ -19,6 +19,7 @@ mod api;
 mod boards;
 mod channels;
 mod claude;
+mod claude_fold;
 mod claude_memory;
 mod companion;
 mod costs;

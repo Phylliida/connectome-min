@@ -103,10 +103,10 @@ pub fn prompted(s: &Session) -> Option<f64> {
     replies(s).next().map(|c| c.prompt.unwrap_or(c.used.input))
 }
 
-/// The last reply's prompt, unless a compile has learnt from it: the one its request was built from is
-/// no longer the last.
+/// The last reply's prompt (its last request's), unless a compile has learnt from it: the one its
+/// request was built from is no longer the last.
 pub fn unlearnt(s: &Session) -> Option<f64> {
-    replies(s).next().filter(|c| c.compile.is_some_and(|i| i + 1 == s.count("compiles"))).map(|c| c.used.input)
+    replies(s).next().filter(|c| c.compile.is_some_and(|i| i + 1 == s.count("compiles"))).map(|c| c.prompt.unwrap_or(c.used.input))
 }
 
 /// The compile a reply's request was built from.

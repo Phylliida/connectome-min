@@ -6,7 +6,8 @@
 //! requests leave it out. The run has no tools, Claude Code's least system prompt (--system-prompt
 //! ""), keeps no session, and may write the memory's max tokens (CLAUDE_CODE_MAX_OUTPUT_TOKENS); it
 //! runs as the session's turns do (Worker::start_claude): in its workspace and sandbox, through the
-//! gateway. What a run used joins the session's costs, for memories.
+//! gateway, but not naming the session, so its requests go as they came (the session's thread, which
+//! folds a turn's, waits on the run). What a run used joins the session's costs, for memories.
 
 use crate::{claude::{told_line, Said, SETTINGS}, costs::{self, For}, hub::Event, llm::Usage, tools::POLL, work::Worker};
 use connectome::{emit::Reader, json::{Json, Value}, memory::{Host, Request, INTERRUPTED}, obj};

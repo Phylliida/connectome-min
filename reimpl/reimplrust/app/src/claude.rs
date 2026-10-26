@@ -10,7 +10,8 @@
 //!          (--session-id ID | --resume ID)
 //!
 //! in the session's workspace, its requests sent to this server's gateway (ANTHROPIC_BASE_URL), with
-//! x-connectome-session naming the session, and in the session's sandbox if it has one: bubblewrap
+//! x-connectome-session naming the session, which folds them (claude_fold.rs; Claude Code's own
+//! compaction off: DISABLE_COMPACT), and in the session's sandbox if it has one: bubblewrap
 //! around all of Claude Code, the same as bash's, with Claude Code's own files (its command's, and
 //! ~/.claude: its login and sessions) and the network, which reaching the gateway takes. Claude Code's own
 //! sandbox stays off. A turn sends what was said, then streams the reply to the pages,
@@ -25,7 +26,7 @@
 //! resuming that session. After a turn, memories form, each written by a run of Claude Code of its
 //! own (claude_memory.rs).
 
-use crate::{api::brief, boards, companion::Heard, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Content, Delta, Piece, Streamed, Usage}, settings::Sandbox, tools::{ask, bash, POLL}, work::{said, Worker, APPROVAL_WAIT, DENIED, STOPPED}, App};
+use crate::{api::brief, boards, claude_fold, companion::Heard, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Content, Delta, Piece, Streamed, Usage}, settings::Sandbox, tools::{ask, bash, POLL}, work::{said, Worker, APPROVAL_WAIT, DENIED, STOPPED}, App};
 use connectome::{drive::append, json::{self, sparse, Json, Value}, obj};
 use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, hash::{BuildHasher, Hasher}, io::{BufRead, BufReader, Read, Write}, path::Path, process::{Child, ChildStdin, Command, Stdio}, sync::mpsc::{channel, Receiver, RecvTimeoutError}, time::Duration};
@@ -145,7 +146,9 @@ impl Worker<'_> {
             args.extend(["--append-system-prompt".into(), system.join("\n\n")]);
         }
         args.extend([if resuming { "--resume" } else { "--session-id" }.into(), id.clone()]);
-        let mut claude = self.start_claude(command, &args, &[])?;
+        // its requests name the session, so the gateway folds them (claude_fold.rs); its own compaction off
+        let headers = format!("x-connectome: 1\nx-connectome-session: {}", self.name);
+        let mut claude = self.start_claude(command, &args, &[("ANTHROPIC_CUSTOM_HEADERS", headers), ("DISABLE_COMPACT", "1".into())])?;
         // 2) what was said, then what Claude Code says, until its result
         let initialize = obj! {"type" => "control_request", "request_id" => "initialize", "request" => obj! {"subtype" => "initialize"}};
         let started = claude.send(&initialize).and_then(|()| claude.send(&told_line(message)));
@@ -153,8 +156,10 @@ impl Worker<'_> {
         self.tell(Msg::Taking); // what the user says from now on comes here, at once
         let mut version = String::new();
         let mut reply = Reply::default();
-        let mut last_prompt = None; // the latest request's prompt
+        let (mut last_prompt, mut unlearnt) = (None, None); // the latest request's prompt, and it until a compile learns from it
         let mut limits = None; // the plan's, as Claude Code said them
+        let mut requests = VecDeque::new(); // Claude Code's requests the gateway holds until they're compiled
+        let turn_text = message["content"][0]["text"].as_str().unwrap_or("").to_string();
         let ended = match started { Err(e) => Err(format!("telling Claude Code what was said: {e}")), Ok(()) => 'turn: loop {
             if self.stopped() { break Err(STOPPED.into()) }
             // what's said meanwhile goes to Claude Code as it comes; a fork, or a turn that continues
@@ -164,6 +169,10 @@ impl Worker<'_> {
                 let (message, users) = match heard {
                     Job::Say { text: Some(text) } => (said("user", text), Some(job)),
                     Job::Hear(Heard { from, text }) | Job::Notice(Heard { from, text }) => (said(&from, text), None),
+                    Job::Fold { claude_session, body, answer } => {
+                        requests.push_back((claude_session, body, answer));
+                        continue;
+                    }
                     other => {
                         self.later.borrow_mut().push_back((job, other));
                         continue;
@@ -174,10 +183,19 @@ impl Worker<'_> {
                 }
                 told.push_back(Told { message, logged: false, job: users });
             }
-            let line = match claude.lines.recv_timeout(POLL) {
+            // a request compiles once the log has what Claude Code wrote before it: the lines it has written
+            let wait = if requests.is_empty() { POLL } else { Duration::ZERO };
+            let line = match claude.lines.recv_timeout(wait) {
                 Ok(Ok(line)) => line,
                 Ok(Err(e)) => break Err(format!("reading Claude Code's output: {e}")),
-                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some((claude_session, body, answer)) = requests.pop_front() {
+                        // the conversation of this turn's: a side request of Claude Code's has messages of its own
+                        let ours = claude_session == id && body["messages"].arr().iter().any(|m| m["role"] == "user" && claude_fold::says(m, &turn_text));
+                        let _ = answer.send(if ours { self.fold(&body, unlearnt.take().or_else(|| costs::unlearnt(&self.s))) } else { Ok(None) });
+                    }
+                    continue;
+                }
                 Err(RecvTimeoutError::Disconnected) => break Err("Claude Code stopped before its turn ended".into()),
             };
             if line.trim().is_empty() { continue }
@@ -201,7 +219,7 @@ impl Worker<'_> {
                         let counted = |n: Option<f64>| n.unwrap_or(0.0);
                         let prompt = counted(message.usage.input_tokens) + counted(message.usage.cache_read_input_tokens) + counted(message.usage.cache_creation_input_tokens);
                         self.event(Event::Prompt(prompt));
-                        last_prompt = Some(prompt);
+                        (last_prompt, unlearnt) = (Some(prompt), Some(prompt));
                     }
                     Ok(event) => {
                         if let Some(piece) = piece(event) { self.event(Event::Piece(piece)) }
@@ -324,7 +342,7 @@ impl Worker<'_> {
         };
         claude.args(args).current_dir(&workspace).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         claude.env("ANTHROPIC_BASE_URL", format!("http://{}/gateway", self.app.addr));
-        claude.env("ANTHROPIC_CUSTOM_HEADERS", format!("x-connectome: 1\nx-connectome-session: {}", self.name));
+        claude.env("ANTHROPIC_CUSTOM_HEADERS", "x-connectome: 1"); // which a POST to this server needs; a turn's name its session too
         for (name, value) in env {
             claude.env(name, value);
         }

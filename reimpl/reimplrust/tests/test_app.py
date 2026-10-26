@@ -29,14 +29,16 @@ sessions work on tasks as files, and a task's owner hears when it's handed to th
 Through the gateway, a request goes upstream as it came, but for this connection's headers, and its
 answer streams back as it comes, the exchange recorded without credentials. A Claude Code session
 (a fake one, fake_claude.py) takes its turns in Claude Code, in its sandbox, through the gateway,
-the page asking before its calls.
+the page asking before its calls; and a long one's requests fold there, to a model that refuses
+reasoning whose conversation changed.
 
-The nine parts (the chat, the tool calls, the large contexts, the companion, the lifted memories,
-the channels, the boards, the gateway, Claude Code) run at once, in processes of their own, each with its own mock; the first to fail stops the rest.
+The ten parts (the chat, the tool calls, the large contexts, the companion, the lifted memories,
+the channels, the boards, the gateway, Claude Code, its fold) run at once, in processes of their own, each with its own mock; the first to fail stops the rest.
 
     python3 tests/test_app.py [turns]
 """
 import datetime
+import hashlib
 import itertools
 import json
 import multiprocessing
@@ -1665,7 +1667,8 @@ def clauded(tls, ca) -> str:
     a turn of its own in the same run, which the turn waits for. The context shown is the last request's
     prompt, not the sum of the turn's that Claude Code's result counts. Its memories form after its
     turns, each written by a run of Claude Code of its own, on the session's model, with no tools,
-    Claude Code's least system prompt and no session kept, told the library's request as a transcript
+    Claude Code's least system prompt and no session kept, its requests through the gateway as they came (the
+    session's thread, which would fold them, waits on the run), told the library's request as a transcript
     (calls and results written out), its reasoning left out of the memory. A stopped turn ends at once, its reply as
     far as it came in the log, and what Claude Code hadn't taken in yet is the next turn. A Claude Code session can't fork, have a companion, or go on without a
     message."""
@@ -1793,7 +1796,7 @@ def clauded(tls, ca) -> str:
         flags = {flag: runs_of[0]['args'][runs_of[0]['args'].index(flag) + 1] for flag in ('--model', '--tools', '--system-prompt')}
         told = runs_of[0]['transcript']
         if not memories or not all(m['text'].startswith('I remember ') and 'recall' not in m['text'] for m in memories) or len(runs_of) != len(memories) \
-                or flags != {'--model': 'fake', '--tools': '', '--system-prompt': ''} or runs_of[0]['max_tokens'] != '20000':
+                or flags != {'--model': 'fake', '--tools': '', '--system-prompt': ''} or runs_of[0]['max_tokens'] != '20000' or {r['gateway'] for r in runs_of} != {200}:
             raise SystemExit(f'memories formed as {[m["text"] for m in memories]}, Claude Code run for them {len(runs_of)} times as {runs_of[:1] and runs_of[0]["args"]}')
         if abs(call(port, '/api/s/cc')['spent']['memories']['cost'] - 0.002 * len(runs_of)) > 1e-9:
             raise SystemExit(f'{len(runs_of)} memories\' runs cost the session {call(port, "/api/s/cc")["spent"].get("memories")}')
@@ -1830,6 +1833,213 @@ def clauded(tls, ca) -> str:
         mock.shutdown()
 
 
+modeled = []   # the requests Model took, as it took them
+
+
+def content(message) -> list:
+    """A message's blocks: a string's is one of text."""
+    return message['content'] if isinstance(message['content'], list) else [{'type': 'text', 'text': message['content']}]
+
+
+def signature(request, before) -> str:
+    """A reasoning block's signature, as Model writes it: what it binds (the system prompt, the tools and
+    the messages `before` it, cache breakpoints and earlier reasoning aside), hashed, and as long as a
+    real signature, about 500 tokens."""
+    bare = lambda b: {k: v for k, v in b.items() if k != 'cache_control'}
+    bound = [[bare(b) for b in request.get('system', [])], request.get('tools'), [[m['role'], [bare(b) for b in content(m) if b['type'] != 'thinking']] for m in before]]
+    return hashlib.sha256(json.dumps(bound, sort_keys=True).encode()).hexdigest() + '.' + 'x' * 2000
+
+
+def unfit(request) -> str | None:
+    """Why the Messages API would refuse a Claude Code session's request, if it would: a first message
+    not the user's, a system message that doesn't follow the user's, a call not answered in the user's
+    turn after it or a result that answers none (a role's consecutive messages join as one turn), a
+    call's id twice, more than four cache breakpoints, a turn that doesn't end with the user's; or a
+    reasoning block that isn't the conversation's as it is (preserved thinking)."""
+    messages = request['messages']
+    if not messages or messages[0]['role'] != 'user':
+        return f'the first message is {messages[:1]}'
+    if any(m['role'] == 'system' and before['role'] != 'user' for before, m in zip(messages, messages[1:])):
+        return 'a system message after another\'s'
+    breakpoints = sum('cache_control' in b for m in messages for b in content(m)) + sum('cache_control' in b for b in request.get('system', []))
+    if breakpoints > 4:
+        return f'{breakpoints} cache breakpoints'
+    turns = []
+    for m in messages:
+        if m['role'] == 'system':
+            continue
+        if turns and turns[-1][0] == m['role']:
+            turns[-1][1].extend(content(m))
+        else:
+            turns.append((m['role'], list(content(m))))
+    if turns[-1][0] != 'user':
+        return 'the conversation ends with the assistant\'s'
+    calls = [b['id'] for _, blocks in turns for b in blocks if b['type'] == 'tool_use']
+    if len(calls) != len(set(calls)):
+        return f'calls of the same id: {calls}'
+    for (role, blocks), (_, after) in zip(turns, turns[1:]):
+        uses, answered = [b['id'] for b in blocks if b['type'] == 'tool_use'], [b['tool_use_id'] for b in after if b['type'] == 'tool_result']
+        if role == 'assistant' and sorted(uses) != sorted(answered):
+            return f'calls {uses} answered by {answered}'
+    if any(b['type'] == 'tool_result' for b in turns[0][1]):
+        return 'results first'
+    for i, m in enumerate(messages):
+        if any(b['type'] == 'thinking' and b['signature'] != signature(request, messages[:i]) for b in content(m)):
+            return f'messages.{i}: Invalid `signature` in `thinking` block. The block is bound to a different conversation.'
+    return None
+
+
+class Model(BaseHTTPRequestHandler):
+    """Claude as a Claude Code session's requests reach it through the gateway: it refuses what the API
+    would (unfit), and replies with reasoning first, signed: to results, 'Ran it.'; to 'run COMMAND', a
+    call to Bash; to anything else, 'Noted.' A prompt's usage is a quarter of its request's bytes."""
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        request = json.loads(body := self.rfile.read(int(self.headers['content-length'])))
+        if self.headers.get('x-claude-code-session-id') != 'memory':   # a memory's run's request, which fake_claude.py makes to see it answered
+            modeled.append(request)
+        if problem := unfit(request):
+            seen['problems'].append(problem)
+            data = json.dumps({'type': 'error', 'error': {'type': 'invalid_request_error', 'message': problem}}).encode()
+            self.send_response(400)
+            self.send_header('content-type', 'application/json')
+            self.send_header('content-length', str(len(data)))
+            self.end_headers()
+            return self.wfile.write(data)
+        last = next(m for m in reversed(request['messages']) if m['role'] != 'system')
+        said = ' '.join(b['text'] for b in content(last) if b['type'] == 'text')
+        reply, stop = [{'type': 'text', 'text': 'Noted.'}], 'end_turn'
+        if any(b['type'] == 'tool_result' for b in content(last)):
+            reply = [{'type': 'text', 'text': 'Ran it.'}]
+        elif said.startswith('run '):
+            reply, stop = [{'type': 'tool_use', 'id': f'toolu_{len(modeled)}', 'name': 'Bash', 'input': {'command': said[4:]}}], 'tool_use'
+        reply.insert(0, {'type': 'thinking', 'thinking': '', 'signature': signature(request, request['messages'])})
+        events = [('message_start', {'message': {'id': f'msg_{len(modeled)}', 'role': 'assistant', 'content': [], 'usage': {'input_tokens': len(body) // 4, 'output_tokens': 1}}})]
+        for i, block in enumerate(reply):
+            if block['type'] == 'tool_use':
+                events += [('content_block_start', {'index': i, 'content_block': {**block, 'input': {}}}),
+                           ('content_block_delta', {'index': i, 'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(block['input'])}})]
+            elif block['type'] == 'thinking':
+                events += [('content_block_start', {'index': i, 'content_block': {'type': 'thinking', 'thinking': '', 'signature': ''}}),
+                           ('content_block_delta', {'index': i, 'delta': {'type': 'signature_delta', 'signature': block['signature']}})]
+            else:
+                events += [('content_block_start', {'index': i, 'content_block': {'type': 'text', 'text': ''}}),
+                           ('content_block_delta', {'index': i, 'delta': {'type': 'text_delta', 'text': block['text']}})]
+            events.append(('content_block_stop', {'index': i}))
+        events += [('message_delta', {'delta': {'stop_reason': stop}, 'usage': {'output_tokens': 5}}), ('message_stop', {})]
+        data = ''.join(f'event: {kind}\ndata: {json.dumps({"type": kind, **fields})}\n\n' for kind, fields in events).encode()
+        self.send_response(200)
+        self.send_header('content-type', 'text/event-stream')
+        self.send_header('content-length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def folded(tls, ca) -> str:
+    """A Claude Code session's requests folded by the gateway (fake_claude.py --converse, which sends
+    its whole conversation with every request, to Model, which refuses reasoning whose conversation
+    changed): until memories stand for part of the context, a request goes as Claude Code sent it; past
+    fold_above, at a turn's start, it goes with the context up to its last memory (the Context Manager's
+    question, the memories, the last of them last) in place of the oldest of Claude Code's messages, then the rest of them as
+    Claude Code sent them, from one that starts a turn or a reply; their reasoning from before that
+    changed goes, and none that's still the conversation's (what goes before it unchanged since it was
+    written), which Model takes; what goes ahead changes only as the context folds, smaller, as a
+    change costs the cache and the reasoning; what the log doesn't have of the messages folded, Claude Code's
+    reminders and its system messages (not one that tells of a message said mid-turn, which the
+    log has), goes ahead of the memories; what goes before Claude Code's messages changes only at a turn's start,
+    never during a turn's calls. A turn that brings the context past fold_above before the memories it
+    takes have formed waits for them, Claude Code's request held. The prompts the requests had calibrate
+    the compiles. Claude Code runs with its own compaction off, and the log has every message."""
+    port, root, mock_port, work = free_port(), tempfile.mkdtemp(), free_port(), tempfile.mkdtemp()
+    mock = serve(mock_port, tls, Model)
+    app = launch(root, port, ca, '--upstream', f'https://localhost:{mock_port}')
+    try:
+        configure(root, f'https://localhost:{mock_port}', 20000, 3500, 200)
+        everything = json.loads(Path(root, 'settings.json').read_text())
+        everything['providers']['code'] = {'base': '', 'key': '', 'models': ['fake'], 'command': [os.path.realpath(sys.executable), str(HERE / 'fake_claude.py'), '--converse']}
+        Path(root, 'settings.json').write_text(json.dumps(everything))
+        call(port, '/api/sessions', {'name': 'cf', 'workspace': work})
+        call(port, '/api/s/cf/settings', {'provider': 'code', 'model': 'fake', 'fold_above': 7000, 'fold_to': 5500})
+        said = [f'run echo {n}' if n % 3 == 2 else f'part {n}: ' + ' '.join(f'word{n}x{i}' for i in range(60)) for n in range(18)]
+        said[5], said[14] = 'run wait', 'run cat big'   # a message said during a call; a result past fold_above, mid-turn
+        said.insert(6, 'and also this')
+        for text in said:
+            if text == 'and also this':
+                continue
+            if text != 'run wait':
+                say(port, 'cf', text)
+                continue
+            r, events = following(port, 'cf')
+            with r:
+                next(events)
+                job = call(port, '/api/s/cf/say', {'text': text})['job']
+                for event in events:
+                    if event.get('calling') == 'Bash':
+                        call(port, '/api/s/cf/say', {'text': 'and also this'})
+                    if event.get('done') == job:
+                        break
+        sent = [json.loads(line) for line in Path(work, 'claude-requests.jsonl').read_text().splitlines()]
+        if seen['problems'] or len(modeled) != len(sent):
+            raise SystemExit(f'the model refused {seen["problems"][:1]}; Claude Code sent {len(sent)} requests, the model got {len(modeled)}')
+        bare = lambda messages: [{**m, 'content': [b for b in content(m) if b['type'] != 'thinking']} for m in messages]
+        label = json.loads(Path(root, 'settings.json').read_text())['defaults']['config']['summary_label']
+        first, ahead, kept = None, None, 0
+        for n, (claude, got) in enumerate(zip(sent, modeled)):
+            mine, theirs = claude['body']['messages'], got['messages']
+            if not any(b.get('text') == label for b in content(theirs[0])):   # the Context Manager's question: folded
+                if first is not None or got != claude['body']:
+                    raise SystemExit(f'request {n} went unfolded{" after a fold" if first is not None else ", not as Claude Code sent it"}: {json.dumps(theirs)[:400]}')
+                continue
+            first = n if first is None else first
+            cut = next((c for c in range(len(mine)) if bare(theirs[len(theirs) - len(mine) + c:]) == bare(mine[c:])), None)
+            if cut is None or {k: v for k, v in got.items() if k != 'messages'} != {k: v for k, v in claude['body'].items() if k != 'messages'}:
+                raise SystemExit(f'request {n} ends with none of Claude Code\'s messages as it sent them, or not its fields: {json.dumps(theirs)[-600:]}')
+            before = theirs[:len(theirs) - len(mine) + cut]
+            standing = [content(before[0])[0].get('text', ''), before[1]['role'], content(before[1])]   # what the log hasn't: Claude Code's reminders, its environment
+            if standing != [mine[0]['content'][0]['text'] if cut else label, 'system' if cut else 'assistant', [{'type': 'text', 'text': '# Environment\nYou run in a fake.'}] if cut else standing[2]]:
+                raise SystemExit(f'request {n} goes ahead with {json.dumps(before[:2])[:400]}, not Claude Code\'s reminders and its environment')
+            if before[-1]['role'] != 'assistant' or not content(before[-1])[-1].get('text', '').startswith('I remember ') or mine[cut]['role'] == 'system' \
+                    or any(b['type'] == 'tool_result' for b in content(mine[cut])) or any(b['type'] == 'thinking' for m in before for b in content(m)):
+                raise SystemExit(f'request {n} folded as {json.dumps(before)[:600]}, then Claude Code\'s from {json.dumps(mine[cut])[:200]}')
+            starts = not any(b['type'] == 'tool_result' for b in content(next(m for m in reversed(mine) if m['role'] != 'system')))
+            if before != ahead and ahead is not None and not starts:
+                raise SystemExit(f'what goes before Claude Code\'s messages changed during a turn, at request {n}')
+            if before != ahead and len(json.dumps(got)) >= len(json.dumps(modeled[n - 1])):   # a fold, not an unfold as calibration moves
+                raise SystemExit(f'what goes before Claude Code\'s messages changed at request {n}, which is no smaller than the one before')
+            ahead = before
+            for i, m in enumerate(mine[cut:]):   # reasoning that's still the conversation's stays
+                at = len(before) + i
+                for b in content(m):
+                    still = b['type'] == 'thinking' and b['signature'] == signature(got, theirs[:at])
+                    if still and b not in content(theirs[at]):
+                        raise SystemExit(f'request {n} left out reasoning that was still the conversation\'s, of message {cut + i}')
+                    kept += still
+        if first is None or kept == 0:
+            raise SystemExit(f'the context never folded (first folded request {first}), or no reasoning was kept after a fold ({kept})')
+        if len(modeled[first]['messages']) >= len(sent[first]['body']['messages']) or len(json.dumps(modeled[first])) >= len(json.dumps(modeled[first - 1])):
+            raise SystemExit(f'the first fold, of request {first}, made it no smaller')
+        memories = [json.loads(line)['at'] for line in Path(work, 'claude-memories.jsonl').read_text().splitlines()]   # each run's request answered, not held (claude part)
+        held = [n for n, r in enumerate(sent) if any(r['sent'] < at < r['answered'] for at in memories)]
+        if not held or any(n < first or len(json.dumps(modeled[n])) >= len(json.dumps(sent[n]['body'])) for n in held):
+            raise SystemExit(f'no request waited for the memories its fold took, or one that waited went unfolded: {held}, folded from {first}')
+        runs = [json.loads(line) for line in Path(work, 'claude-runs.jsonl').read_text().splitlines()]
+        if {r['compact'] for r in runs} != {'1'}:
+            raise SystemExit(f'Claude Code ran with DISABLE_COMPACT {[r["compact"] for r in runs]}')
+        if abs(call(port, '/api/s/cf')['multiplier'] - 1) < 0.05:   # Model's prompts are a quarter of a request's bytes, which the library prices higher
+            raise SystemExit(f'the price multiplier learnt nothing from the requests\' prompts: {call(port, "/api/s/cf")["multiplier"]}')
+        logged = [words(m) for m in call(port, '/api/s/cf/messages') if m['participant'] == 'user' and words(m)]
+        if logged != said or not Path(root, 'cf', 'prefixes.jsonl').exists():
+            raise SystemExit(f'the log has {len(logged)} of the {len(said)} messages said, or no record of what went ahead')
+        return f'{len(sent)} Claude Code requests, folded from the {first + 1}th, {len(held)} held while memories formed, {kept} reasoning blocks kept after folds'
+    finally:
+        app.terminate()
+        mock.shutdown()
+
+
 def part(name, run, done):
     """A part of the test in a process group of its own, which its apps and their servers join, so
     that killing the group stops them all: (name, its summary or None, why it failed or None, counts)."""
@@ -1857,7 +2067,7 @@ def main(turns=60):
     parts = {'chat': lambda: chatted(turns, (cert, key), ca, baseline), 'tools': lambda: tooled((cert, key), ca, baseline), 'large': lambda: streamed_large((cert, key), ca),
              'companion': lambda: accompanied((cert, key), ca), 'lifted': lambda: lifted((cert, key), ca), 'channels': lambda: channeled((cert, key), ca),
              'boards': lambda: boarded((cert, key), ca), 'gateway': lambda: gatewayed((cert, key), ca),
-             'claude': lambda: clauded((cert, key), ca)}
+             'claude': lambda: clauded((cert, key), ca), 'fold': lambda: folded((cert, key), ca)}
     running = [forked.Process(target=part, args=(name, run, done)) for name, run in parts.items()]
     summaries, totals, failure = {}, {'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0}, None
     try:
@@ -1882,7 +2092,7 @@ def main(turns=60):
         print(failure)
         return 1
     print(f'{totals["chat"]} chat turns and {totals["memory"]} memory requests; {summaries["chat"]}; {totals["bytes"] // 1024} KB of requests streamed '
-          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}; {summaries["gateway"]}; {summaries["claude"]}')
+          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}; {summaries["gateway"]}; {summaries["claude"]}; {summaries["fold"]}')
     return 0
 
 

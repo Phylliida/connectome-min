@@ -262,19 +262,21 @@ follows its session again on its own. If a session's files are
 edited into something the library can't read, its stream says so, and reads them again at the next
 event.
 
-The gateway (`app/src/gateway.rs`), for now, only records. Claude Code (or the Agent SDK, which runs
-it, or anything else that speaks the Messages API) run with
-`ANTHROPIC_BASE_URL=http://127.0.0.1:8080/gateway` and `ANTHROPIC_CUSTOM_HEADERS='x-connectome: 1'`
-(the header every POST here carries) sends its requests here, and each goes on to `--upstream` as it
-came: its body byte for byte, and its headers but this connection's (host, connection, content-length,
-transfer-encoding and the like; accept-encoding, so the answer comes uncompressed; and x-connectome),
-so its own credentials go with it, an API key or a Claude login's token. The answer streams back as it
-arrives, with its status and headers. Each exchange joins
+The gateway (`app/src/gateway.rs`): Claude Code (or the Agent SDK, which runs it, or anything else
+that speaks the Messages API) run with `ANTHROPIC_BASE_URL=http://127.0.0.1:8080/gateway` and
+`ANTHROPIC_CUSTOM_HEADERS='x-connectome: 1'` (the header every POST here carries) sends its requests
+here, and each goes on to `--upstream` with its headers but this connection's (host, connection,
+content-length, transfer-encoding and the like; accept-encoding, so the answer comes uncompressed; and
+x-connectome), so its own credentials go with it, an API key or a Claude login's token. A request of
+the conversation a Claude Code session's turn runs is compiled (below); any other goes as it came,
+its body byte for byte: a subagent's (`x-claude-code-agent-id`), one of another class
+(`x-claude-code-request-class`), a memory's run's, which doesn't name the session. The answer streams
+back as it arrives, with its status and headers. Each exchange joins
 `ROOT/.gateway/SESSION/exchanges.jsonl` (SESSION is the request's `x-claude-code-session-id`, or
-`unnamed`): `{id, at, method, path, headers, body, status, answer_headers, answer, failed}`, its
-`authorization` and `x-api-key` left out, so a real session's requests can be read before the
-gateway changes any of them. A record holds the whole request, which for Claude Code is the whole
-conversation so far, so a long session's recording grows fast.
+`unnamed`): `{id, at, method, path, headers, body, folded, status, answer_headers, answer, failed}`,
+the body as it went upstream, `folded` if compiled, its `authorization` and `x-api-key` left out. A
+record holds the whole request, which for Claude Code is its whole conversation, so a long session's
+recording grows fast; a request to the gateway takes 1 GiB at most.
 
 Claude Code sessions (`app/src/claude.rs`) take their turns in Claude Code: a provider in
 settings.json with a `command`, how to run Claude Code (`["claude"]`, or whatever runs it here, say
@@ -288,7 +290,8 @@ before a tool runs), with the session's model and its system prompt appended to 
 (`--append-system-prompt`, boards' note included), the MCP servers of `mcp.json` and no others
 (`--strict-mcp-config`), none of the user's Claude Code settings files (`--setting-sources ""`),
 and Claude Code's own sandbox off. Its requests go through the gateway (ANTHROPIC_BASE_URL), headed
-`x-connectome-session: NAME`. In the session's sandbox, bubblewrap wraps all of Claude Code, as it
+`x-connectome-session: NAME`, which folds them (below), so its own compaction is off
+(`DISABLE_COMPACT=1`). In the session's sandbox, bubblewrap wraps all of Claude Code, as it
 does bash, with the same paths, besides Claude Code's own: its command's absolute paths, read-only,
 and `~/.claude` (its login and sessions), read-write, but not `~/.claude.json`, its global settings,
 which a headless run does without (it says so on stderr) and which Claude Code saves by putting a new
@@ -317,7 +320,8 @@ turns, each written by a run of Claude Code of its own (`app/src/claude_memory.r
 model (or `config.compression_model`), so they're the same model's: no tools (`--tools ""`), Claude
 Code's least system prompt (`--system-prompt ""`), no session kept (`--no-session-persistence`), and
 the memory's max tokens (`CLAUDE_CODE_MAX_OUTPUT_TOKENS`), in the session's sandbox and through the
-gateway like its turns. Claude Code takes only user messages, so the library's request goes as one,
+gateway like its turns, but not naming the session, so its requests go as they came (the session's
+thread, which would fold them, waits on the run). Claude Code takes only user messages, so the library's request goes as one,
 a transcript: a line on how it's laid out, then each turn headed by who says it, calls and their
 results in brackets, reasoning left out. Its cost joins the session's, for memories. The page draws
 Claude Code's calls by what they do: an Edit as a diff, colored in its file's language, as it draws
@@ -327,23 +331,44 @@ says it holds Claude Code. On a plan, Claude Code says the plan's limits as each
 `rate_limit_event`): the session's panel shows how much of the 5-hour and the 7-day windows is used,
 each with a bar, and the time until it resets, counting down, as the session's last run said them
 (kept in its costs record, `limits`, so they're there after a restart; a window past its reset says
-so). Not yet: what
-Claude Code sees is still its own conversation (the gateway forwards its requests unchanged), forks,
-a companion, and Continue without a message.
+so). Not yet: forks, a companion, and Continue without a message.
+
+A Claude Code session's context folds in the gateway (`app/src/claude_fold.rs`). Claude Code keeps
+its whole conversation and sends all of it with each request, which waits while the session's thread
+compiles the context from the log as a step does (`fold_above` and `fold_to`, as many memories forming
+first as a fold takes, the request held meanwhile). Until memories stand for part of the context, the
+request goes as it came. Once they do, it goes with the context up to its last memory in place of the
+oldest of Claude Code's messages, then the rest of them as Claude Code sent them, from the first of
+the log's messages after that part (found by its calls', results' and reasoning's ids, else its text),
+back to one that starts a turn or a reply: so its system prompt, tools, reminders and the system
+messages it adds mid-session, which the log doesn't have, go as it sent them. What Claude Code's folded
+messages hold that the log doesn't, so no memory does, goes ahead of the memories: the reminders it
+began its session with (CLAUDE.md, the user's context) and its system messages (where it runs, its MCP
+servers' instructions, tools it added or took away, its effort), but those that tell of a message said
+mid-turn, which the log has. A request folds at a turn's start; mid-turn only once the context
+wouldn't fit the window otherwise; and what goes ahead of Claude Code's messages changes only as it
+folds (it unfolds back to `fold_to` as a fold lands, never at `config.unfold_below`), since every change
+costs the cache and the reasoning: a reasoning block a request carries back is bound by its signature
+to what came before it (Claude's preserved thinking: an edit there is a 400), so after each change the
+reasoning Claude Code's messages hold from before it goes (their text and calls stay), the same on
+every request after. `ROOT/NAME/prefixes.jsonl` records each change, `{id, shape, reasoning}`: what
+went ahead, and the digest of the newest reasoning block Claude Code's messages had then, from whose
+message back the reasoning goes. Claude Code's system prompt, tools, reminders and system messages
+count as what every request carries besides the context, as a step's system prompt and tools do.
 
 Flags: `--root DIR` (sessions and settings; `sessions` by default), `--addr` (`127.0.0.1:8080`),
 `--ca PEM` (root certificates to trust instead of Mozilla's: a company proxy's, a test server's),
 `--mcp FILE`, `--tool-timeout SECONDS`, `--no-bash`, `--upstream URL` (where the gateway sends
 requests on; `https://api.anthropic.com` by default), and `--no-open` (else the page opens in the
 browser). The server answers only its own page: requests must name it as their Host, and POSTs must
-carry its `x-connectome` header. A request's body takes 32 MiB at most.
+carry its `x-connectome` header. A request's body takes 32 MiB at most (the gateway's 1 GiB).
 
 Tests:
 
 ```sh
 cargo test                  # unit tests of the JavaScript and Python arithmetic the ports share
 python3 tests/test_rust.py  # every compile, request and file record the same as reimplclean2's, handoffs both ways, the planner
-python3 tests/test_app.py   # the app against mock APIs over HTTPS, its parts at once: chat, memories, forks, settings, certificates, bash, its sandbox, approvals, timeouts and tools through fake MCP servers, flat memory, the gateway, Claude Code sessions through a fake of it (fake_claude.py)
+python3 tests/test_app.py   # the app against mock APIs over HTTPS, its parts at once: chat, memories, forks, settings, certificates, bash, its sandbox, approvals, timeouts and tools through fake MCP servers, flat memory, the gateway, Claude Code sessions through a fake of it (fake_claude.py), their requests folded in the gateway to a model that checks preserved thinking
 python3 tests/mutants.py tests/test_app.py app/src/work.rs=mutants.json   # mutation testing, each mutant in a copy of its own, many at once
 ```
 
