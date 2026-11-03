@@ -88,7 +88,7 @@ impl Host for Summarizer<'_> {
         let model = if request.model.is_empty() { &self.setup.settings.model } else { &request.model };
         let none = request.tools.as_ref().map(|_| obj! {"type" => "none"});
         let head = sparse(obj! {"model" => model.as_str(), "max_tokens" => request.max_tokens, "tools" => request.tools.clone(), "tool_choice" => none});
-        let reply = self.setup.llm.messages(head, &request.messages, reader, |_| !(self.stopped)(), self.stopped, |_, _| {});
+        let reply = self.setup.llm.messages(head, &request.messages, reader, false, |_| !(self.stopped)(), self.stopped, |_, _| {});
         self.ended = reply.as_ref().ok().map(|r| (r["stopReason"].as_str().unwrap_or("nothing").to_string(), request.max_tokens));
         if (self.stopped)() { Err(INTERRUPTED.into()) } else { reply }
     }
@@ -304,11 +304,14 @@ impl Worker<'_> {
             !self.stopped()
         };
         let retrying = |n, why: &str| self.event(Event::Retry { n, of: RETRIES.len(), why: why.into() });
-        let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), piece, &|| self.stopped(), retrying);
+        let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), true, piece, &|| self.stopped(), retrying);
         let reply = reply.map_err(|why| if self.stopped() { STOPPED.into() } else { why })?;
         self.spend(&setup, For::Reply);
         append(s, &obj! {"participant" => "assistant", "content" => reply["content"].clone()}, cfg);
         self.logged();
+        // a reply cut short once its text or reasoning began is kept as far as it came, and the turn ends there:
+        // Continue goes on from it
+        if let Some(why) = reply["cut"].as_str() { return Err(format!("{why}; the reply is kept as far as it came")) }
         let calls = reply["content"].arr().iter().filter(|b| b.kind() == "tool_use");
         let run = |call: &Value| if call["name"] == ask::NAME && setup.settings.questions { self.ask_user(call) } else { self.approve(&setup, call).map_or_else(|why| tools::result(call, Err(why.into())), |()| {
             self.event(Event::Running { id: call["id"].as_str().unwrap_or("").into(), tool: call["name"].as_str().unwrap_or("").into() });

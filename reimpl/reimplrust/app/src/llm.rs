@@ -85,15 +85,20 @@ impl Llm {
     /// Hands `piece` each piece of the reply as it arrives (Piece), and gives the whole reply as the
     /// library takes it: {stopReason, content, usage: {inputTokens, outputTokens}}. Once `piece`
     /// answers false, the reply stops there: its stop reason "stopped", its calls left out. A failure
-    /// that may pass is tried again (retried); what the attempt handed `piece` is then void, which
-    /// `retrying` hears first. Only a reply that comes whole counts toward what was spent.
-    pub fn messages(&self, mut head: Value, turns: &[Turn], reader: &mut Reader, mut piece: impl FnMut(Piece) -> bool, stopped: &dyn Fn() -> bool, retrying: impl FnMut(usize, &str)) -> Result<Value, String> {
+    /// that may pass is tried again (retried) while none of the reply's text or reasoning has come;
+    /// what the attempt handed `piece` is then void, which `retrying` hears first. Once some has, if
+    /// the caller `keep`s it, a failure ends the reply there instead, its stop reason "cut", why in
+    /// `cut`, its calls left out: a turn's reply keeps what came (a local model may have reasoned for
+    /// an hour), where a memory's, which must come whole, is tried again from the start. Only a reply
+    /// that comes, whole or cut, counts toward what was spent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn messages(&self, mut head: Value, turns: &[Turn], reader: &mut Reader, keep: bool, mut piece: impl FnMut(Piece) -> bool, stopped: &dyn Fn() -> bool, retrying: impl FnMut(usize, &str)) -> Result<Value, String> {
         head["stream"] = true.into();
-        retried(|| self.attempt(&head, turns, reader, &mut piece), stopped, retrying, std::thread::sleep)
+        retried(|| self.attempt(&head, turns, reader, keep, &mut piece), stopped, retrying, std::thread::sleep)
     }
 
     /// One try of a request (messages).
-    fn attempt(&self, head: &Value, turns: &[Turn], reader: &mut Reader, piece: &mut impl FnMut(Piece) -> bool) -> Result<Value, Failed> {
+    fn attempt(&self, head: &Value, turns: &[Turn], reader: &mut Reader, keep: bool, piece: &mut impl FnMut(Piece) -> bool) -> Result<Value, Failed> {
         let base = self.base.trim_end_matches('/');
         let url = if base.ends_with("/v1") { format!("{base}/messages") } else { format!("{base}/v1/messages") };
         let request = self.agent.post(&url).header("x-api-key", &self.key).header("anthropic-version", "2023-06-01").header("content-type", "application/json");
@@ -121,13 +126,17 @@ impl Llm {
         // each event's data, until OpenRouter's [DONE] (it ends the stream as OpenAI's does, past message_stop)
         let lines = BufReader::new(body.into_reader()).lines().map(|line| line.map_err(|e| e.to_string()));
         let data = lines.filter_map(|line| line.map(|l| l.strip_prefix("data:").map(|d| d.trim().to_string())).transpose());
-        let mut reply = Reply::default();
+        let (mut reply, mut failed) = (Reply::default(), None);
         for d in data.take_while(|d| d.as_deref() != Ok("[DONE]")) {
-            reply = reply.event(serde_json::from_str(&d?).map_err(|e| e.to_string())?, piece)?;
+            let event = d.and_then(|d| serde_json::from_str(&d).map_err(|e| e.to_string()));
+            if let Err(why) = event.map_err(Failed::from).and_then(|e| reply.event(e, piece)) {
+                failed = Some(why);
+                break;
+            }
             if reply.halted { break } // the connection goes with the response
         }
         let used = reply.used;
-        let done = reply.done()?;
+        let done = reply.ended(failed, keep)?;
         self.spent.set(self.spent.get() + used);
         Ok(done)
     }
@@ -200,7 +209,8 @@ pub enum Content {
     Text { text: String },
     Thinking { thinking: String, signature: Option<String> },
     RedactedThinking { data: Value },
-    ToolUse { id: String, name: String, input: Value, #[serde(skip)] json: String }, // the input's JSON, parsed once whole
+    // the input's JSON, parsed once whole; a call starts with input {}, or (llama.cpp's server) with none
+    ToolUse { id: String, name: String, #[serde(default = "no_input")] input: Value, #[serde(skip)] json: String },
     #[serde(other)] Other,
 }
 
@@ -214,12 +224,14 @@ pub enum Delta {
     #[serde(other)] Other,
 }
 
-/// A streamed reply as its events build it, a fold over them, and whether its caller stopped it.
+fn no_input() -> Value { obj! {} }
+
+/// A streamed reply as its events build it, and whether its caller stopped it.
 #[derive(Default)]
 struct Reply { blocks: Vec<Content>, stop: Option<String>, used: Usage, halted: bool }
 
 impl Reply {
-    fn event(mut self, e: Streamed, show: &mut impl FnMut(Piece) -> bool) -> Result<Reply, Failed> {
+    fn event(&mut self, e: Streamed, show: &mut impl FnMut(Piece) -> bool) -> Result<(), Failed> {
         match e {
             Streamed::MessageStart { message } => self.used(&message.usage),
             Streamed::ContentBlockStart { content_block } => {
@@ -261,7 +273,7 @@ impl Reply {
             }
             Streamed::Other => {}
         }
-        Ok(self)
+        Ok(())
     }
 
     /// The usage an event reports. Counts only grow over a stream, which reports them at its start
@@ -274,16 +286,36 @@ impl Reply {
         used.cost = c.cost.or(used.cost);
     }
 
-    /// The reply, once it has stopped: a stream that ends before its stop reason was cut off. One its
-    /// caller stopped keeps its text and reasoning so far, not its calls, which may be half written.
-    fn done(self) -> Result<Value, String> {
-        let stop = if self.halted { "stopped".into() } else { self.stop.ok_or("the reply's stream ended before the reply did")? };
-        let kept = self.blocks.into_iter().filter(|b| !(self.halted && matches!(b, Content::ToolUse { .. })));
-        Ok(obj! {
+    /// Whether any of its text or reasoning has come.
+    fn began(&self) -> bool {
+        self.blocks.iter().any(|b| match b {
+            Content::Text { text } => !text.is_empty(),
+            Content::Thinking { thinking, .. } => !thinking.is_empty(),
+            Content::RedactedThinking { .. } => true,
+            _ => false,
+        })
+    }
+
+    /// The reply, once its stream has ended, or `failed` (one that ends before its stop reason was cut
+    /// off). One its caller stopped keeps its text and reasoning so far, not its calls, which may be
+    /// half written; so does one that failed once its text or reasoning began, if the caller `keep`s
+    /// it: its stop reason "cut", and why (`cut`).
+    fn ended(self, failed: Option<Failed>, keep: bool) -> Result<Value, Failed> {
+        let failed = failed.or_else(|| (self.stop.is_none() && !self.halted).then(|| "the reply's stream ended before the reply did".into()));
+        let (stop, cut) = match failed {
+            None if self.halted => ("stopped".to_string(), None),
+            None => (self.stop.clone().unwrap_or_default(), None),
+            Some(failed) if keep && self.began() => ("cut".to_string(), Some(failed.why)),
+            Some(failed) => return Err(failed),
+        };
+        let whole = stop != "stopped" && cut.is_none();
+        let kept = self.blocks.into_iter().filter(|b| whole || !matches!(b, Content::ToolUse { .. }));
+        Ok(sparse(obj! {
             "stopReason" => stop,
             "content" => kept.filter_map(Content::logged).collect::<Vec<_>>(),
             "usage" => obj! {"inputTokens" => self.used.input, "outputTokens" => self.used.output},
-        })
+            "cut" => cut,
+        }))
     }
 }
 
@@ -397,19 +429,22 @@ mod tests {
         assert_eq!(tried(9, true, Some(1)), (Err("no 1".into()), vec![1], vec![Duration::ZERO])); // a stop ends the wait
     }
 
-    /// A reply built from a stream's events, and the pieces it showed.
-    fn streamed(events: &[&str]) -> (Result<Reply, Failed>, Vec<String>) {
-        let mut pieces = vec![];
-        let reply = events.iter().try_fold(Reply::default(), |reply, e| reply.event(serde_json::from_str(e).expect("an event"), &mut |p| {
-            pieces.push(json::to_string(&p));
-            true
-        }));
-        (reply, pieces)
+    /// A reply built from a stream's events, how its stream failed, if it did, and the pieces it showed.
+    fn streamed(events: &[&str]) -> (Reply, Option<Failed>, Vec<String>) {
+        let (mut reply, mut pieces) = (Reply::default(), vec![]);
+        for e in events {
+            let shown = reply.event(serde_json::from_str(e).expect("an event"), &mut |p| {
+                pieces.push(json::to_string(&p));
+                true
+            });
+            if let Err(failed) = shown { return (reply, Some(failed), pieces) }
+        }
+        (reply, None, pieces)
     }
 
     #[test]
     fn a_stream_builds_its_reply() {
-        let (reply, pieces) = streamed(&[
+        let (reply, failed, pieces) = streamed(&[
             r#"{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"usage":{"input_tokens":10,"cache_read_input_tokens":5,"cache_creation_input_tokens":null,"output_tokens":1}}}"#,
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Hm."}}"#,
@@ -426,45 +461,68 @@ mod tests {
             r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}"#,
             r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}"#,
             r#"{"type":"content_block_stop","index":3}"#,
+            // as llama.cpp's server starts a call: no input
+            r#"{"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"t2","name":"bash"}}"#,
+            r#"{"type":"content_block_delta","index":4,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pwd\"}"}}"#,
+            r#"{"type":"content_block_stop","index":4}"#,
+            r#"{"type":"content_block_start","index":5,"content_block":{"type":"tool_use","id":"t3","name":"date"}}"#,
+            r#"{"type":"content_block_stop","index":5}"#,
             r#"{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":7,"cost":0.5}}"#,
             r#"{"type":"message_stop"}"#,
         ]);
-        let reply = reply.expect("a reply");
+        assert!(failed.is_none());
         assert_eq!((reply.used.cost, reply.used.input, reply.used.cached, reply.used.output), (Some(0.5), 15.0, 5.0, 7.0));
-        assert_eq!(pieces, [r#"{"thinking":"Hm."}"#, r#"{"text":"Hi"}"#, r#"{"calling":"bash"}"#, r#"{"input":"{\"command\":"}"#, r#"{"input":"\"ls\"}"}"#]);
+        assert_eq!(pieces, [r#"{"thinking":"Hm."}"#, r#"{"text":"Hi"}"#, r#"{"calling":"bash"}"#, r#"{"input":"{\"command\":"}"#, r#"{"input":"\"ls\"}"}"#,
+            r#"{"calling":"bash"}"#, r#"{"input":"{\"command\":\"pwd\"}"}"#, r#"{"calling":"date"}"#]);
         let content = vec![
             obj! {"type" => "thinking", "thinking" => "Hm.", "signature" => "c2ln"},
             obj! {"type" => "text", "text" => "Hi"},
             obj! {"type" => "tool_use", "id" => "t1", "name" => "bash", "input" => obj! {"command" => "ls"}},
+            obj! {"type" => "tool_use", "id" => "t2", "name" => "bash", "input" => obj! {"command" => "pwd"}},
+            obj! {"type" => "tool_use", "id" => "t3", "name" => "date", "input" => obj! {}},
         ];
-        assert_eq!(reply.done(), Ok(obj! {"stopReason" => "tool_use", "content" => content, "usage" => obj! {"inputTokens" => 15.0, "outputTokens" => 7.0}}));
+        assert_eq!(reply.ended(None, true), Ok(obj! {"stopReason" => "tool_use", "content" => content, "usage" => obj! {"inputTokens" => 15.0, "outputTokens" => 7.0}}));
     }
 
     #[test]
     fn a_stream_its_caller_stops_keeps_what_came() {
-        let mut shown = 0;
-        let reply = [
+        let (mut shown, mut reply) = (0, Reply::default());
+        for e in [
             r#"{"type":"message_start","message":{"usage":{"input_tokens":5}}}"#,
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}"#,
             r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"bash","input":{}}}"#,
             r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"comm"}}"#,
-        ].iter().try_fold(Reply::default(), |reply, e| reply.event(serde_json::from_str(e).expect("an event"), &mut |_| {
-            shown += 1;
-            shown < 3 // the third piece is where its caller stops it
-        })).expect("a reply");
+        ] {
+            reply.event(serde_json::from_str(e).expect("an event"), &mut |_| {
+                shown += 1;
+                shown < 3 // the third piece is where its caller stops it
+            }).expect("an event it takes");
+        }
         assert!(reply.halted);
-        assert_eq!(reply.done(), Ok(obj! {"stopReason" => "stopped", "content" => vec![obj! {"type" => "text", "text" => "Hel"}], "usage" => obj! {"inputTokens" => 5.0, "outputTokens" => 0.0}}));
+        assert_eq!(reply.ended(None, false), Ok(obj! {"stopReason" => "stopped", "content" => vec![obj! {"type" => "text", "text" => "Hel"}], "usage" => obj! {"inputTokens" => 5.0, "outputTokens" => 0.0}}));
     }
 
     #[test]
     fn a_stream_can_fail() {
-        let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":0}}}"#;
-        let (reply, _) = streamed(&[start, r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#]);
-        assert_eq!(reply.err(), Some(Failed { why: "overloaded_error: Overloaded".into(), passing: true }));
-        let (reply, _) = streamed(&[start, r#"{"type":"error","error":{"type":"invalid_request_error","message":"Too long"}}"#]);
-        assert_eq!(reply.err(), Some(Failed { why: "invalid_request_error: Too long".into(), passing: false }));
-        let (reply, _) = streamed(&[start, r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#]);
-        assert_eq!(reply.expect("a reply so far").done().err(), Some("the reply's stream ended before the reply did".into()));
+        let start = r#"{"type":"message_start","message":{"usage":{"input_tokens":3}}}"#;
+        let (reply, failed, _) = streamed(&[start, r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#]);
+        assert_eq!(reply.ended(failed, true), Err(Failed { why: "overloaded_error: Overloaded".into(), passing: true })); // nothing came: tried again
+        let (reply, failed, _) = streamed(&[start, r#"{"type":"error","error":{"type":"invalid_request_error","message":"Too long"}}"#]);
+        assert_eq!(reply.ended(failed, true), Err(Failed { why: "invalid_request_error: Too long".into(), passing: false }));
+        let (reply, failed, _) = streamed(&[start, r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#]);
+        assert_eq!(reply.ended(failed, true), Err("the reply's stream ended before the reply did".into()));
+        // once its reasoning or text has begun, a failure ends the reply there: what came is kept, but a call, maybe half written
+        let began = [start, r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"An hour of it."}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"bash"}}"#];
+        let cut = |why: &str| obj! {"stopReason" => "cut", "content" => vec![obj! {"type" => "thinking", "thinking" => "An hour of it.", "signature" => Value::Null}],
+            "usage" => obj! {"inputTokens" => 3.0, "outputTokens" => 0.0}, "cut" => why};
+        let (reply, failed, _) = streamed(&[&began[..], &[r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"co"}}"#, r#"{"type":"content_block_stop","index":1}"#]].concat());
+        assert_eq!(reply.ended(failed, true), Ok(cut("EOF while parsing a string at line 1 column 4")));
+        let (reply, failed, _) = streamed(&began);
+        assert_eq!(reply.ended(failed, true), Ok(cut("the reply's stream ended before the reply did")));
+        let (reply, failed, _) = streamed(&began); // a memory's must come whole
+        assert_eq!(reply.ended(failed, false), Err("the reply's stream ended before the reply did".into()));
     }
 }

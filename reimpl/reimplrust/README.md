@@ -217,11 +217,14 @@ make the room (the tail and the messages no chunk holds yet are over `fold_to` a
 it is if the window takes it, and a context the window can't take says what it holds, and why a
 memory it waits for doesn't form (its call failed, the summarizer's reply ran out of tokens or had no
 memory in it, or it failed `config.attempt_limit` times since the log last grew). A request that fails in a way that may pass (no answer, a stream cut off, an HTTP
-408, 409, 425, 429 or 5xx, an error event of overload, rate limit, timeout or the API's own) is
-tried again, up to five times: 500 ms after, then 500 ms, then 2 s each; what streamed of the reply
-is dropped, and the page says why it's trying again. A failure that would come again (a bad key, a
-request the API rejects) isn't retried, and only a reply that comes whole counts toward the
-session's costs. A reply that calls tools goes back in later requests with its reasoning as it came,
+408, 409, 425, 429 or 5xx, an error event of overload, rate limit, timeout or the API's own) before
+any of its reply's text or reasoning has come is tried again, up to five times: 500 ms after, then
+500 ms, then 2 s each, and the page says why it's trying again. Once some has come, any failure ends
+the reply there instead: what came joins the log (a call it was writing left out) and the turn ends
+saying why, so a long reply's reasoning is never thrown away; Continue goes on from it. A memory's
+request, which must come whole, is tried again from the start. A failure that would come again (a
+bad key, a request the API rejects) isn't retried, and only a reply that comes, whole or cut short,
+counts toward the session's costs. A call may start with no input (llama.cpp's server starts them so). A reply that calls tools goes back in later requests with its reasoning as it came,
 signatures and all, as DeepSeek's thinking mode requires (without it the model reasons from scratch
 at each step); other replies' reasoning, and the reasoning that wrote a memory, stay in the log and
 are never sent. Every request carries the system prompt and the tool definitions, so their tokens

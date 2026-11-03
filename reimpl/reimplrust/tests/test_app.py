@@ -13,7 +13,8 @@ picks, reach the API, the key never the page or a session's file, in a file only
 and the models it lists (each once) stay as they are when it's saved without them; a provider is
 deleted, unless new sessions start on it;
 a session without settings says so, and one whose provider has gone shows its settings and takes
-another; a reply whose stream is cut off is an error, not a logged reply; a turn on a log the library
+another; a reply whose stream is cut off once its text came keeps what came, in the log, its turn
+ending with why, where a request that fails before any of its reply comes is tried again; a turn on a log the library
 can't read fails, and the session goes on once it's mended; a fork onto a session there is is refused;
 a session's settings refuse a provider there isn't, a workspace that isn't a directory and a new
 merge_threshold once memories have merged; a session that calls bash after losing its workspace
@@ -1259,14 +1260,19 @@ def chatted(turns, tls, ca, baseline) -> str:
             if "The context doesn't fit" not in str(refused) or 'less 1000 for the reply' not in str(refused) or 'Raise the window' not in str(refused) \
                     or not took or not told or took[1] != told[1]:   # all of it the message: past the recent window, the tail has none, and alone it closes no chunk
                 raise
-        call(port, '/api/sessions', {'name': 'cut'})                     # a reply whose stream is cut off, then one whose request fails: each tried again
+        call(port, '/api/sessions', {'name': 'cut'})                     # a reply whose stream is cut off: kept; then one whose request fails: tried again
         before, started = len(seen['retries']), time.monotonic()
-        say(port, 'cut', 'cut off once')
+        try:
+            say(port, 'cut', 'cut off once')
+            raise SystemExit('a reply whose stream was cut off went on as whole')
+        except SystemExit as cut:
+            if 'ended before the reply did; the reply is kept as far as it came' not in str(cut):
+                raise
         say(port, 'cut', 'fail once, then answer')
         retries, logged = seen['retries'][before:], call(port, '/api/s/cut/messages')
-        if [(r['n'], r['of']) for r in retries] != [(1, 5), (1, 5)] or 'ended before' not in retries[0]['why'] or 'Overloaded' not in retries[1]['why'] \
-                or [m['participant'] for m in logged] != ['user', 'assistant'] * 2 or not all(words(m).startswith('Reply ') for m in logged[1::2]) or time.monotonic() - started < 1:
-            raise SystemExit(f'tried again: the page heard {retries}, the log holds {[(m["participant"], words(m)[:20]) for m in logged]}')
+        if [(r['n'], r['of']) for r in retries] != [(1, 5)] or 'Overloaded' not in retries[0]['why'] \
+                or [m['participant'] for m in logged] != ['user', 'assistant'] * 2 or not all(words(m).startswith('Reply ') for m in logged[1::2]) or time.monotonic() - started < 0.5:
+            raise SystemExit(f'cut off, then tried again: the page heard {retries}, the log holds {[(m["participant"], words(m)[:20]) for m in logged]}')
         call(port, '/api/sessions', {'name': 'mended'})
         say(port, 'mended', 'a first message')
         log = Path(root, 'mended', 'messages.jsonl')
