@@ -171,13 +171,13 @@ h2 .add { padding: 0 7px; font-size: 14px; line-height: 20px; color: var(--muted
 .thinking summary::-webkit-details-marker, .tool summary::-webkit-details-marker { display: none; }
 .tool pre, .md pre, .md code, .cmd, #detail { font: 12px/1.4 ui-monospace, monospace; }
 
-/* reasoning, folded to its last line; while it streams in, its newest lines */
+/* reasoning, folded to its last line; while it streams in, its newest lines, and all of it once clicked */
 .thinking { border-style: dashed; color: var(--muted); }
 .thinking > div { white-space: pre-wrap; font-style: italic; margin-top: 6px; }
 .thinking .last { display: inline-block; max-width: calc(100% - 90px); vertical-align: bottom; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-style: italic; margin-left: 6px; }
 .thinking[open] .last { display: none; }
-.thinking.live > span { font-size: 12px; }
-.thinking.live > div { max-height: 7.3em; overflow: hidden; display: flex; flex-direction: column-reverse; }   /* its bottom in view */
+.thinking.live summary > div { font-size: 14px; white-space: pre-wrap; font-style: italic; margin-top: 6px; max-height: 7.3em; overflow: hidden; display: flex; flex-direction: column-reverse; }   /* its bottom in view */
+.thinking.live[open] summary > div { display: none; }
 
 /* a call's card, folded to its line, its result joining it */
 .tool summary { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1023,10 +1023,11 @@ const Unlogged = ({ calls }) => html`<div class="msg" id="asked" data-who="assis
   ${calls.map((c) => html`<${Card} key=${c.id} call=${{ id: c.id, name: c.tool, input: c.input }} asking=${true} />`)}
 </div>`;
 
-// reasoning, folded to its last line (the end of it, when long); while it streams in (`live`), open
-// to its newest lines, so each piece shows as it comes
+// reasoning, folded to its last line (the end of it, when long); while it streams in (`live`), to its
+// newest lines, so each piece shows as it comes. A click opens all of it, which then grows as it comes;
+// the browser keeps a <details> open as the page draws again, and as the reasoning ends, the same element
 function Thinking({ text, live }) {
-  if (live) return html`<div class="thinking live" data-kind="thinking"><span>Thinking…</span><div><div>${text}</div></div></div>`;
+  if (live) return html`<details class="thinking live" data-kind="thinking"><summary>Thinking…<div><div>${text}</div></div></summary><div>${text}</div></details>`;
   const line = text.trimEnd().split('\n').pop();
   return html`<details class="thinking" data-kind="thinking"><summary>Thinking<span class="last">${line.length > 200 ? '…' + line.slice(-200) : line}</span></summary><div>${text}</div></details>`;
 }
