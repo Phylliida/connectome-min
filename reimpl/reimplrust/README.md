@@ -15,7 +15,12 @@ autobiographical compaction) and a web app around it.
   least `min_merge_memories`) that hold `target_chunk_tokens`, merge into a memory one layer above the highest it takes (`memory.rs`,
   `lifted`), even past a memory that keeps failing, which would hold back any other. `merge_by_count` merges `merge_threshold` at a time and never lifts, as the port does
   (the differential test runs that way); a memory without `merges` is read as such a group, so a
-  session that merged by count goes on by tokens from where it was. A compile plans the context from prices and block shapes only (`emit::select`), and
+  session that merged by count goes on by tokens from where it was. The head (`head_window_tokens`, the
+  library's `headWindowTokens`, 0 by default): the oldest messages, up to that many tokens, stay raw at
+  the context's start, and every memory's request starts with them, their reasoning left out, so a
+  memory is written in the agent's own voice and the context doesn't become all summaries. It's
+  measured uncalibrated, and once a chunk has closed it is what came before it, so it never moves
+  (the library's moves with calibration, and can overlap chunks). A compile plans the context from prices and block shapes only (`emit::select`), and
   an `emit::Reader` reads each block from disk as the caller writes the request, so neither a
   session nor a context is held in memory.
 - `connectome/src/bin/replay.rs`: replays a scripted session, for the tests.
@@ -91,11 +96,11 @@ since one holds the keys:
   file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its
   parent's; a session without one has none to run with, and the page says so. The page edits the
   main fields, the chunk size (`config.target_chunk_tokens`: the tokens of text a chunk closes at,
-  and that a merge gathers memories to), the least memories a merge takes (`config.min_merge_memories`, 2 or more, though a merge takes 2 when the context can't fold down to `fold_to` otherwise; it can change at any time, since each merge records what it took), the raw tail (`config.recent_window_tokens`: the newest tokens, never folded) and a
+  and that a merge gathers memories to), the least memories a merge takes (`config.min_merge_memories`, 2 or more, though a merge takes 2 when the context can't fold down to `fold_to` otherwise; it can change at any time, since each merge records what it took), the raw head (`config.head_window_tokens`: the oldest tokens, never folded, which every memory's request starts with), the raw tail (`config.recent_window_tokens`: the newest tokens, never folded) and a
   memory's max tokens (`config.compression_max_tokens`, its reasoning included: unlike the library,
   where it only lowers the 16000 a memory gets by default, it's the max_tokens a memory asks for), each saved alone as it changes (a choice at once, typing once it pauses for 2.5 s or
   leaves the field, a number only once it is one), its model one its provider lists (or any, typed,
-  for a provider that lists none); `config.merge_threshold` can't change once memories have merged,
+  for a provider that lists none); `config.head_window_tokens` can't change once a chunk has closed, `config.merge_threshold` once memories have merged,
   nor `config.merge_by_count` turn on; `fold_above` and `fold_to` can't be blank, `fold_to` stays at
   most `fold_above`, and that at most what the window leaves the reply (so a smaller window needs a
   lower band first); a chunk holds more than 0 tokens; and a merge takes 2 memories or more.

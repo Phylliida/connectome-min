@@ -3,9 +3,10 @@
 //!
 //! select plans from what messages and memories cost and their blocks' shapes (estimate::Priced,
 //! blocks::Block), never their content: chunks close, the counter plans the frontier (planner.rs),
-//! and the window is laid out as turns of blocks that say where their content is: each frontier
-//! node's chunk raw or its memory's recall pair (a 'Context Manager' turn with the summary label, then
-//! the memory as answer() renders it, as the agent); then the messages no chunk holds yet, raw. Passes
+//! and the window is laid out as turns of blocks that say where their content is: the head, raw
+//! (chunking::head_end); each frontier node's chunk raw or its memory's recall pair (a 'Context
+//! Manager' turn with the summary label, then the memory as answer() renders it, as the agent); then
+//! the messages no chunk holds yet, raw. Passes
 //! over the layout: trailing tool calls with no result are dropped, tool pairing is repaired, and up
 //! to three cache breakpoints are placed. A compile over W plus the grace is refused; only a compile
 //! that completes commits its frontier and arms calibration, and a refused one that couldn't fold
@@ -14,7 +15,7 @@
 //! A Reader then reads each block's content as the caller writes the turns out, so the context is
 //! never in memory, only one record of it at a time.
 
-use crate::{blocks::{reasoning, shape, At, Block}, chunking::{close_chunks, live_price, open_start, priced, stripped_raw, tail_start}, config::Config};
+use crate::{blocks::{reasoning, shape, At, Block}, chunking::{close_chunks, head_end, live_price, open_start, priced, stripped_raw, tail_start}, config::Config};
 use crate::{estimate::Calibration, js::{digest, js_len, js_trim, py_round}, json::{Json, Value}, obj, planner::{chunks, plan, Node}, segment::budget};
 use crate::{memory::Recorded, store::Session, turns::{pair_tools, say, split, text, Turn, DROPPED}};
 use std::{cell::RefCell, collections::HashMap, ops::Range};
@@ -45,10 +46,11 @@ pub struct Refusal {
     pub actual: f64,
     pub budget: f64,
     /// What the context at its most folded holds, how many and their tokens: memories, and chunks
-    /// raw that have no L1 yet; then the tokens of the messages no chunk holds yet, outside the tail
-    /// and in it.
+    /// raw that have no L1 yet; then the tokens of the head, and of the messages no chunk holds yet,
+    /// outside the tail and in it.
     pub memories: (usize, f64),
     pub unformed: (usize, f64),
+    pub head: f64,
     pub open: f64,
     pub tail: f64,
 }
@@ -69,14 +71,15 @@ pub fn select(session: &Session, fit: &Fit, calibration: Calibration, cfg: &Conf
     let groups = Recorded::new(session, cfg);
     let covered = shown.last().map_or(0, |&node| chunks(node, &groups).end);
     let frontier: Vec<Node> = shown.into_iter().chain((covered..held(0)).map(|j| (0, j))).collect();
-    let (tail, loose) = (tail_start(session, m, cfg), open_start(session)..session.count("messages"));
+    let (head, tail, loose) = (head_end(session, cfg), tail_start(session, m, cfg), open_start(session, cfg)..session.count("messages"));
     let (mut admit, live) = (budget(cfg.max_live_images, cfg.max_live_image_bytes), tail..loose.end);
     let price = |i| {
         let p = priced(session, i);
         if live.contains(&i) { live_price(&p, m, &mut admit) } else { py_round(stripped_raw(&p) * m) }
     };
     let prices: Vec<f64> = loose.clone().rev().map(price).collect(); // newest first, as the live image limits count
-    let fixed = prices.iter().fold(0.0, |a, x| a + x);
+    let headed = (0..head).map(|i| py_round(stripped_raw(&priced(session, i)) * m)).fold(0.0, |a, x| a + x);
+    let fixed = headed + prices.iter().fold(0.0, |a, x| a + x);
     let carried = fixed + frontier.iter().map(|&n| cost(n)).fold(0.0, |a, x| a + x);
     let frontier = plan(frontier, cost, |(n, p)| p < held(n), fixed, fit.over, fit.to, &groups, cfg);
     let total = fixed + frontier.iter().map(|&n| cost(n)).fold(0.0, |a, x| a + x);
@@ -84,7 +87,7 @@ pub fn select(session: &Session, fit: &Fit, calibration: Calibration, cfg: &Conf
     let refusal = |stage| {
         let held = |raw: bool| frontier.iter().filter(|n| (n.0 == 0) == raw).fold((0, 0.0), |(k, t), &n| (k + 1, t + cost(n)));
         let tail = prices[..(loose.end - tail) as usize].iter().fold(0.0, |a, x| a + x);
-        Refusal { stage, actual: total, budget: limit, memories: held(false), unformed: held(true), open: fixed - tail, tail }
+        Refusal { stage, actual: total, budget: limit, memories: held(false), unformed: held(true), head: headed, open: fixed - headed - tail, tail }
     };
     if total > limit {
         let mut record = last.clone();
@@ -95,7 +98,8 @@ pub fn select(session: &Session, fit: &Fit, calibration: Calibration, cfg: &Conf
         return Err(refusal("Adaptive picker exhausted"));
     }
 
-    let mut entries: Vec<Turn> = frontier.iter().flat_map(|&node| render(session, node, cfg)).chain(messages(session, loose.clone(), &live, cfg)).collect();
+    let shown = frontier.iter().flat_map(|&node| render(session, node, cfg)).chain(messages(session, loose.clone(), &live, cfg));
+    let mut entries: Vec<Turn> = messages(session, 0..head, &(0..0), cfg).into_iter().chain(shown).collect();
     let trailing = entries.iter().rev().take_while(|e| e.has("tool_use") && !e.has("tool_result")).count();
     entries.truncate(entries.len() - trailing);
     let entries = pair_tools(entries);

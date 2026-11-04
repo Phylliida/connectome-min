@@ -207,8 +207,7 @@ impl Worker<'_> {
                 Said::System { subtype, claude_code_version } if subtype == "init" => {
                     version = claude_code_version;
                     if !resuming { // Claude Code has started the session: later turns resume it
-                        let merged = self.s.count("layer2") > 0;
-                        if let Err(e) = self.app.ask_session(self.name, |answer| Msg::Tune(obj! {"claude_session" => id.as_str()}, merged, answer)) {
+                        if let Err(e) = self.app.ask_session(self.name, |answer| Msg::Tune(obj! {"claude_session" => id.as_str()}, answer)) {
                             break Err(format!("keeping Claude Code's session {id}: {e}"));
                         }
                     }

@@ -117,9 +117,10 @@ fn refused(r: &Refusal, setup: &Setup) -> String {
     }
     let ((memories, remembered), (unformed, waiting)) = (r.memories, r.unformed);
     let (memories, unformed) = (if memories == 1 { "1 memory".into() } else { format!("{memories} memories") }, if unformed == 1 { "1 chunk".into() } else { format!("{unformed} chunks") });
+    let head = if r.head > 0.0 { format!("the {:.0} oldest kept raw (the head, config.head_window_tokens, now {:.0}), ", r.head, s.config.head_window_tokens) } else { String::new() };
     format!("The context doesn't fit: folded as far as it can be, it takes {:.0} tokens, and the window leaves it {:.0} ({:.0}, less {:.0} for the reply and {:.0} for the tools and system prompt). \
-        It holds {memories} ({remembered:.0} tokens), {unformed} raw that have no memory yet ({waiting:.0}), {:.0} tokens of messages not yet in a chunk (one closes at config.target_chunk_tokens, now {:.0}, of text), \
-        and the {:.0} most recent kept raw (the raw tail, config.recent_window_tokens, now {:.0}). Raise the window, lower the reply reserve, or make chunks or the recent window smaller.",
+        It holds {head}{memories} ({remembered:.0} tokens), {unformed} raw that have no memory yet ({waiting:.0}), {:.0} tokens of messages not yet in a chunk (one closes at config.target_chunk_tokens, now {:.0}, of text), \
+        and the {:.0} most recent kept raw (the raw tail, config.recent_window_tokens, now {:.0}). Raise the window, lower the reply reserve, or make the head, chunks or the recent window smaller.",
         r.actual, r.budget, s.window, s.reserve, setup.overhead, r.open, s.config.target_chunk_tokens, r.tail, s.config.recent_window_tokens)
 }
 
@@ -355,12 +356,12 @@ impl Worker<'_> {
         let mut compiled = select(s, &fit, reported.map_or(last, |u| last.observe(u)), cfg);
         // a context that folds (past fold_above) short of fold_to is refused, which escalates the session, so the
         // memories it waits for form at once, as many as it takes: while one forms, and while memories can make
-        // the room (the messages no chunk holds yet and the tail fit without them); if they can't, it goes as it
+        // the room (the head, the messages no chunk holds yet and the tail fit without them); if they can't, it goes as it
         // is, if the window takes it
         // (a reply without a memory is tried again, attempt_limit times since the log grew, and then a lift goes
         // past it; a call that fails would fail again)
         let mut failed = None;
-        while let Err(r) = &compiled && r.actual > r.budget && r.open + r.tail <= r.budget {
+        while let Err(r) = &compiled && r.actual > r.budget && r.head + r.open + r.tail <= r.budget {
             match self.form(setup) {
                 Formed::Memory => compiled = select(s, &fit, current(s), cfg),
                 Formed::Unused(why) => failed = Some(why),

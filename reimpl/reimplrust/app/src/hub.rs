@@ -4,7 +4,7 @@
 //! time one is told something), each session's pages and what they hear (Live), and the pages
 //! following each channel.
 
-use crate::{api::Shown, boards, claude::Limits, channels::{self, Post, Posted}, companion::Heard, costs::{Fold, Spent}, llm::Piece, settings::{self, SessionSettings, Settings}, work::{work, DENIED, STOPPED}, App};
+use crate::{api::Shown, boards, claude::Limits, channels::{self, Post, Posted}, companion::Heard, costs::{Fold, Spent}, llm::Piece, settings::{self, Formed, SessionSettings, Settings}, work::{work, DENIED, STOPPED}, App};
 use connectome::json::Value;
 use serde::Serialize;
 use std::{collections::{HashMap, VecDeque}, sync::mpsc::{channel, Receiver, SendError, Sender}};
@@ -76,8 +76,8 @@ pub enum Msg {
     Approve { id: String, answer: String, given: Value, reply: Sender<Result<(), String>> },
     /// Whether a job runs, and the turns queued.
     Status(Sender<(bool, Vec<Queued>)>),
-    /// A change to the session's settings (SessionSettings::tuned), and whether its memories have merged.
-    Tune(Value, bool, Sender<Result<(), String>>),
+    /// A change to the session's settings (SessionSettings::tuned).
+    Tune(Value, Sender<Result<(), String>>),
     /// A change to the session's place in a channel (channels::member).
     Member { channel: String, change: Value, reply: Sender<Result<(), String>> },
     /// The session put on a board, or taken off it (boards::member).
@@ -387,8 +387,9 @@ impl Live {
                 let _ = followed.send(());
             }
             Msg::Status(reply) => drop(reply.send((self.turn.is_some(), self.queue()))),
-            Msg::Tune(v, merged, reply) => {
-                let tune = |all: Settings| settings::change(&app.profile_path(name), |old: &mut SessionSettings| old.tuned(&v, merged, &all).map(|new| *old = new));
+            Msg::Tune(v, reply) => {
+                let formed = Formed::of(&app.session(name));
+                let tune = |all: Settings| settings::change(&app.profile_path(name), |old: &mut SessionSettings| old.tuned(&v, formed, &all).map(|new| *old = new));
                 let _ = reply.send(app.settings().and_then(tune).map(drop));
             }
             Msg::Member { channel, change, reply } => drop(reply.send(channels::member(app, name, &channel, &change))),

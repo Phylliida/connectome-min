@@ -1,9 +1,9 @@
-//! Chunks and the raw tail, read from the end of the log (the library's rebuildChunks, without its head
-//! window). Messages outside the tail close into chunks, in log order: a run is full once it reaches
-//! target_chunk_tokens of text-only tokens over at least four messages and doesn't end on a tool_use,
-//! whose result comes next; a run that isn't full stays open. A message in a chunk never re-enters the
-//! tail. Images count only in the tail, newest first within the live limits; elsewhere a placeholder
-//! stands for each.
+//! The head, chunks and the raw tail (the library's rebuildChunks). The head, the oldest messages, stays
+//! raw (head_end). Messages after it and outside the tail close into chunks, in log order: a run is full
+//! once it reaches target_chunk_tokens of text-only tokens over at least four messages and doesn't end on
+//! a tool_use, whose result comes next; a run that isn't full stays open. A message in a chunk never
+//! re-enters the tail. Images count only in the tail, newest first within the live limits; elsewhere a
+//! placeholder stands for each.
 
 use crate::{config::Config, estimate::{price, store_tokens, Priced}, obj, segment::{budget, runs}, store::Session};
 use std::rc::Rc;
@@ -14,7 +14,7 @@ pub const PLACEHOLDER: f64 = 9.0;
 /// The tail's first message: walking back from the newest, the messages until one takes the total
 /// past recent_window_tokens, which is outside; a tool_result first in the tail brings its call in.
 pub fn tail_start(session: &Session, multiplier: f64, cfg: &Config) -> u64 {
-    let (floor, n, mut admit, mut total) = (open_start(session), session.count("messages"), budget(cfg.max_live_images, cfg.max_live_image_bytes), 0.0);
+    let (floor, n, mut admit, mut total) = (open_start(session, cfg), session.count("messages"), budget(cfg.max_live_images, cfg.max_live_image_bytes), 0.0);
     let outside = (floor..n).rev().find(|&i| {
         total += live_price(&priced(session, i), multiplier, &mut admit);
         total > cfg.recent_window_tokens
@@ -22,16 +22,37 @@ pub fn tail_start(session: &Session, multiplier: f64, cfg: &Config) -> u64 {
     outside.map_or(floor, |i| i + 1 - (i + 1 < n && priced(session, i + 1).has("tool_result")) as u64)
 }
 
-/// The first message no chunk holds.
-pub fn open_start(session: &Session) -> u64 {
-    session.last("layer0").map_or(0, |last| last["last"].as_f64().unwrap() as u64 + 1)
+/// The first message after the head (headWindowTokens): from the log's first, the messages until one
+/// takes their uncalibrated total past head_window_tokens, back one if that one's call would be split
+/// from its result; and once a chunk has closed, those before it, so the head never moves (the
+/// library's moves with its calibration, and then overlaps chunks).
+pub fn head_end(session: &Session, cfg: &Config) -> u64 {
+    if session.count("layer0") > 0 {
+        return session.read("layer0", 0)["first"].as_f64().unwrap() as u64;
+    }
+    if cfg.head_window_tokens <= 0.0 {
+        return 0;
+    }
+    let (n, mut total) = (session.count("messages"), 0.0);
+    for i in 0..n {
+        total += stripped_raw(&priced(session, i));
+        if total > cfg.head_window_tokens {
+            return if i > 0 && priced(session, i - 1).has("tool_use") { i - 1 } else { i };
+        }
+    }
+    n
+}
+
+/// The first message no chunk holds, after the head.
+pub fn open_start(session: &Session, cfg: &Config) -> u64 {
+    session.last("layer0").map_or_else(|| head_end(session, cfg), |last| last["last"].as_f64().unwrap() as u64 + 1)
 }
 
 /// Append the chunks that close now: the open run, from the last chunk to the tail, in full runs.
 pub fn close_chunks(session: &Session, multiplier: f64, cfg: &Config) {
     let p = |i| priced(session, i);
     let full = |run: &[u64], total: f64| total >= cfg.target_chunk_tokens && run.len() >= 4 && !p(*run.last().unwrap()).has("tool_use");
-    for run in runs(open_start(session), tail_start(session, multiplier, cfg), |i| p(i).text_only, full) {
+    for run in runs(open_start(session, cfg), tail_start(session, multiplier, cfg), |i| p(i).text_only, full) {
         let raw = run.iter().map(|&i| stripped_raw(&p(i))).fold(0.0, |a, x| a + x);
         session.append("layer0", obj! {"first" => run[0], "last" => *run.last().unwrap(), "raw" => raw});
     }

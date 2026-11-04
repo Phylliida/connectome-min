@@ -65,7 +65,7 @@ HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
 LIFTED = 2300   # lifted's window: without lifting, its context stops fitting by the 31st turn
-seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': [], 'planned': {}, 'passbacks': 0, 'forgetful': False, 'long-winded': False, 'memory max': []}
+seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': [], 'planned': {}, 'passbacks': 0, 'forgetful': False, 'long-winded': False, 'memory max': [], 'heads': []}
 PONDERED = 'I weighed what this stretch should keep. '   # what a memory's summarizer thinks first: never sent again
 
 
@@ -166,6 +166,8 @@ class Mock(BaseHTTPRequestHandler):
             blocks = [{'type': 'thinking', 'thinking': 'Let me think about it.', 'signature': 'c2ln'}] * (seen['chat'] % 4 == 0) \
                 + [{'type': 'text', 'text': f'Reply {seen["chat"]}: ' + ' '.join(['words'] * 80)}]
         memory = 'memory' in last and ('Write the memory' in last or 'consolidate' in last)
+        if 'wren-' in json.dumps(messages):   # the headed session's: what it starts with, and whether it folded
+            seen['heads'].append((memory, ' '.join(b.get('text', '') for b in messages[0]['content']), 'What do you remember from earlier?' in json.dumps(messages)))
         cut = 'cut off once' in last and last not in seen['cut']
         seen['cut'] += [last] * cut
         self.stream(blocks, prompt, 0.25 if 'slowly' in last else 0.01 if memory else 0, stop, cut)   # a memory takes a moment, as a page may see
@@ -506,7 +508,8 @@ def lifted(tls, ca) -> str:
     """A session whose memories are large beside its chunks, so they merge two at a time, a layer
     forms every few turns and each keeps a memory no merge has taken: in a window too small for those
     and the tail, the oldest of them merge across layers (lifted), and every turn still gets its
-    reply."""
+    reply. A session with a head (config.head_window_tokens) starts every request with it, a reply's
+    or a memory's, once it has folded too, and can't change it once a chunk has closed."""
     port, root, mock_port = free_port(), tempfile.mkdtemp(), free_port()
     mock = serve(mock_port, tls)
     app = launch(root, port, ca, '--no-bash')
@@ -542,6 +545,22 @@ def lifted(tls, ca) -> str:
             if "The context doesn't fit" not in str(stopped) or 'A memory it waits for doesn\'t form: the summarizer\'s reply ran out of its' not in str(stopped):
                 raise
         seen['long-winded'] = False
+        call(port, '/api/sessions', {'name': 'headed'})                  # its oldest messages kept raw (the head): every request, a reply's
+        call(port, '/api/s/headed/settings', {'window': 4000, 'fold_above': 3000, 'fold_to': 2400, 'config': {'head_window_tokens': 250}})   # or a memory's, starts with them
+        opening = 'You are Wren, a quiet lighthouse keeper who answers in short sentences. ' + ' '.join(['tide'] * 30)
+        say(port, 'headed', opening)
+        for t in range(30):
+            say(port, 'headed', f'wren-{t}: ' + ' '.join(f'word{t % 7}' for _ in range(80)))
+            settle(port, 'headed')
+        heads = seen['heads']
+        if not any(memory for memory, _, _ in heads) or not any(folded for memory, _, folded in heads if not memory) or any(first != opening for _, first, _ in heads):
+            raise SystemExit(f'a session with a head made {len(heads)} requests, starting with {sorted({first[:30] for _, first, _ in heads})}')
+        try:
+            call(port, '/api/s/headed/settings', {'config': {'head_window_tokens': 500}})
+            raise SystemExit('the head changed after a chunk had closed')
+        except urllib.error.HTTPError as error:
+            if error.code != 400 or 'head_window_tokens stays' not in json.loads(error.read())['error']:
+                raise SystemExit(f'a new head after a chunk had closed got {error.code}')
         call(port, '/api/sessions', {'name': 'banded'})                  # a band in a big window: past fold_above it folds, down to fold_to
         for wrong in ({'fold_above': 19500}, {'fold_above': 4000, 'fold_to': 4500}, {'fold_above': None}, {'fold_to': None}, {'config': {'target_chunk_tokens': 0}}):   # never blank
             try:

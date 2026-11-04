@@ -4,7 +4,7 @@
 //! carry an x-connectome header (another site's page can't send one without a CORS preflight, which
 //! this server never approves), since a POST can change where the key goes.
 
-use crate::{boards, channels::{self, Post}, claude::{self, Limits}, companion, costs::{self, Compile, Fold, Spent}, gateway, hub::{Event, Job, Msg, Queued, Routed}, settings::{self, SessionSettings}, work::Setup, App};
+use crate::{boards, channels::{self, Post}, claude::{self, Limits}, companion, costs::{self, Compile, Fold, Spent}, gateway, hub::{Event, Job, Msg, Queued, Routed}, settings::{self, Formed, SessionSettings}, work::Setup, App};
 use connectome::{config::Config, json::{self, sparse, Json, Value}, memory::Recorded, obj, planner::chunks, store::Session};
 use serde::{Serialize, Serializer};
 use std::{collections::{BTreeSet, HashMap}, net::TcpStream, path::Path, sync::mpsc::{channel, RecvTimeoutError}, time::Duration};
@@ -132,10 +132,7 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
             app.ask_session(name, |job| Msg::Job(Job::Fork { at, name: fork.into(), reply }, job));
             made.recv().expect("the session's thread answers").map(|()| Some(state(app, fork, &app.session(fork))))
         }
-        ("POST", ["settings"]) => {
-            let merged = s.count("layer2") > 0;
-            app.ask_session(name, |reply| Msg::Tune(body.clone(), merged, reply)).map(|()| Some(state(app, name, &s)))
-        }
+        ("POST", ["settings"]) => app.ask_session(name, |reply| Msg::Tune(body.clone(), reply)).map(|()| Some(state(app, name, &s))),
         ("POST", [said @ ("say" | "continue")]) => {
             let text = (*said == "say").then(|| body["text"].as_str().unwrap_or("").to_string());
             if text.as_ref().map_or_else(|| s.count("messages") == 0, |text| text.trim().is_empty()) {
@@ -247,7 +244,7 @@ fn create(app: &App, v: &Value) -> Result<Value, String> {
     let name = v["name"].as_str().filter(|name| named(name)).ok_or("a session's name is letters, digits, - and _")?;
     if !app.profile_path(name).exists() {
         let all = app.settings()?;
-        let first = all.defaults.tuned(&obj! {"workspace" => v["workspace"].clone()}, false, &all)?;
+        let first = all.defaults.tuned(&obj! {"workspace" => v["workspace"].clone()}, Formed { chunked: false, merged: false }, &all)?;
         std::fs::create_dir_all(app.root.join(name)).map_err(|e| format!("{name}: {e}"))?;
         settings::write(&app.profile_path(name), &first)?;
     }

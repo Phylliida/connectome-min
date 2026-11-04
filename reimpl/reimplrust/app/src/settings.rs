@@ -2,7 +2,7 @@
 //! only this user can read, since settings.json holds the keys. README.md describes their fields:
 //! ROOT/settings.json is a Settings, each session's ROOT/NAME/session_settings.json a SessionSettings.
 
-use connectome::{config::Config, json::{sparse, Value}, obj};
+use connectome::{config::Config, json::{sparse, Value}, obj, store::Session};
 use itertools::Itertools;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use smart_default::SmartDefault;
@@ -102,6 +102,15 @@ pub struct SessionSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub claude_session: Option<String>, // on a Claude Code provider, the session Claude Code keeps, once started (claude.rs)
 }
 
+/// What a session's logs have done that some settings must then stay for: whether a chunk has closed
+/// (the head is then what came before it), and whether memories have merged.
+#[derive(Clone, Copy)]
+pub struct Formed { pub chunked: bool, pub merged: bool }
+
+impl Formed {
+    pub fn of(s: &Session) -> Formed { Formed { chunked: s.count("layer0") > 0, merged: s.count("layer2") > 0 } }
+}
+
 /// A session's place in a channel (channels.rs): whether it hears the channel's posts (`inputs`), and
 /// the most posts it may make there in any 24 hours (`per_day`; 0 or less, no limit).
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
@@ -127,7 +136,7 @@ impl SessionSettings {
     /// ~/ the home directory, no trailing /), fold_to at most fold_above and that at most what the window
     /// leaves the reply, chunks of more than 0 tokens, merges of 2 memories or more, and once memories have `merged`, merge_threshold as it was and merge_by_count
     /// not turned on (merging by count after merging by tokens would misread them).
-    pub fn tuned(&self, v: &Value, merged: bool, all: &Settings) -> Result<SessionSettings, String> {
+    pub fn tuned(&self, v: &Value, formed: Formed, all: &Settings) -> Result<SessionSettings, String> {
         let mut new = serde_json::to_value(self).expect("settings are JSON");
         for (k, x) in v.as_object().into_iter().flatten() {
             match (k.as_str(), x) {
@@ -159,10 +168,13 @@ impl SessionSettings {
         if new.config.min_merge_memories < 2 {
             return Err(format!("a merge ({} memories at least) must take 2 or more", new.config.min_merge_memories));
         }
-        if merged && new.config.merge_threshold != self.config.merge_threshold {
+        if formed.chunked && new.config.head_window_tokens != self.config.head_window_tokens {
+            return Err("head_window_tokens stays as it is once a chunk has closed (the head is then what came before it)".into());
+        }
+        if formed.merged && new.config.merge_threshold != self.config.merge_threshold {
             return Err("merge_threshold stays as it is once memories have merged".into());
         }
-        if merged && new.config.merge_by_count && !self.config.merge_by_count {
+        if formed.merged && new.config.merge_by_count && !self.config.merge_by_count {
             return Err("merge_by_count can't go on once memories have merged by tokens".into());
         }
         Ok(new)

@@ -16,8 +16,10 @@
 //!     folding never waits on a third memory (escalated: what was due at min_merge_memories first).
 //!     A memory held back (blocked) holds back those after it, but not a lift, which goes ahead past it.
 //!
-//! A memory asks the summarizer what the agent saw before the stretch, replayed (a recall pair for each
-//! unmerged memory the recall budget fits, newest first), then the stretch and an instruction. A
+//! A memory asks the summarizer what the agent saw before the stretch, replayed: the head, raw, where the
+//! agent always sees it (who is speaking to whom, so the memory is in the agent's voice, not its
+//! stretch's), then a recall pair for each unmerged memory the recall budget fits, newest first; then
+//! the stretch and an instruction. A
 //! text-only chunk under min_chunk_chars gets a stub without a call. Requests are built to go through:
 //! the agent's tools stay (its cache prefix) with toolChoice 'none', recall answers carry no reasoning,
 //! and images past compression_image_bytes become placeholders. A request is planned as emit::select's
@@ -28,7 +30,7 @@
 //! attempt_limit times until the log grows. A request its host says was stopped (INTERRUPTED, not the
 //! library's) is neither: as if it wasn't made.
 
-use crate::{blocks::{reasoning, At, Block}, chunking::priced, config::Config, emit::{answer, recall_tokens, recalled, Reader}, js::{digest, is_js_space, js_len, js_round, js_trim}};
+use crate::{blocks::{reasoning, At, Block}, chunking::{head_end, priced}, config::Config, emit::{answer, recall_tokens, recalled, Reader}, js::{digest, is_js_space, js_len, js_round, js_trim}};
 use crate::{json::{sparse, Json, Value}, obj, planner::{chunks, Fixed, Groups, Node}, store::Session, turns::{cap_images, normalize, say, strip_reasoning, Turn, LABEL}};
 use std::{cell::RefCell, collections::HashMap};
 
@@ -305,15 +307,16 @@ fn merge_request(session: &Session, level: u64, members: &[Node], host: &dyn Hos
     ask(session, span(session, members, cfg).0, shown, host, cfg)
 }
 
-/// The request for `task`: recall pairs, oldest first, for the newest unmerged memories before
-/// message `before` that fit the recall budget at their tokens plus 50 (capRecallPairs); normalized
-/// for the provider, images capped; cache seams follow unless the budget left a memory out.
+/// The request for `task`: the head, then recall pairs, oldest first, for the newest unmerged memories
+/// before message `before` that fit the recall budget at their tokens plus 50 (capRecallPairs);
+/// normalized for the provider, images capped; cache seams follow unless the budget left a memory out.
 fn ask(session: &Session, before: u64, task: Vec<Turn>, host: &dyn Host, cfg: &Config) -> Request {
     let (prior, mut used) = (unmerged(session, before, cfg), 0.0);
     let fits = |&&(_, tokens): &&(Node, f64)| used + tokens + 50.0 <= cfg.recall_budget_tokens && { used += tokens + 50.0; true };
     let mut kept: Vec<Node> = prior.iter().rev().filter(fits).map(|&(node, _)| node).collect();
     kept.reverse();
-    let mut wire = cap_images(normalize(pairs(session, &kept, cfg).into_iter().chain(task).collect()), cfg.compression_image_bytes);
+    let head = match head_end(session, cfg) { 0 => vec![], end => raw(session, 0, end - 1) };
+    let mut wire = cap_images(normalize(head.into_iter().chain(pairs(session, &kept, cfg)).chain(task).collect()), cfg.compression_image_bytes);
     let marks = if kept.len() == prior.len() { seams(&wire, &kept) } else { vec![] };
     for (i, t) in wire.iter_mut().enumerate() {
         t.mark = marks.contains(&i);
@@ -455,6 +458,62 @@ mod tests {
 
     fn memory_of_30_tokens() -> Answering {
         Answering(Ok(obj! {"stopReason" => "end_turn", "content" => vec![obj! {"type" => "text", "text" => "a memory"}], "usage" => obj! {"outputTokens" => 30.0}}), 0)
+    }
+
+    /// A host that answers every request with a memory, and keeps where each one's turns are.
+    struct Keeping(Vec<Vec<Value>>);
+
+    impl Host for Keeping {
+        fn complete(&mut self, request: &Request, _: &mut Reader) -> Result<Value, String> {
+            self.0.push(request.messages.iter().map(|t| Value::Array(t.content.iter().map(|b| b.at.value()).collect())).collect());
+            Ok(obj! {"stopReason" => "end_turn", "content" => vec![obj! {"type" => "text", "text" => "a memory"}], "usage" => obj! {"outputTokens" => 30.0}})
+        }
+    }
+
+    #[test]
+    fn the_head_stays_raw_and_starts_every_memory() {
+        let dir = std::env::temp_dir().join(format!("connectome-head-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // messages of about 125 tokens: a head of 300 holds two, the first's reasoning left out of requests
+        let cfg = Config { head_window_tokens: 300.0, target_chunk_tokens: 50.0, recent_window_tokens: 50.0, l1_holdback_chunks: 0, ..Config::default() };
+        let session = Session::open(&dir);
+        let thought = obj! {"type" => "thinking", "thinking" => "who am I talking to", "signature" => "c2ln"};
+        append(&session, &obj! {"participant" => "user", "content" => vec![thought, obj! {"type" => "text", "text" => format!("message 0: {}", "words ".repeat(60))}]}, &cfg);
+        let mut host = Answering(Ok(obj! {}), 0);
+        grow(&session, &mut host, 3, false, &cfg);
+        assert_eq!((head_end(&session, &cfg), session.read("layer0", 0)["first"].clone()), (2, 2.into())); // chunks begin after it
+        let mut keeping = Keeping(vec![]);
+        while due(&session, &cfg).is_some() {
+            assert_eq!(drive(&session, &mut keeping, &cfg), Ok(true));
+        }
+        // each request starts with message 0's text (its reasoning out) and message 1
+        let head = vec![json!([["messages", 0, 1]]), json!([["messages", 1, 0]])];
+        assert!(keeping.0.len() >= 3 && keeping.0.iter().all(|turns| turns[..2] == head[..]), "{:?}", keeping.0);
+        // the context begins with it, raw, its reasoning as it was
+        let fit = Fit { over: 1e9, to: 1e9, limit: 1e9, reach: false };
+        let turns = select(&session, &fit, current(&session), &cfg).expect("a compile");
+        let located: Vec<Value> = turns.iter().take(2).map(|t| Value::Array(t.content.iter().map(|b| b.at.value()).collect())).collect();
+        assert_eq!(located[0], json!([["messages", 0, 0], ["messages", 0, 1]]));
+        assert_eq!(located[1], json!([["messages", 1, 0]]));
+        // once a chunk has closed it stays as it is
+        let bigger = Config { head_window_tokens: 10000.0, ..cfg.clone() };
+        assert_eq!(head_end(&session, &bigger), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_head_keeps_a_call_with_its_result() {
+        let dir = std::env::temp_dir().join(format!("connectome-head-call-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config { head_window_tokens: 300.0, ..Config::default() };
+        let session = Session::open(&dir);
+        let words = |i: usize| obj! {"type" => "text", "text" => format!("message {i}: {}", "words ".repeat(60))};
+        append(&session, &obj! {"participant" => "user", "content" => vec![words(0)]}, &cfg);
+        append(&session, &obj! {"participant" => "assistant", "content" => vec![words(1), obj! {"type" => "tool_use", "id" => "t1", "name" => "bash", "input" => obj! {}}]}, &cfg);
+        append(&session, &obj! {"participant" => "user", "content" => vec![obj! {"type" => "tool_result", "toolUseId" => "t1", "content" => "ok ".repeat(200)}]}, &cfg);
+        assert_eq!(head_end(&session, &Config { head_window_tokens: 0.0, ..cfg.clone() }), 0);
+        assert_eq!(head_end(&session, &cfg), 1); // the result takes the head past 300 tokens, and its call goes with it
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

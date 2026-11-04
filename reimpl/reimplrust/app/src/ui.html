@@ -831,6 +831,8 @@ function SessionForm() {
     <label title="Off, the model has no tool to ask you questions"><input name="questions" type="checkbox" defaultChecked=${s.questions !== false} /> Questions: the model can ask you</label>
     <label>Window <input name="window" type="number" defaultValue=${s.window ?? ''} /></label>
     <label>Reply reserve <input name="reserve" type="number" defaultValue=${s.reserve ?? ''} /></label>
+    <label title="The oldest this many tokens of the context stay as they were, never folded, and every memory's request starts with them, so memories stay in the model's own voice; fixed once a chunk has closed">Raw head
+      <input name="config.head_window_tokens" type="number" defaultValue=${s.config?.head_window_tokens ?? ''} /></label>
     <label title="The newest this many tokens of the context stay as they were, never folded">Raw tail
       <input name="config.recent_window_tokens" type="number" defaultValue=${s.config?.recent_window_tokens ?? ''} /></label>
     <label title="Messages close into a chunk, which one memory holds, at this many tokens of text; and a merge gathers memories until they hold this many">Chunk size

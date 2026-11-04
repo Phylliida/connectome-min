@@ -8,6 +8,7 @@ use smart_default::SmartDefault;
 #[serde(default)]
 pub struct Config {
     // chunks and windows
+    pub head_window_tokens: f64,                                     // headWindowTokens: oldest tokens kept raw (chunking.rs head_end), which every memory's request starts with; 0, none
     #[default(3000.0)] pub target_chunk_tokens: f64,                 // targetChunkTokens
     #[default(30000.0)] pub recent_window_tokens: f64,               // recentWindowTokens: newest tokens kept raw
     #[default(1)] pub l1_holdback_chunks: u64,                       // l1HoldbackChunks: newest chunks that wait for a newer one
