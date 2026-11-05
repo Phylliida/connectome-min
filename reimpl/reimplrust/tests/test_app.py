@@ -1186,6 +1186,25 @@ def drafted(port, root):
         raise SystemExit('a draft that can\'t be read did not start empty')
 
 
+def foldered(port):
+    """The folders offered as a workspace path is typed: those it can go on to, by name, hidden ones
+    only once it starts one, never files, the first 100; none for a path without a /; ~/ the home
+    folder."""
+    top = tempfile.mkdtemp()
+    for name in ['beta', 'alps', 'alpha', '.hidden', *(f'many/{n:03}' for n in range(105))]:
+        os.makedirs(os.path.join(top, name))
+    Path(top, 'afile').write_text('')
+    cases = {f'{top}/al': [f'{top}/alpha/', f'{top}/alps/'], f'{top}/': [f'{top}/alpha/', f'{top}/alps/', f'{top}/beta/', f'{top}/many/'],
+             f'{top}/.': [f'{top}/.hidden/'], f'{top}/nothing': [], f'{top}/afile/': [], 'no slash': [],
+             f'{top}/many/': [f'{top}/many/{n:03}/' for n in range(100)]}
+    for path, expected in cases.items():
+        if (offered := call(port, '/api/folders', {'path': path})) != expected:
+            raise SystemExit(f'typing {path} offered {offered[:5]}, not {expected[:5]}')
+    home = call(port, '/api/folders', {'path': '~/'})
+    if not home or not all(f.startswith('~/') and os.path.isdir(os.path.expanduser(f)) for f in home):
+        raise SystemExit(f'typing ~/ offered {home[:5]}')
+
+
 def chatted(turns, tls, ca, baseline) -> str:
     """The long chat, the fork and the settings; the main session's price multiplier goes to `baseline`."""
     mock_port, plain_port, port, root = free_port(), free_port(), free_port(), tempfile.mkdtemp()
@@ -1303,6 +1322,7 @@ def chatted(turns, tls, ca, baseline) -> str:
                     raise
         presetted(port, root, ca)
         drafted(port, root)
+        foldered(port)
         Path(root, 'old').mkdir()                                       # a session without settings has none to run with
         if 'session_settings.json' not in (call(port, '/api/s/old')['problem'] or '') or call(port, '/api/s/old/messages') != []:
             raise SystemExit('a session without settings did not say so, or show its log')

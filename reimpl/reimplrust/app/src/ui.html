@@ -200,6 +200,7 @@ h2 .add { padding: 0 7px; font-size: 14px; line-height: 20px; color: var(--muted
 .question legend { padding: 0; margin-bottom: 4px; }
 .question .head { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; margin-right: 4px; }
 .question .option { display: flex; gap: 8px; align-items: baseline; margin: 3px 0; font-size: 13px; }
+.question .other input:not([type]) { flex: 1; padding: 3px 6px; }   /* Other's words and the notes, beside their label */
 .question .preview { margin: 2px 0 6px 24px; padding: 6px; border: 1px solid var(--line); border-radius: 4px; }
 .question input:not([type]) { display: block; width: 100%; margin: 4px 0; box-sizing: border-box; }
 .tool .running { font-size: 12px; color: var(--accent); margin: 4px 0; }
@@ -284,6 +285,7 @@ const current = () => channel() == null && board() == null ? opened() : '';   //
 let state = null;   // the session as the server has it (a global the browser tests read)
 const page = {
   sessions: [], providers: [], presets: {}, channels: [], boards: [],
+  folders: [],                            // the folders a workspace path being typed can go on to (offer)
   board: null,                            // the board the page shows, as the server last read it (refresh)
   task: null,                             // the task open in its dialog: {file, data (as the server last read it), error}
   messages: [],                           // the log's messages the page has, oldest first
@@ -445,6 +447,7 @@ const App = () => {
       <${Pyramid} />
       <pre id="detail">${page.detail || 'Select a memory or chunk.'}</pre>`}
     </aside>
+    <datalist id="folders">${page.folders.map((f) => html`<option key=${f} value=${f} />`)}</datalist>
     ${page.creating && html`<${NewSession} />`}
     ${page.settings && html`<${Settings} />`}
     ${page.accompanying && html`<${Accompany} />`}
@@ -602,7 +605,7 @@ function TaskDialog() {
       <div class="buttons">
         <button type="button" class="icon delete" title="Delete the task" aria-label="Delete the task" onClick=${() => confirm(`Delete the task "${t.title}"?`) && change({ op: 'delete', file: open.file })}>${ICONS.trash()}</button>
         <small>${t.column}/${t.file}</small>
-        <button type="button" onClick=${(e) => e.target.closest('dialog').close()}>Done</button>
+        <button type="button" onClick=${(e) => e.target.closest('dialog').close()}>Close</button>
       </div>
     </form>`}
   </dialog>`;
@@ -702,7 +705,9 @@ function NewSession() {
         <option value="" selected=${made.workspace === ''}>No workspace</option>
         <option value=${OTHER} selected=${made.workspace === OTHER}>Another directory…</option>
       </select></label>
-      ${made.workspace === OTHER && html`<input id="newpath" name="path" required placeholder="/its/path, or ~/its/path" />`}
+      ${made.workspace === OTHER && html`<input id="newpath" name="path" required list="folders" defaultValue="~/" placeholder="/its/path, or ~/its/path" onFocus=${offer} onInput=${offer} />
+        <small>The folder its bash and edit work in. Type its path (~/ is your home folder) and pick from the folders offered as you go.</small>`}
+      ${made.workspace === '' && html`<small class="warn">Without a workspace it has no bash and no edit: it can't run commands or touch files. Its other tools still work, and a workspace can be given later in its settings.</small>`}
       <small class="warn">${made.error}</small>
       <div class="buttons">
         <button type="button" onClick=${(e) => e.target.closest('dialog').close()}>Cancel</button>
@@ -757,6 +762,17 @@ function Accompany() {
   </dialog>`;
 }
 
+// the folders a workspace path being typed can go on to, offered under its field (the folders datalist),
+// unless the field has changed again by the time they come
+async function offer(e) {
+  const field = e.target, typed = field.value;
+  try {
+    const folders = await api('/api/folders', { path: typed });
+    if (field.value === typed) page.folders = folders;
+  } catch (err) { fail(err); }
+  redraw();
+}
+
 // the new-session dialog opened, its workspace the session open's
 function creating() {
   page.creating = { workspace: state?.settings?.workspace ?? '', error: '' };
@@ -777,7 +793,7 @@ function Settings() {
       <small>${keyless ? 'Add a provider\'s API key to chat. DeepSeek: https://api.deepseek.com/anthropic, OpenRouter: https://openrouter.ai/api/v1' : 'A session runs on a provider\'s API, or in Claude Code, on one of the models it lists.'}</small>
       ${page.providers.map((p) => html`<${Provider} key=${p.name} p=${p} />`)}
       <${Provider} key=${'new-' + open.made} />`}
-    <div class="buttons"><button type="button" onClick=${(e) => e.target.closest('dialog').close()}>Done</button></div>
+    <div class="buttons"><button type="button" onClick=${(e) => e.target.closest('dialog').close()}>Close</button></div>
   </dialog>`;
 }
 
@@ -873,7 +889,7 @@ function SessionForm({ preset }) {
     <label>Provider <select name="provider" id=${preset ? null : 'sprovider'} onChange=${pick}>${page.providers.map((p) => html`<option selected=${p.name === s.provider}>${p.name}</option>`)}</select></label>
     <label>Model ${models.length ? html`<select name="model" key=${provider}>${models.map((m) => html`<option selected=${m === s.model}>${m}</option>`)}</select>`
       : html`<input name="model" defaultValue=${s.model ?? ''} placeholder="its name, as the provider has it" />`}</label>
-    ${!preset && html`<label>Workspace <input name="workspace" defaultValue=${s.workspace ?? ''} placeholder="none: no bash" /></label>`}
+    ${!preset && html`<label title="The folder its bash and edit work in; without one it has neither">Workspace <input name="workspace" list="folders" defaultValue=${s.workspace ?? ''} placeholder="none: no bash or edit" onFocus=${offer} onInput=${offer} /></label>`}
     <label><input name="sandbox" type="checkbox" defaultChecked=${!!s.sandbox} /> ${inClaude ? 'Claude Code' : 'bash'} in the sandbox</label>
     <label title="Off, the model has no tool to ask you questions"><input name="questions" type="checkbox" defaultChecked=${s.questions !== false} /> Questions: the model can ask you</label>
     <label>Window <input name="window" type="number" defaultValue=${s.window ?? ''} /></label>
@@ -1124,41 +1140,65 @@ function Card({ call, result, asking, running }) {
 // the tools that ask the user questions, whose input is the same: Claude Code's (claude.rs), and ask_user (tools/ask.rs)
 const QUESTIONS = ['AskUserQuestion', 'ask_user'];
 
-// questions for the user (QUESTIONS): each with its header, its options to pick from
-// (their descriptions and previews), one or, multiSelect, several, an Other to write in, and notes.
-// While it's `asking`, Answer gives the picks for each question, by its text (several joined ", ", and
-// Other's words with them, or for one pick in place of it), with its notes; Decline declines. After,
-// the result says what Claude Code was told.
+// questions for the user (QUESTIONS): each with its header, its options to pick from (their
+// descriptions and previews), one or, multiSelect, several, Other among them, the user's own words
+// (typing there picks it), and notes. While it's `asking`, Answer gives what's picked for each
+// question, by its text (several joined ", ", Other as its words, if any), with its notes; Decline
+// declines. After, each question shows what was given, read back from the result (answered): the
+// options picked, the user's own words and their notes; and the result says what the model was told.
 function Questions({ call, result, asking }) {
   const questions = call.input?.questions ?? [];
   const answer = (e) => {
     e.preventDefault();
     const [answers, annotations] = [{}, {}];
     questions.forEach((q, i) => {
-      const picked = [...e.target.querySelectorAll(`[name="q${i}"]:checked`)].map((c) => c.value);
       const [other, notes] = [e.target.elements[`other${i}`].value.trim(), e.target.elements[`notes${i}`].value.trim()];
-      answers[q.question] = q.multiSelect ? [...picked, other].filter(Boolean).join(', ') : other || picked[0] || '';
+      const picked = [...e.target.querySelectorAll(`[name="q${i}"]:checked`)].map((c) => c.dataset.other ? other : c.value);
+      answers[q.question] = picked.filter(Boolean).join(', ');
       if (notes) annotations[q.question] = { notes };
     });
     approve(call.id, 'answer', { answers, annotations });
   };
-  const text = result && said(result), failed = result?.isError ? ' failed' : '';
+  const text = result && said(result), failed = result?.isError ? ' failed' : '', open = asking && !result;
   return html`<details class=${'tool questions' + failed} id=${'call-' + call.id} data-kind="tool_use" open=${!result}>
     <summary>Questions: ${questions.map((q) => q.header).join(', ')}${result && html`<span class="out"> → ${text.split('\n')[0].slice(0, 100)}</span>`}</summary>
     <form onSubmit=${answer}>
-      ${questions.map((q, i) => html`<fieldset class="question" key=${i} disabled=${!asking || result}>
+      ${questions.map((q, i) => {
+        const type = q.multiSelect ? 'checkbox' : 'radio', given = result ? answered(text, q) : null;   // checked by the user while asking
+        return html`<fieldset class="question" key=${i} disabled=${!open}>
         <legend><span class="head">${q.header}</span> ${q.question}</legend>
-        ${(q.options ?? []).map((o) => html`<label class="option"><input type=${q.multiSelect ? 'checkbox' : 'radio'} name=${'q' + i} value=${o.label} />
+        ${(q.options ?? []).map((o) => html`<label class="option"><input type=${type} name=${'q' + i} value=${o.label} checked=${given ? given.picked.includes(o.label) : undefined} />
           <span><b>${o.label}</b>${o.description && o.description !== o.label && html` — ${o.description}`}</span></label>
           ${o.preview && html`<pre class="preview">${o.preview}</pre>`}`)}
-        ${asking && !result && html`<input name=${'other' + i} placeholder="Other: your own answer" />
-          <input name=${'notes' + i} placeholder="Notes (optional)" />`}
-      </fieldset>`)}
+        ${(open || given?.own) && html`<label class="option other"><input type=${type} name=${'q' + i} data-other="1" checked=${given ? true : undefined} /><span>Other</span>
+          <input name=${'other' + i} placeholder="your own answer" defaultValue=${given?.own ?? ''} onInput=${(e) => { e.target.parentNode.firstChild.checked = !!e.target.value.trim(); }} /></label>`}
+        ${(open || given?.notes) && html`<label class="option other"><span>Notes</span><input name=${'notes' + i} placeholder="optional" defaultValue=${given?.notes ?? ''} /></label>`}
+      </fieldset>`;
+      })}
       ${asking && !result && html`<div class="ask"><button class="primary" data-answer="answer">Answer</button>
         <button type="button" data-answer="deny" onClick=${() => approve(call.id, 'deny')}>Decline</button></div>`}
     </form>
     ${result && html`<pre class=${'result' + failed}>${text}</pre>`}
   </details>`;
+}
+
+// what the user gave question `q`, read back from the result the model was told, where it's
+// "question"="answer" notes: their notes (ask.rs's told, worded as Claude Code words its own): the
+// options picked, their own words (an answer that isn't an option's label, or for several, each such
+// part of it) and their notes; null if the result doesn't say. An answer, or notes, with a quote in it
+// shows up to the quote (the result says it whole).
+function answered(text, q) {
+  const start = text.indexOf(`"${q.question}"="`);
+  if (start < 0) return null;
+  const rest = text.slice(start + q.question.length + 4), end = rest.indexOf('"');
+  if (end < 0) return null;
+  const labels = (q.options ?? []).map((o) => o.label), after = rest.slice(end + 1);
+  const parts = q.multiSelect ? rest.slice(0, end).split(', ') : [rest.slice(0, end)];
+  return {
+    picked: parts.filter((part) => labels.includes(part)),
+    own: parts.filter((part) => part && !labels.includes(part)).join(', '),
+    notes: after.startsWith(' notes: ') ? after.slice(' notes: '.length).split(/, "|\.$/)[0] : '',
+  };
 }
 
 // an edit's change as a diff: the lines it takes out and puts in (all in, for a new file), colored in

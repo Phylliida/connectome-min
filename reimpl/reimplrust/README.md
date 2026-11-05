@@ -78,7 +78,9 @@ since one holds the keys:
   offers a session on it (the page's Settings edits them, adds providers and deletes them, all but
   those a preset is on); `presets`, what a new session can start with, by name, each a session's
   settings (below) that a new session's file starts as a copy of (the page's new-session dialog
-  chooses one, `default` if none is named, and gives the workspace); the page's Settings, on its
+  chooses one, `default` if none is named, and gives the workspace, warning that without one the
+  session has no bash or edit; as a workspace's path is typed there, or in a session's settings, the
+  page offers the folders it can go on to, from `POST /api/folders`); the page's Settings, on its
   Presets tab, edits a preset's main fields as a session's are edited and refused, adds one as a
   copy of another, and deletes them, all but `default`, and changing one changes no session made
   before; `sandbox`, what a sandboxed command sees; and `search`, a SearXNG
@@ -122,9 +124,11 @@ may touch), `web_search` (when settings.json names a SearXNG server: a query ask
 API, which its settings.yml must allow by listing `json` in `search.formats`, the pages found given
 back as text, each one's title, address, date when known and excerpt), `ask_user` (while the
 session's `questions` is on: one to four questions, each with two to four options to pick, one or
-several, which the page shows as Claude Code's questions are shown, with an answer of your own and
-notes; the call's result is what you answered, worded as Claude Code words it, or that you declined,
-and it always asks, whatever the session always allows) and the tools of the MCP
+several, which the page shows as Claude Code's questions are shown, with Other, an answer of your own
+that's picked like the options (typing there picks it; blank, it gives nothing), and notes; the call's
+result is what you answered, worded as Claude Code words it, or that you declined, and the card then
+shows what you gave, read back from it: the options picked, your own answer and your notes; and it
+always asks, whatever the session always allows) and the tools of the MCP
 servers in `ROOT/mcp.json` (or `--mcp FILE`), listed all at once at startup (one whose tools can't
 be listed is stopped), in the usual format:
 

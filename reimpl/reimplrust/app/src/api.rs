@@ -90,6 +90,7 @@ pub fn handle(app: &App, mut stream: TcpStream) -> io::Result<()> {
         ("POST", ["api", "settings"]) => app.ask(|reply| Routed::Provide(body.clone(), reply)).map(|all| Some(all.shown())),
         ("POST", ["api", "presets"]) => app.ask(|reply| Routed::Preset(body.clone(), reply)).map(|all| Some(all.shown())),
         ("POST", ["api", "sessions"]) => create(app, &body).map(Some),
+        ("POST", ["api", "folders"]) => Ok(Some(Value::from(folders(body["path"].as_str().unwrap_or(""))))),
         ("GET", ["api", "channels"]) => Ok(Some(channels::listing(app))),
         ("POST", ["api", "channels"]) => founded(app, &body).map(Some),
         ("GET", ["api", "boards"]) => Ok(Some(boards::listing(app))),
@@ -257,6 +258,19 @@ fn create(app: &App, v: &Value) -> Result<Value, String> {
         settings::write(&app.profile_path(name), &first)?;
     }
     Ok(state(app, name, &app.session(name)))
+}
+
+/// The folders a workspace path being typed can go on to, which the page offers as it's typed: those in
+/// the folder up to its last / (a leading ~/ the home folder) whose names start with what follows,
+/// hidden ones only once that starts with a dot, each as the path typed reaches it with a / to go on;
+/// the first 100 by name.
+fn folders(typed: &str) -> Vec<String> {
+    let Some((parent, start)) = typed.rsplit_once('/') else { return vec![] };
+    let entries = std::fs::read_dir(settings::expand(&format!("{parent}/"))).into_iter().flatten().flatten();
+    let mut names: Vec<String> = entries.filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().into_string().ok()).collect();
+    names.retain(|name| name.starts_with(start) && (start.starts_with('.') || !name.starts_with('.')));
+    names.sort();
+    names.into_iter().take(100).map(|name| format!("{parent}/{name}/")).collect()
 }
 
 /// What the page shows of a session: counts, each layer's size, the last compile's frontier and
