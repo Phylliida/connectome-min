@@ -65,8 +65,9 @@ HERE = Path(__file__).resolve().parent
 APP = Path(os.environ.get('CONNECTOME_WEB') or HERE.parent / 'target' / 'release' / 'connectome-web')   # CONNECTOME_WEB: test that build instead
 WINDOW = 8000
 LIFTED = 2300   # lifted's window: without lifting, its context stops fitting by the 31st turn
-seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': [], 'planned': {}, 'passbacks': 0, 'forgetful': False, 'long-winded': False, 'memory max': [], 'heads': []}
+seen = {'folds': {}, 'costs': {}, 'prompts': {}, 'calls': [], 'forming': False, 'prefills': 0, 'prefilled': [], 'failed': [], 'model': None, 'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0, 'problems': [], 'key': None, 'thought': 0, 'results': [], 'tool memories': 0, 'events': [], 'asked': [], 'limit': None, 'requests': [], 'retries': [], 'running': [], 'cut': [], 'planned': {}, 'passbacks': 0, 'forgetful': False, 'long-winded': False, 'memory max': [], 'heads': []}
 PONDERED = 'I weighed what this stretch should keep. '   # what a memory's summarizer thinks first: never sent again
+CIRCLE = ''.join(chr(0x4E00 + i * 7919 % 20000) for i in range(500))   # 1.5 KB of 500 distinct three-byte characters, so the stretch a loop is checked by starts inside one
 
 
 class Mock(BaseHTTPRequestHandler):
@@ -118,9 +119,16 @@ class Mock(BaseHTTPRequestHandler):
         results = [b for b in messages[-1]['content'] if b['type'] == 'tool_result']
         asked = next(' '.join(b.get('text', '') for b in m['content']) for m in reversed(messages) if m['role'] == 'user' and any(b['type'] == 'text' for b in m['content']))
         stop = 'end_turn'
-        if messages[-1]['role'] == 'assistant':                    # a reply cut short, which this one goes on from
+        if 'circles between calls' in asked:                       # by request: a loop, a call, two loops, an answer
             seen['chat'] += 1
-            blocks = [{'type': 'text', 'text': ' and so the story ends.'}]
+            seen['between'] = seen.get('between', -1) + 1
+            looping, calling = {'type': 'thinking', 'thinking': CIRCLE * 6, 'signature': 'c2ln'}, {'type': 'tool_use', 'id': 'between-1', 'name': 'bash', 'input': {'command': 'true'}}
+            blocks = [[looping], [calling], [looping], [looping], [{'type': 'text', 'text': 'Done circling.'}]][seen['between']]
+            stop = 'tool_use' if blocks == [calling] else stop
+        elif messages[-1]['role'] == 'assistant':                  # a reply cut short, which this one goes on from
+            seen['chat'] += 1
+            seen['prefilled'].append(messages[-1]['content'])
+            blocks = [{'type': 'thinking', 'thinking': CIRCLE * 6, 'signature': 'c2ln'}] if 'in circles for good' in asked else [{'type': 'text', 'text': ' and so the story ends.'}]
         elif 'fail once' in last and last not in seen['failed']:          # a failure that may pass: tried again
             seen['failed'].append(last)
             return self.answer(529, {'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'Overloaded'}})
@@ -130,7 +138,10 @@ class Mock(BaseHTTPRequestHandler):
         elif last.startswith('echo '):                             # the message back, as the reply
             seen['chat'] += 1
             blocks = [{'type': 'text', 'text': last[len('echo '):]}]
-        elif last.startswith('think '):                            # the message back as reasoning, then an answer
+        elif 'think in circles' in last:                           # reasoning that goes round the same 1.5 KB six times
+            seen['chat'] += 1
+            blocks = [{'type': 'thinking', 'thinking': CIRCLE * 6, 'signature': 'c2ln'}, {'type': 'text', 'text': 'Out of the circle.'}]
+        elif last.startswith('think '):                            # the message back as reasoning, then an answer (cut off, if it says so)
             seen['chat'] += 1
             blocks = [{'type': 'thinking', 'thinking': last[len('think '):], 'signature': 'c2ln'}, {'type': 'text', 'text': 'Thought it through.'}]
         elif 'a long story' in last:
@@ -1205,6 +1216,45 @@ def foldered(port):
         raise SystemExit(f'typing ~/ offered {home[:5]}')
 
 
+def circled(port, root):
+    """A reply whose reasoning goes round in circles stops once it repeats a stretch of itself, and its
+    turn goes on from it by itself, its reasoning carried back; replies that go round each time end
+    their turn at the third."""
+    log = lambda name='circles': [json.loads(line) for line in Path(root, name, 'messages.jsonl').read_text().splitlines()]
+    circle = lambda m: [b['type'] for b in m['content']] == ['thinking'] and 2000 <= len(m['content'][0]['thinking'].encode()) < len((CIRCLE * 6).encode()) \
+        and m['content'][0]['thinking'] == (CIRCLE * 6)[:len(m['content'][0]['thinking'])]   # stopped once round, as far as it came
+    call(port, '/api/sessions', {'name': 'circles'})
+    before = len(seen['prefilled'])
+    say(port, 'circles', 'think in circles')
+    told = log()
+    if [m['participant'] for m in told] != ['user', 'assistant', 'assistant'] or not circle(told[1]) or told[2]['content'] != [{'type': 'text', 'text': ' and so the story ends.'}] \
+            or seen['prefilled'][before:] != [told[1]['content']]:   # the reasoning as the log has it
+        raise SystemExit(f'reasoning in circles: the log holds {[(m["participant"], str(m["content"])[:60]) for m in told]}, the next request went on from {str(seen["prefilled"][before:])[:120]}')
+    try:
+        say(port, 'circles', 'think in circles for good')
+        raise SystemExit('reasoning that went round in circles each time went on')
+    except SystemExit as stopped:
+        if 'repeated itself word for word, 3 times in a row' not in str(stopped):
+            raise
+    told = log()[3:]
+    if [m['participant'] for m in told] != ['user'] + ['assistant'] * 3 or not all(circle(m) for m in told[1:]) or seen['prefilled'][before + 1:] != [told[1]['content'], told[2]['content']]:
+        raise SystemExit(f'reasoning in circles for good: the log holds {[(m["participant"], str(m["content"])[:60]) for m in told]}, each next request going on from the reply before')
+    call(port, '/api/sessions', {'name': 'snipped'})                 # a reply cut short once its text began: Continue goes on from its text alone, as before
+    try:
+        say(port, 'snipped', 'think it over, but cut off once')
+        raise SystemExit('a reply whose stream was cut off went on as whole')
+    except SystemExit as cut:
+        if 'the reply is kept as far as it came' not in str(cut):
+            raise
+    say(port, 'snipped', None)
+    if [b['type'] for b in seen['prefilled'][-1]] != ['text']:
+        raise SystemExit(f'Continue after a reply cut short in its text went on from {seen["prefilled"][-1]}')
+    call(port, '/api/sessions', {'name': 'between'})                 # loops with a call between them aren't in a row: the turn goes on to its answer
+    say(port, 'between', 'circles between calls')
+    if (kinds := [[b['type'] for b in m['content']] for m in log('between')]) != [['text'], ['thinking'], ['tool_use'], ['tool_result'], ['thinking'], ['thinking'], ['text']]:
+        raise SystemExit(f'loops with a call between them: the log holds {kinds}')
+
+
 def chatted(turns, tls, ca, baseline) -> str:
     """The long chat, the fork and the settings; the main session's price multiplier goes to `baseline`."""
     mock_port, plain_port, port, root = free_port(), free_port(), free_port(), tempfile.mkdtemp()
@@ -1417,6 +1467,7 @@ def chatted(turns, tls, ca, baseline) -> str:
         if told[:4] != [('user', 'tell me a long s'), ('assistant', 'Once upon a time'), ('assistant', ' and so the stor'), ('user', 'refuse once plea')] \
                 or told[4:] != [('assistant', told[4][1])] or not told[4][1].startswith('Reply') or seen['prefills'] != 1:
             raise SystemExit(f'continuing: the log holds {told}, {seen["prefills"]} requests went on from a reply')
+        circled(port, root)
         call(port, '/api/s/branch/settings', {'provider': 'default'})
         call(port, '/api/settings', {'name': 'default', 'base': f'https://127.0.0.1:{mock_port}'})
         try:

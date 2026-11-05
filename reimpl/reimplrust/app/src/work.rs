@@ -10,7 +10,7 @@
 //! hub what the pages following the job see (Msg). The user can stop a turn: it ends where it is
 //! (Worker::stopped). A Claude Code session's turn is Claude Code's instead (claude.rs).
 
-use crate::{api::brief, boards, channels, claude, claude_memory::Remembering, companion::{self, Heard, How}, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Llm, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, ask, bash, edit, mcp, search, Toolbox}, App};
+use crate::{api::brief, boards, channels, claude, claude_memory::Remembering, companion::{self, Heard, How}, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Llm, Piece, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, ask, bash, edit, mcp, search, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, store::Session, turns::Turn};
 use std::{cell::{Cell, RefCell}, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
@@ -29,6 +29,37 @@ pub const STOPPED: &str = "Stopped by the user.";
 
 /// The result of a call whose step the server stopped in, its reply logged but not its results.
 const UNFINISHED: &str = "No result: the server stopped before this call finished (while it ran, or waited for the user to allow it). It may or may not have run.";
+
+/// A reply whose reasoning repeats its last LOOP bytes word for word from earlier in it is looping, and
+/// stops there (looping, step), checked each time LOOP_CHECK more bytes of it have come. A model that
+/// loops so goes round a cycle of thousands of tokens: two DeepSeek replies cycled through 17k and 11k
+/// bytes, 5 and 8 times, until their 30k tokens ran out at 109k and 116k bytes; stopped at 1000 bytes
+/// into their second time round, they'd have ended at 27.5k and 29.5k. Of 368 reasoning blocks (1 MB)
+/// in the sessions here, none but those two repeats even 500 bytes.
+const LOOP: usize = 1000;
+const LOOP_CHECK: usize = 500;
+
+/// The replies in a row whose reasoning may loop before their turn ends. Each goes on from the one
+/// before, its reasoning carried back (llm.rs write_body), and stops once it repeats itself, so each
+/// costs about one time round its loop (at 11k–17k bytes, some 3k–5k tokens) and LOOP bytes more.
+const LOOPS: usize = 3;
+
+/// A turn's end when its replies' reasoning looped LOOPS times in a row.
+const LOOPED: &str = "Its reasoning repeated itself word for word, 3 times in a row, so the turn stopped there. The last reply is kept as far as it came: Continue goes on from it, its reasoning with it";
+
+/// How a step ended: its reply called tools, or its reasoning looped and it stopped there (looping),
+/// and the turn goes on; or it answered.
+#[derive(PartialEq)]
+enum Stepped { Called, Looped, Answered }
+
+/// Whether reasoning has begun repeating itself: its last LOOP bytes (from a character's start) are,
+/// word for word, somewhere before them.
+fn looping(reasoning: &str) -> bool {
+    if reasoning.len() < 2 * LOOP { return false }
+    let mut start = reasoning.len() - LOOP;
+    while !reasoning.is_char_boundary(start) { start += 1 }
+    reasoning[..start].contains(&reasoning[start..])
+}
 
 /// What a session's step runs with: its settings, the boards it's on, the model client and tools they
 /// give, the tools' definitions, the system prompt (the session's, then what boards::note says of its
@@ -211,8 +242,9 @@ impl Worker<'_> {
     }
 
     /// A chat turn: the log mended if the server stopped in a step (mend), its message joins the log,
-    /// then steps run, as many as it takes, until a reply calls no tools and the partner has told the
-    /// session nothing more (deliver), or the user stops it. Without a message, the turn continues the
+    /// then steps run, as many as it takes, until a reply answers (calls no tools, and its reasoning
+    /// didn't loop: then the next step goes on from it) and the partner has told the session nothing
+    /// more (deliver), or the user stops it, or LOOPS replies in a row loop. Without a message, the turn continues the
     /// log as it is: after an interruption the context ends with the user's message or the tool
     /// results, and after a reply cut short with that reply, which the Messages API continues (a
     /// prefill).
@@ -229,10 +261,13 @@ impl Worker<'_> {
         }
         self.deliver()?;
         self.logged();
+        let mut loops = 0; // replies in a row whose reasoning looped
         loop {
             if self.stopped() { return Err(STOPPED.into()) }
-            let called = self.step()?;
-            if !self.deliver()? && !called { return Ok(()) }
+            let stepped = self.step()?;
+            loops = if stepped == Stepped::Looped { loops + 1 } else { 0 };
+            if loops == LOOPS { return Err(LOOPED.into()) }
+            if !self.deliver()? && stepped == Stepped::Answered { return Ok(()) }
         }
     }
 
@@ -294,15 +329,24 @@ impl Worker<'_> {
 
     /// One step: the context compiles and streams into a request, the reply streams to the pages and
     /// joins the log, and the tools it calls run, their results joining the log; then memories form.
-    /// Whether it called any.
-    fn step(&self) -> Result<bool, String> {
+    /// How it ended.
+    fn step(&self) -> Result<Stepped, String> {
         let (s, setup) = (&self.s, Setup::new(self.app, self.name)?);
         let (cfg, reserve) = (&setup.settings.config, setup.settings.reserve);
         let turns = self.compile(&setup, costs::unlearnt(s), setup.settings.fold_above)?;
         let head = sparse(obj! {"model" => setup.settings.model.as_str(), "max_tokens" => reserve, "system" => setup.system.as_deref(), "tools" => setup.definitions.clone()});
+        // the reply's reasoning as it streams, which stops the reply once it's looping
+        let (mut reasoning, mut checked, mut looped) = (String::new(), 0, false);
         let piece = |piece| {
+            if let Piece::Thinking(more) = &piece {
+                reasoning.push_str(more);
+                if reasoning.len() >= checked + LOOP_CHECK {
+                    checked = reasoning.len();
+                    looped = looping(&reasoning);
+                }
+            }
             self.event(Event::Piece(piece));
-            !self.stopped()
+            !self.stopped() && !looped
         };
         let retrying = |n, why: &str| self.event(Event::Retry { n, of: RETRIES.len(), why: why.into() });
         let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), true, piece, &|| self.stopped(), retrying);
@@ -313,6 +357,7 @@ impl Worker<'_> {
         // a reply cut short once its text or reasoning began is kept as far as it came, and the turn ends there:
         // Continue goes on from it
         if let Some(why) = reply["cut"].as_str() { return Err(format!("{why}; the reply is kept as far as it came")) }
+        if looped { return Ok(Stepped::Looped) }
         let calls = reply["content"].arr().iter().filter(|b| b.kind() == "tool_use");
         let run = |call: &Value| if call["name"] == ask::NAME && setup.settings.questions { self.ask_user(call) } else { self.approve(&setup, call).map_or_else(|why| tools::result(call, Err(why.into())), |()| {
             self.event(Event::Running { id: call["id"].as_str().unwrap_or("").into(), tool: call["name"].as_str().unwrap_or("").into() });
@@ -329,9 +374,9 @@ impl Worker<'_> {
             }
         }
         if self.stopped() { return Err(STOPPED.into()) }
-        if !called { return Ok(false) }
+        if !called { return Ok(Stepped::Answered) }
         self.form(&setup);
-        Ok(true)
+        Ok(Stepped::Called)
     }
 
     /// The context for a request that carries `setup.overhead` besides it (the system prompt and tools),

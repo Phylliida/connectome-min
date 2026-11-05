@@ -364,7 +364,8 @@ pub fn to_api(mut b: Value, cache: bool) -> Value {
 /// The block types a request carries; documents and the rest stay in the log.
 const SENT: [&str; 4] = ["text", "tool_use", "tool_result", "image"];
 
-/// Reasoning, which a request carries only on the assistant's turns that call tools (write_body).
+/// Reasoning, which a request carries only on the assistant's turns that call tools, and on one with
+/// nothing else that ends it (write_body).
 const REASONING: [&str; 2] = ["thinking", "redacted_thinking"];
 
 /// A turn's blocks a request carries: its kinds SENT, not blank, and if `reasoning` its reasoning.
@@ -377,10 +378,14 @@ pub fn carried(t: &Turn, reasoning: bool) -> Vec<&Block> {
 /// blocks the request doesn't carry and blank text are left out, and a turn left empty goes. An
 /// assistant's turn that calls tools carries its reasoning back as the reply gave it, signatures and
 /// all (as DeepSeek's thinking mode requires, and Claude's tool use), unless it's joined to another
-/// turn, which would change the reply's shape (the API rejects altered reasoning). A turn's cache
-/// breakpoint marks its last block.
+/// turn, which would change the reply's shape (the API rejects altered reasoning). So does the
+/// assistant's turn that ends the request with nothing but reasoning, a reply that stopped as it
+/// reasoned (it looped, work.rs's looping, or ran out of tokens, or was cut or stopped), which
+/// Continue goes on from: left empty, it would go, and Continue would send the request it came from
+/// again. A turn's cache breakpoint marks its last block.
 fn write_body(mut out: impl Write, head: &Value, turns: &[Turn], reader: &mut Reader) -> io::Result<()> {
-    let turns: Vec<(&Turn, Vec<&Block>)> = turns.iter().map(|t| (t, carried(t, false))).filter(|(_, blocks)| !blocks.is_empty()).collect();
+    let reasoned = |i: usize, t: &Turn| i + 1 == turns.len() && carried(t, false).is_empty();
+    let turns: Vec<(&Turn, Vec<&Block>)> = turns.iter().enumerate().map(|(i, t)| (t, carried(t, reasoned(i, t)))).filter(|(_, blocks)| !blocks.is_empty()).collect();
     let head = json::to_string(head);
     write!(out, "{},\"messages\":[", &head[..head.len() - 1])?; // the head's fields without its closing brace
     for (i, run) in turns.chunk_by(|(a, _), (b, _)| (a.participant == "assistant") == (b.participant == "assistant")).enumerate() {

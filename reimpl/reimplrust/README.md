@@ -243,8 +243,14 @@ request, which must come whole, is tried again from the start. A failure that wo
 bad key, a request the API rejects) isn't retried, and only a reply that comes, whole or cut short,
 counts toward the session's costs. A call may start with no input (llama.cpp's server starts them so). A reply that calls tools goes back in later requests with its reasoning as it came,
 signatures and all, as DeepSeek's thinking mode requires (without it the model reasons from scratch
-at each step); other replies' reasoning, and the reasoning that wrote a memory, stay in the log and
-are never sent. Every request carries the system prompt and the tool definitions, so their tokens
+at each step), and so does a reply with nothing but reasoning that a request goes on from (as a
+prefill: one that stopped as it reasoned, by looping, running out of tokens, a cut or a stop), which
+without it would go, the request repeating the one it came from; other replies' reasoning, and the
+reasoning that wrote a memory, stay in the log and are never sent. A reply whose reasoning starts
+repeating itself word for word (its last 1000 bytes, checked every 500 as it streams, are somewhere
+earlier in it: a model that loops so goes round a cycle of thousands of tokens until its tokens run
+out) stops there and joins the log, and the turn goes on from it by itself, its reasoning carried
+back; three such replies in a row end the turn, saying so. Every request carries the system prompt and the tool definitions, so their tokens
 come out of the window the context compiles to, and out of the usage that calibrates prices; while
 calibration catches up with a request bigger than its estimate, the next context compiles that much
 smaller. Memory requests declare the same tools with tool choice "none", as the library does, so a
