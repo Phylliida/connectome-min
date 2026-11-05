@@ -42,6 +42,9 @@ const LOOP_CHECK: usize = 500;
 /// The replies in a row whose reasoning may loop before their turn ends. Each goes on from the one
 /// before, its reasoning carried back (llm.rs write_body), and stops once it repeats itself, so each
 /// costs about one time round its loop (at 11k–17k bytes, some 3k–5k tokens) and LOOP bytes more.
+/// DeepSeek V4.1 Flash on OpenRouter (Morph) takes reasoning carried back so as done, and answers from
+/// it without reasoning more (asked 17 × 23 after "17 × 3 = ", it answered "391" in 3 tokens), so
+/// the reply after a loop answers or calls tools rather than going round again.
 const LOOPS: usize = 3;
 
 /// A turn's end when its replies' reasoning looped LOOPS times in a row.

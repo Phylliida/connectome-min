@@ -250,7 +250,8 @@ reasoning that wrote a memory, stay in the log and are never sent. A reply whose
 repeating itself word for word (its last 1000 bytes, checked every 500 as it streams, are somewhere
 earlier in it: a model that loops so goes round a cycle of thousands of tokens until its tokens run
 out) stops there and joins the log, and the turn goes on from it by itself, its reasoning carried
-back; three such replies in a row end the turn, saying so. Every request carries the system prompt and the tool definitions, so their tokens
+back (DeepSeek V4.1 Flash on OpenRouter takes such reasoning as done, and answers from it or calls
+tools without reasoning more); three such replies in a row end the turn, saying so. Every request carries the system prompt and the tool definitions, so their tokens
 come out of the window the context compiles to, and out of the usage that calibrates prices; while
 calibration catches up with a request bigger than its estimate, the next context compiles that much
 smaller. Memory requests declare the same tools with tool choice "none", as the library does, so a
