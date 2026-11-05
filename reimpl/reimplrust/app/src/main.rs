@@ -58,6 +58,8 @@ impl App {
 
     fn profile(&self, name: &str) -> Result<SessionSettings, String> { settings::read(&self.profile_path(name)) }
 
+    fn draft_path(&self, name: &str) -> PathBuf { self.root.join(name).join("draft.json") }
+
     /// Every session's settings, by name, of those that have them.
     fn profiles(&self) -> Vec<(String, SessionSettings)> {
         let names = std::fs::read_dir(&self.root).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|n| !n.starts_with('.'));

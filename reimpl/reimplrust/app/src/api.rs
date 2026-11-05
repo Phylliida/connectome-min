@@ -134,6 +134,10 @@ fn session(app: &App, method: &str, name: &str, rest: &[&str], body: &Value, que
             made.recv().expect("the session's thread answers").map(|()| Some(state(app, fork, &app.session(fork))))
         }
         ("POST", ["settings"]) => app.ask_session(name, |reply| Msg::Tune(body.clone(), reply)).map(|()| Some(state(app, name, &s))),
+        ("POST", ["draft"]) => {
+            let text = body["text"].as_str().ok_or("a draft's text")?.to_string();
+            app.ask(|reply| Routed::Draft(name.into(), text, reply)).map(|()| Some(Value::Null))
+        }
         ("POST", [said @ ("say" | "continue")]) => {
             let text = (*said == "say").then(|| body["text"].as_str().unwrap_or("").to_string());
             if text.as_ref().map_or_else(|| s.count("messages") == 0, |text| text.trim().is_empty()) {
@@ -259,7 +263,7 @@ fn create(app: &App, v: &Value) -> Result<Value, String> {
 /// calibration, its settings as its file has them, the tools that ask before they run and the tokens
 /// every request carries (or the problem that keeps it from running), whether a turn runs (with its
 /// memories forming after it), the turns the user asked for that wait for it, what its requests have used, and the last reply's prompt as its
-/// provider counted it.
+/// provider counted it; and the message the user is writing to it (draft.json).
 #[derive(Serialize)]
 struct State<'a> {
     messages: u64,
@@ -276,6 +280,7 @@ struct State<'a> {
     overhead: f64,
     problem: Option<&'a str>,
     covers: Vec<Vec<(u64, u64)>>,
+    draft: String,
 }
 
 /// A session's State, as JSON.
@@ -300,6 +305,7 @@ fn state(app: &App, name: &str, s: &Session) -> Value {
         overhead: setup.as_ref().map_or(0.0, |x| x.overhead),
         problem: setup.as_ref().err().map(String::as_str),
         covers: app.profile(name).map_or(vec![], |own| covers(s, &own.config)),
+        draft: settings::read(&app.draft_path(name)).unwrap_or_default(), // none yet, or one that can't be read: the box starts empty
     };
     serde_json::to_value(state).expect("a state is JSON")
 }

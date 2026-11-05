@@ -109,6 +109,9 @@ since one holds the keys:
   nor `config.merge_by_count` turn on; `fold_above` and `fold_to` can't be blank, `fold_to` stays at
   most `fold_above`, and that at most what the window leaves the reply (so a smaller window needs a
   lower band first); a chunk holds more than 0 tokens; and a merge takes 2 memories or more.
+- `ROOT/NAME/draft.json`: the message you're writing to the session, as a JSON string, saved as you
+  type it (one save at a time, the newest text next) and emptied as you send it, so each session
+  keeps its own and a page opening the session, here or on another device, puts it back in the box.
 
 Tools (`app/src/tools/`): the model can call `bash` (a command in a new shell in the session's
 workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in the workspace changed

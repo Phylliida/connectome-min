@@ -298,7 +298,7 @@ const page = {
   settings: null,                         // the settings dialog, while it's open: {tab, notes: under each provider's card, by provider ('' the new one's), made: providers added,
                                           //   preset: the preset shown, picked: the provider chosen on its form, note: under it}
   accompanying: null,                     // the dialog that makes the session's companion, while it's open: {error}
-  detail: 'Select a memory or chunk.',    // the memory or chunk the pyramid last showed
+  detail: '',                             // the memory or chunk the pyramid last showed, in the session open
   folded: new Set(),                      // the workspaces whose groups are folded, kept in this browser
   collapsed: new Set(),                   // boards' columns collapsed to their headers, as board/column, kept in this browser
   dragging: null,                         // what's dragged on the board: a task {file, from} or a column {column}
@@ -429,7 +429,7 @@ const App = () => {
       ${b != null ? html`<${BoardView} />` : c != null ? html`<${Posts} />` : html`<${Log} />`}
       <div id="status" class=${warn ? 'warn' : ''}>${line}</div>
       ${b == null && c == null && html`<${QueuedList} />`}
-      ${b != null ? null : c != null ? html`<${PostForm} key=${c} />` : html`<${SayForm} />`}
+      ${b != null ? null : c != null ? html`<${PostForm} key=${c} />` : html`<${SayForm} key=${current()} />`}
     </section>
     <aside id="memory" hidden=${!page.panels.right}>
       ${b != null ? html`<h2>${b}</h2><${BoardPanel} />` : c != null ? html`<h2>#${c}</h2><${ChannelAbout} /><${Members} />` : html`
@@ -443,7 +443,7 @@ const App = () => {
       <h2>Memory pyramid</h2>
       <div class="legend">Each row up merges runs of the row below, each about a chunk's worth of tokens, or, when the context can't fold enough, the oldest leftovers of several rows; bottom row is chunks of raw messages. Outlined: what the context shows. Click for its text.</div>
       <${Pyramid} />
-      <pre id="detail">${page.detail}</pre>`}
+      <pre id="detail">${page.detail || 'Select a memory or chunk.'}</pre>`}
     </aside>
     ${page.creating && html`<${NewSession} />`}
     ${page.settings && html`<${Settings} />`}
@@ -670,7 +670,9 @@ const enters = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault
 
 // a new session, in a dialog in the middle of the page: its name, the preset it starts as a copy of,
 // and its workspace, one the sessions have (the session open's to start with), none, or another
-// directory, typed (page.creating)
+// directory, typed (page.creating). A name's pattern (as a companion's) is written \\- to reach the
+// page as \-: htm takes the template's text with its escapes applied, and a browser reads a pattern
+// as a v-mode regular expression, where - in brackets must be escaped or the whole pattern is ignored.
 const OTHER = '…';
 function NewSession() {
   const made = page.creating, workspaces = [...new Set(page.sessions.map((s) => s.workspace).filter(Boolean))].sort();
@@ -693,7 +695,7 @@ function NewSession() {
   return html`<dialog id="new" ref=${(d) => d && !d.open && d.showModal()} onClose=${() => { page.creating = null; draw(); }}>
     <form class="settings" onSubmit=${create}>
       <h2>New session</h2>
-      <label>Name <input id="newname" name="name" required pattern="[A-Za-z0-9_\-]+" title="Letters, digits, - and _" placeholder="letters, digits, - and _" /></label>
+      <label>Name <input id="newname" name="name" required pattern="[A-Za-z0-9_\\-]+" title="Letters, digits, - and _" placeholder="letters, digits, - and _" /></label>
       <label title="Its settings start as a copy of the preset's; Settings edits the presets">Preset <select id="newpreset" name="preset">${Object.keys(page.presets).map((p) => html`<option selected=${p === 'default'}>${p}</option>`)}</select></label>
       <label>Workspace, where its tools run <select id="newspace" name="workspace" onChange=${choose}>
         ${workspaces.map((w) => html`<option value=${w} selected=${w === made.workspace}>${w}</option>`)}
@@ -745,7 +747,7 @@ function Accompany() {
       <h2>A companion for ${current()}</h2>
       <small>Another session, on ${s.provider} · ${s.model}, that keeps the goal in mind and talks with ${current()} as a collaborator. While Auto is on, each one's turn's end goes to the other, and either can message the other at any time. It has no workspace; its settings are a session's like any other's.</small>
       <label>Goal <textarea id="goal" name="goal" rows="5" required placeholder="What the work is for, and what done looks like"></textarea></label>
-      <label>Its name <input id="companionname" name="name" required pattern="[A-Za-z0-9_\-]+" title="Letters, digits, - and _" defaultValue=${current() + '-companion'} /></label>
+      <label>Its name <input id="companionname" name="name" required pattern="[A-Za-z0-9_\\-]+" title="Letters, digits, - and _" defaultValue=${current() + '-companion'} /></label>
       <small class="warn">${made.error}</small>
       <div class="buttons">
         <button type="button" onClick=${(e) => e.target.closest('dialog').close()}>Cancel</button>
@@ -928,11 +930,12 @@ function SayForm() {
     if (text) {
       box.value = '';
       fit(box);
+      saveDraft(current(), '');
       turn(text);
     }
   };
   return html`<form id="say" onSubmit=${say}>
-    <textarea id="text" name="text" placeholder="Message (Enter sends, Shift+Enter for a new line)" onKeyDown=${enters} onInput=${(e) => fit(e.target)}></textarea>
+    <textarea id="text" name="text" placeholder="Message (Enter sends, Shift+Enter for a new line)" onKeyDown=${enters} onInput=${(e) => { fit(e.target); saveDraft(current(), e.target.value); }}></textarea>
     <button class="icon send" title="Send (Enter)" aria-label="Send">${ICONS.send()}</button>
     <button type="button" id="continue" class="icon" title="Let the model go on, without a message" aria-label="Continue" onClick=${() => turn(null)}>${ICONS.go()}</button>
     <button type="button" id="stop" class="icon stop" title="Stop the turn" aria-label="Stop" disabled=${!page.live} onClick=${stop}>${ICONS.stop()}</button>
@@ -1600,6 +1603,34 @@ async function earlier() {
   draw();
 }
 
+// the message box's text kept as its session's draft (draft.json), saved as it's typed: one save at a
+// time, then the newest text of each session that changed meanwhile, so a save never lands after a
+// newer one and fast typing makes few
+const drafts = new Map();   // the text to save next, by session
+let draftSaving = false;
+async function saveDraft(name, text) {
+  drafts.set(name, text);
+  if (draftSaving) return;
+  draftSaving = true;
+  while (drafts.size) {
+    const [next, saving] = drafts.entries().next().value;
+    drafts.delete(next);
+    try { await api(`/api/s/${next}/draft`, { text: saving }); } catch (err) { fail(err); }
+  }
+  draftSaving = false;
+}
+
+// a session's draft in its message box as the page opens the session, unless the user has typed there
+// already
+function restore(text) {
+  draw();   // the box drawn now, the session's own (SayForm's key), so it's the one found here
+  const box = document.getElementById('text');
+  if (box && !box.value && text) {
+    box.value = text;
+    fit(box);
+  }
+}
+
 // a turn: `text` joins the log and the model answers it, or without text the model goes on from the
 // log as it is; the page hears it as it follows the session
 async function turn(text) {
@@ -1681,6 +1712,7 @@ async function follow(name, signal) {
       if (caught) {
         const next = caught[0]?.id ?? 0, kept = page.messages.filter((m) => m.id < next);
         [page.scroll, page.messages, caught] = [!page.messages.length, kept.at(-1)?.id === next - 1 ? [...kept, ...caught] : caught, null];
+        restore(s.draft);
       }
       if (!s.running) page.live = null;
     },
@@ -1768,7 +1800,8 @@ try { page.folded = new Set(JSON.parse(localStorage.getItem('folded')) || []); }
 try { page.collapsed = new Set(JSON.parse(localStorage.getItem('collapsed')) || []); } catch { /* no storage here: columns start expanded */ }
 try { Object.assign(page.panels, JSON.parse(localStorage.getItem('panels'))); } catch { /* no storage here: both sides show */ }
 window.onhashchange = () => {
-  [page.notes.session, page.notes.about, page.picked, page.live, page.error, page.accompanying, page.messages, page.posts, page.board, page.task, page.editing] = ['', '', null, null, null, null, [], [], null, null, null];
+  [page.notes.session, page.notes.about, page.picked, page.live, page.error, page.accompanying, page.messages, page.posts, page.board, page.task, page.editing, page.detail] = ['', '', null, null, null, null, [], [], null, null, null, ''];
+  state = null;   // the session left: nothing of it shows in the one opened, until its own comes
   listSessions();
   listChannels();
   listBoards();

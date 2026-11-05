@@ -242,8 +242,8 @@ pub fn change<T: Serialize + DeserializeOwned>(path: &Path, f: impl FnOnce(&mut 
     write(path, &settings).map(|()| settings)
 }
 
-/// Writes a settings file whole, through a new file that then takes the old one's place, so no one
-/// reads half of it.
+/// Writes a settings file (or a session's draft) whole, through a new file that then takes the old
+/// one's place, so no one reads half of it.
 pub fn write(path: &Path, settings: &impl Serialize) -> Result<(), String> {
     let new = path.with_extension("json.new");
     let _ = std::fs::remove_file(&new); // left by a write that stopped halfway

@@ -1159,6 +1159,33 @@ def presetted(port, root, ca):
         raise SystemExit('settings.json with presets and defaults both had them changed as the app started')
 
 
+def drafted(port, root):
+    """The message the user is writing to a session, kept as its draft: none at first, then each text
+    saved, as it was, until it's emptied; one that can't be read starts empty."""
+    call(port, '/api/sessions', {'name': 'drafting'})
+    draft = lambda: call(port, '/api/s/drafting')['draft']
+    if draft() != '':
+        raise SystemExit(f'a new session has the draft {draft()!r}')
+    text = 'half a thought,\n  then "more" — ünïcode'
+    call(port, '/api/s/drafting/draft', {'text': text})
+    path = Path(root, 'drafting', 'draft.json')
+    if draft() != text or json.loads(path.read_text()) != text or os.stat(path).st_mode & 0o777 != 0o600:
+        raise SystemExit(f'a draft saved is {draft()!r}, its file {path.read_text()!r}, mode {os.stat(path).st_mode & 0o777:o}')
+    call(port, '/api/s/drafting/draft', {'text': ''})
+    if draft() != '':
+        raise SystemExit(f'a draft emptied is {draft()!r}')
+    for path_, wrong in [('/api/s/drafting/draft', {}), ('/api/s/nowhere/draft', {'text': 'x'})]:   # without its text, and for a session there isn't
+        try:
+            call(port, path_, wrong)
+            raise SystemExit(f'{path_} took {wrong}')
+        except urllib.error.HTTPError as error:
+            if error.code != 400 or Path(root, 'nowhere').exists():
+                raise
+    path.write_text('not JSON')
+    if draft() != '':
+        raise SystemExit('a draft that can\'t be read did not start empty')
+
+
 def chatted(turns, tls, ca, baseline) -> str:
     """The long chat, the fork and the settings; the main session's price multiplier goes to `baseline`."""
     mock_port, plain_port, port, root = free_port(), free_port(), free_port(), tempfile.mkdtemp()
@@ -1275,6 +1302,7 @@ def chatted(turns, tls, ca, baseline) -> str:
                 if error.code != 400:
                     raise
         presetted(port, root, ca)
+        drafted(port, root)
         Path(root, 'old').mkdir()                                       # a session without settings has none to run with
         if 'session_settings.json' not in (call(port, '/api/s/old')['problem'] or '') or call(port, '/api/s/old/messages') != []:
             raise SystemExit('a session without settings did not say so, or show its log')
