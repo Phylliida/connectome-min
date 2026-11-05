@@ -91,6 +91,8 @@ fn main() {
     let app: &'static App = Box::leak(Box::new(App { root, addr, agent, upstream, mcp, mcp_config, bash: !flag("--no-bash"), limit, hub: told }));
     if !app.settings_path().exists() {
         settings::write(&app.settings_path(), &Settings::first()).expect("settings.json");
+    } else if let Err(e) = settings::upgrade(&app.settings_path()) {
+        eprintln!("{e}"); // the page says so too, at each use
     }
     std::thread::spawn(move || hub::hub(app, inbox));
     let listener = TcpListener::bind(&app.addr).expect("--addr");

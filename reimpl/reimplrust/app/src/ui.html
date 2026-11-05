@@ -56,6 +56,9 @@ dialog .buttons small { margin-right: auto; }
 /* the settings: a card per provider, its models as chips */
 #settings { width: min(600px, 94vw); }
 #settings > small { display: block; margin: -2px 0 12px; color: var(--muted); font-size: 12px; }
+#settings .tabs { display: flex; gap: 14px; margin: 0 0 12px; }
+#settings .tabs button { border: 0; border-radius: 0; background: none; padding: 0 0 3px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+#settings .tabs button.on { color: var(--ink); box-shadow: inset 0 -2px var(--accent); }
 .card { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 0 0 12px; }
 .card.adding { border-style: dashed; }
 .card h3 { font-size: 14px; margin: 0; }
@@ -280,7 +283,7 @@ const current = () => channel() == null && board() == null ? opened() : '';   //
 
 let state = null;   // the session as the server has it (a global the browser tests read)
 const page = {
-  sessions: [], providers: [], channels: [], boards: [],
+  sessions: [], providers: [], presets: {}, channels: [], boards: [],
   board: null,                            // the board the page shows, as the server last read it (refresh)
   task: null,                             // the task open in its dialog: {file, data (as the server last read it), error}
   messages: [],                           // the log's messages the page has, oldest first
@@ -292,7 +295,8 @@ const page = {
   picked: null,                           // the provider chosen on the session form, until it starts again
   creating: null,                         // the new-session dialog, while it's open: {workspace chosen, error}
   editing: null,                          // the queued message being edited in place, by its number
-  settings: null,                         // the settings dialog, while it's open: {notes: under each card, by provider ('' the new one's), made: providers added}
+  settings: null,                         // the settings dialog, while it's open: {tab, notes: under each provider's card, by provider ('' the new one's), made: providers added,
+                                          //   preset: the preset shown, picked: the provider chosen on its form, note: under it}
   accompanying: null,                     // the dialog that makes the session's companion, while it's open: {error}
   detail: 'Select a memory or chunk.',    // the memory or chunk the pyramid last showed
   folded: new Set(),                      // the workspaces whose groups are folded, kept in this browser
@@ -409,7 +413,7 @@ const App = () => {
     <aside hidden=${!page.panels.left}>
       <div class="top">
         <button id="new-session" class="new" onClick=${creating}>New session</button>
-        <button id="open-settings" class="icon" title="Settings: providers and their models" aria-label="Settings" onClick=${opening}>${ICONS.gear()}</button>
+        <button id="open-settings" class="icon" title="Settings: providers and presets" aria-label="Settings" onClick=${opening}>${ICONS.gear()}</button>
       </div>
       ${page.providers.length > 0 && !page.providers.some(ready) && html`<small class="nokey">Add a provider's API key in Settings to chat.</small>`}
       <h2>Sessions</h2>
@@ -664,16 +668,17 @@ function PostForm() {
 // Enter in a message box sends it; Shift+Enter starts a new line
 const enters = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.form.requestSubmit(); } };
 
-// a new session, in a dialog in the middle of the page: its name, and its workspace, one the sessions
-// have (the session open's to start with), none, or another directory, typed (page.creating)
+// a new session, in a dialog in the middle of the page: its name, the preset it starts as a copy of,
+// and its workspace, one the sessions have (the session open's to start with), none, or another
+// directory, typed (page.creating)
 const OTHER = '…';
 function NewSession() {
   const made = page.creating, workspaces = [...new Set(page.sessions.map((s) => s.workspace).filter(Boolean))].sort();
   const create = async (e) => {
     e.preventDefault();
-    const { name, workspace, path } = e.target.elements;
+    const { name, preset, workspace, path } = e.target.elements;
     try {
-      await api('/api/sessions', { name: name.value.trim(), workspace: (workspace.value === OTHER ? path.value.trim() : workspace.value) || null });
+      await api('/api/sessions', { name: name.value.trim(), preset: preset.value, workspace: (workspace.value === OTHER ? path.value.trim() : workspace.value) || null });
       page.creating = null;
       location.hash = name.value.trim();
     } catch (err) {
@@ -689,6 +694,7 @@ function NewSession() {
     <form class="settings" onSubmit=${create}>
       <h2>New session</h2>
       <label>Name <input id="newname" name="name" required pattern="[A-Za-z0-9_\-]+" title="Letters, digits, - and _" placeholder="letters, digits, - and _" /></label>
+      <label title="Its settings start as a copy of the preset's; Settings edits the presets">Preset <select id="newpreset" name="preset">${Object.keys(page.presets).map((p) => html`<option selected=${p === 'default'}>${p}</option>`)}</select></label>
       <label>Workspace, where its tools run <select id="newspace" name="workspace" onChange=${choose}>
         ${workspaces.map((w) => html`<option value=${w} selected=${w === made.workspace}>${w}</option>`)}
         <option value="" selected=${made.workspace === ''}>No workspace</option>
@@ -758,17 +764,54 @@ function creating() {
 // whether sessions can chat on a provider: it has a key, or it's Claude Code (a command), which logs in itself
 const ready = (p) => p.key || p.command;
 
-// the settings, in a dialog in the middle of the page (page.settings): a card per provider sessions
-// choose from, then one that adds a provider
+// the settings, in a dialog in the middle of the page (page.settings), on two tabs: the providers, a
+// card per provider sessions choose from, then one that adds a provider; and the presets (Presets)
 function Settings() {
-  const keyless = !page.providers.some(ready);
+  const open = page.settings, keyless = !page.providers.some(ready);
+  const tab = (name, title) => html`<button type="button" id=${name + '-tab'} class=${open.tab === name ? 'on' : ''} onClick=${() => { open.tab = name; draw(); }}>${title}</button>`;
   return html`<dialog id="settings" ref=${(d) => d && !d.open && d.showModal()} onClose=${() => { page.settings = null; draw(); }}>
-    <h2>Providers</h2>
-    <small>${keyless ? 'Add a provider\'s API key to chat. DeepSeek: https://api.deepseek.com/anthropic, OpenRouter: https://openrouter.ai/api/v1' : 'A session runs on a provider\'s API, or in Claude Code, on one of the models it lists.'}</small>
-    ${page.providers.map((p) => html`<${Provider} key=${p.name} p=${p} />`)}
-    <${Provider} key=${'new-' + page.settings.made} />
+    <div class="tabs">${tab('providers', 'Providers')}${tab('presets', 'Presets')}</div>
+    ${open.tab === 'presets' ? html`<${Presets} />` : html`
+      <small>${keyless ? 'Add a provider\'s API key to chat. DeepSeek: https://api.deepseek.com/anthropic, OpenRouter: https://openrouter.ai/api/v1' : 'A session runs on a provider\'s API, or in Claude Code, on one of the models it lists.'}</small>
+      ${page.providers.map((p) => html`<${Provider} key=${p.name} p=${p} />`)}
+      <${Provider} key=${'new-' + open.made} />`}
     <div class="buttons"><button type="button" onClick=${(e) => e.target.closest('dialog').close()}>Done</button></div>
   </dialog>`;
+}
+
+// the presets (Settings::preset in settings.rs), what a new session can start with: the one chosen's
+// form, a session's but for the workspace (SessionForm), with a button that deletes it once the user
+// confirms (all but default, which stays); then one that adds a copy of it, named. Showing another
+// starts its form again (its key), the provider chosen on it with it.
+function Presets() {
+  const open = page.settings, names = Object.keys(page.presets), chosen = names.includes(open.preset) ? open.preset : names[0];
+  if (!chosen) return html`<small>No presets: settings.json lists none.</small>`;
+  const show = (name) => {
+    [open.preset, open.picked, open.note] = [name, null, ''];
+    draw();
+  };
+  const copy = async (e) => {
+    e.preventDefault();
+    const input = e.target.elements.name, name = input.value.trim();
+    if (await changePreset({ name, from: chosen })) {
+      input.value = '';
+      show(name);
+    }
+  };
+  const forget = async () => confirm(`Delete the preset ${chosen}? Sessions made from it keep their settings.`) && await changePreset({ name: chosen, delete: true }) && show(null);
+  return html`
+    <small>A new session's settings start as a copy of the preset it's made from, its workspace the one it's given then; changing a preset changes no session made before.</small>
+    <div class="card">
+      <div class="top">
+        <select id="presets" aria-label="The preset shown" onChange=${(e) => show(e.target.value)}>${names.map((p) => html`<option selected=${p === chosen}>${p}</option>`)}</select>
+        ${chosen !== 'default' && html`<button type="button" class="icon delete" title=${'Delete ' + chosen} aria-label=${'Delete ' + chosen} onClick=${forget}>${ICONS.trash()}</button>`}
+      </div>
+      <${SessionForm} key=${chosen} preset=${chosen} />
+    </div>
+    <form class="card settings adding" id="new-preset" onSubmit=${copy}>
+      <label>New preset, a copy of ${chosen} <input name="name" required placeholder="its name" /></label>
+      <div class="buttons"><button class="primary">Add preset</button></div>
+    </form>`;
 }
 
 // a provider's card: its base URL and its key (which the page never sees), saved by its button, or, for
@@ -813,20 +856,22 @@ function Provider({ p }) {
 // from what the page shows and are the user's from then on (default values: Preact sets `value` again
 // at every draw), until the form starts again for another session (its key). Its models are those of the provider chosen (page.picked), the
 // session's own first if its provider doesn't list it; a provider without any takes a model typed.
-function SessionForm() {
-  const s = state?.settings ?? {}, provider = page.picked ?? s.provider;
+// With `preset`, the form is that preset's (Presets), all but the workspace, which a new session is
+// given when it's made; its provider chosen is kept with the settings dialog's (page.settings.picked).
+function SessionForm({ preset }) {
+  const s = (preset ? page.presets[preset] : state?.settings) ?? {}, keeps = preset ? page.settings : page, provider = keeps.picked ?? s.provider;
   const listed = page.providers.find((p) => p.name === provider)?.models ?? [];
   const inClaude = !!page.providers.find((p) => p.name === provider)?.command;   // a Claude Code session's sandbox holds all of Claude Code
   const models = provider === s.provider && s.model && !listed.includes(s.model) ? [s.model, ...listed] : listed;
   const pick = (e) => {
-    page.picked = e.target.value;
+    keeps.picked = e.target.value;
     draw();
   };
-  return html`<form id="session" class="settings" data-session=${current()} onInput=${typing} onChange=${(e) => tune(e.target)} onSubmit=${(e) => e.preventDefault()}>
-    <label>Provider <select name="provider" id="sprovider" onChange=${pick}>${page.providers.map((p) => html`<option selected=${p.name === s.provider}>${p.name}</option>`)}</select></label>
+  return html`<form id=${preset ? 'preset' : 'session'} class="settings" data-session=${preset ? null : current()} data-preset=${preset} onInput=${typing} onChange=${(e) => tune(e.target)} onSubmit=${(e) => e.preventDefault()}>
+    <label>Provider <select name="provider" id=${preset ? null : 'sprovider'} onChange=${pick}>${page.providers.map((p) => html`<option selected=${p.name === s.provider}>${p.name}</option>`)}</select></label>
     <label>Model ${models.length ? html`<select name="model" key=${provider}>${models.map((m) => html`<option selected=${m === s.model}>${m}</option>`)}</select>`
       : html`<input name="model" defaultValue=${s.model ?? ''} placeholder="its name, as the provider has it" />`}</label>
-    <label>Workspace <input name="workspace" defaultValue=${s.workspace ?? ''} placeholder="none: no bash" /></label>
+    ${!preset && html`<label>Workspace <input name="workspace" defaultValue=${s.workspace ?? ''} placeholder="none: no bash" /></label>`}
     <label><input name="sandbox" type="checkbox" defaultChecked=${!!s.sandbox} /> ${inClaude ? 'Claude Code' : 'bash'} in the sandbox</label>
     <label title="Off, the model has no tool to ask you questions"><input name="questions" type="checkbox" defaultChecked=${s.questions !== false} /> Questions: the model can ask you</label>
     <label>Window <input name="window" type="number" defaultValue=${s.window ?? ''} /></label>
@@ -846,7 +891,8 @@ function SessionForm() {
     <label title="Folding goes down to this many tokens of prompt, so it doesn't fold again at every step">Fold down to
       <input name="fold_to" type="number" defaultValue=${s.fold_to ?? ''} /></label>
     <label>System prompt <textarea name="system" rows="2" defaultValue=${s.system ?? ''}></textarea></label>
-    <small id="ssaved">${page.notes.session || 'Changes save as you make them. The rest is in the session\'s session_settings.json.'}</small>
+    ${preset ? html`<small>${page.settings.note || 'Changes save as you make them. The rest is in settings.json\'s presets.'}</small>`
+      : html`<small id="ssaved">${page.notes.session || 'Changes save as you make them. The rest is in the session\'s session_settings.json.'}</small>`}
   </form>`;
 }
 
@@ -1330,8 +1376,8 @@ async function member(name, change) {
   draw();
 }
 
-async function loadProviders() {
-  ({ providers: page.providers } = await api('/api/settings'));
+async function loadSettings() {
+  ({ providers: page.providers, presets: page.presets } = await api('/api/settings'));
   redraw();
 }
 
@@ -1402,11 +1448,11 @@ function fold(workspace, folded) {
   redraw();
 }
 
-// the settings dialog opened, the providers as settings.json has them now
+// the settings dialog opened on its providers, the providers and presets as settings.json has them now
 function opening() {
-  page.settings = { notes: {}, made: 0 };
+  page.settings = { tab: 'providers', notes: {}, made: 0, preset: null, picked: null, note: '' };
   draw();
-  loadProviders();
+  loadSettings();
 }
 
 // a provider saved as `body` gives it (Settings::provide in settings.rs), from `card` (its name, '' for
@@ -1414,7 +1460,7 @@ function opening() {
 async function provide(card, body) {
   const open = page.settings;
   try {
-    ({ providers: page.providers } = await api('/api/settings', body));
+    ({ providers: page.providers, presets: page.presets } = await api('/api/settings', body));
     open.notes[card] = '';
     open.notes[body.name.trim()] = 'Saved.';
     if (!card) open.made++;
@@ -1425,7 +1471,20 @@ async function provide(card, body) {
   } finally { draw(); }
 }
 
-// typing in a field of the session form: it's saved once the typing pauses for PAUSE (or as it leaves
+// a preset saved as `body` gives it (Settings::preset in settings.rs); whether it was, said under its form
+async function changePreset(body) {
+  const open = page.settings ?? {};   // the dialog may have closed before a pause's save (tune)
+  try {
+    ({ providers: page.providers, presets: page.presets } = await api('/api/presets', body));
+    open.note = 'Saved.';
+    return true;
+  } catch (err) {
+    open.note = err.message;
+    return false;
+  } finally { draw(); }
+}
+
+// typing in a field of a settings form: it's saved once the typing pauses for PAUSE (or as it leaves
 // the field, tune); a choice is saved at once
 const PAUSE = 2500, pausing = new Map();
 function typing(e) {
@@ -1435,24 +1494,30 @@ function typing(e) {
   pausing.set(el, setTimeout(() => tune(el), PAUSE));
 }
 
-// a field of the session form saved, alone, into the form's session, unless its file has it already: a
-// number once it is one (an optional one, blank, unset), a provider with the model its list starts on, and
-// a field named config.x as config's x. The form may have gone, the
-// page on another session (a browser can tell its field it's left as it goes): then nothing on the page
-// says so.
+// a field of a settings form saved, alone, into the form's session, or a preset's form's into its
+// preset, unless its file has it already: a number once it is one (an optional one, blank, unset), a
+// provider with the model its list starts on, and a field named config.x as config's x. The form may
+// have gone, the page on another session or the settings dialog closed (a browser can tell its field
+// it's left as it goes): then nothing on the page says so.
 async function tune(el) {
   clearTimeout(pausing.get(el));
   const [form, value] = [el.form, el.type === 'checkbox' ? el.checked : el.type === 'number' ? (el.value.trim() ? Number(el.value) : el.dataset.optional ? null : NaN) : el.value || null];
-  const name = form?.id === 'session' ? form.dataset.session : null, shown = name === current();
+  const preset = form?.dataset.preset, name = form?.id === 'session' ? form.dataset.session : null;
+  const shown = preset ? preset in page.presets : name === current(), before = preset ? page.presets[preset] : state?.settings;
+  const note = (text) => {
+    if (preset && page.settings) page.settings.note = text;
+    else if (!preset && name === current()) page.notes.session = text;
+  };
   const path = el.name.split('.');
-  if (!el.name || !name || shown && value === (path.reduce((o, k) => o?.[k], state?.settings) ?? null)) return;
+  if (!el.name || !(preset || name) || shown && value === (path.reduce((o, k) => o?.[k], before) ?? null)) return;
   if (Number.isNaN(value)) {
-    if (shown) page.notes.session = `${el.closest('label').firstChild.textContent.trim()} needs a number.`;
+    note(`${el.closest('label').firstChild.textContent.trim()} needs a number.`);
     return draw();
   }
   const change = el.name === 'provider' ? { provider: value, model: form.elements.model?.value || null } : path.reduceRight((v, k) => ({ [k]: v }), value);
-  if (shown) page.notes.session = 'Saving…';
+  note('Saving…');
   draw();
+  if (preset) return changePreset({ name: preset, set: change });
   try {
     const saved = await api(`/api/s/${name}/settings`, change);
     if (name === current()) [state, page.notes.session] = [saved, 'Saved.'];
@@ -1711,7 +1776,7 @@ window.onhashchange = () => {
 };
 document.onvisibilitychange = subscribe;
 redraw();
-loadProviders();
+loadSettings();
 listSessions();
 listChannels();
 listBoards();

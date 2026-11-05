@@ -21,6 +21,7 @@ use std::{collections::{HashMap, VecDeque}, sync::mpsc::{channel, Receiver, Send
 pub enum Routed {
     To(String, Msg),
     Provide(Value, Sender<Result<Settings, String>>),
+    Preset(Value, Sender<Result<Settings, String>>),
     Auto(String, bool, Sender<Result<bool, String>>),
     Post(Post, Sender<Result<Posted, String>>),
     Describe(String, String, Sender<Result<(), String>>),
@@ -172,6 +173,7 @@ pub fn hub(app: &'static App, inbox: Receiver<Routed>) {
         match routed {
             Routed::To(name, msg) => live(app, &mut sessions, &name).handle(app, &name, msg),
             Routed::Provide(v, reply) => drop(reply.send(settings::change(&app.settings_path(), |all: &mut Settings| all.provide(&v)))),
+            Routed::Preset(v, reply) => drop(reply.send(settings::change(&app.settings_path(), |all: &mut Settings| all.preset(&v)))),
             Routed::Auto(name, on, reply) => drop(reply.send(auto(app, &sessions, &name, on))),
             Routed::Post(p, reply) => drop(reply.send(post(app, &mut sessions, &mut watching, p))),
             Routed::Describe(name, description, reply) => drop(reply.send(channels::describe(app, &name, &description))),

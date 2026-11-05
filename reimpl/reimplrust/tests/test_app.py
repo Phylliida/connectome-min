@@ -349,12 +349,12 @@ def configure(root, base, window, recent, chunk):
     under that), with `chunk`s and a recent window of `recent` sized for it."""
     path = Path(root, 'settings.json')
     everything = json.loads(path.read_text())
-    if everything['defaults']['sandbox'] != sys.platform.startswith('linux') or everything['providers']['default']['models'] != [everything['defaults']['model']] \
-            or everything['defaults']['config']['target_chunk_tokens'] != 3000 or (everything['defaults']['fold_above'], everything['defaults']['fold_to']) != (90000, 65000):
-        raise SystemExit(f'a first run wrote {everything["defaults"]["sandbox"]=}, {everything["providers"]["default"]["models"]=} and chunks of {everything["defaults"]["config"]["target_chunk_tokens"]}')
+    if everything['presets']['default']['sandbox'] != sys.platform.startswith('linux') or everything['providers']['default']['models'] != [everything['presets']['default']['model']] \
+            or everything['presets']['default']['config']['target_chunk_tokens'] != 3000 or (everything['presets']['default']['fold_above'], everything['presets']['default']['fold_to']) != (90000, 65000):
+        raise SystemExit(f'a first run wrote {everything["presets"]["default"]["sandbox"]=}, {everything["providers"]["default"]["models"]=} and chunks of {everything["presets"]["default"]["config"]["target_chunk_tokens"]}')
     everything['providers']['default']['base'] = base
-    everything['defaults'].update(model='mock', window=window, reserve=1000, fold_above=window - 1000, fold_to=(window - 1000) * 0.9)   # the window's own band
-    everything['defaults']['config'].update(recent_window_tokens=recent, target_chunk_tokens=chunk)
+    everything['presets']['default'].update(model='mock', window=window, reserve=1000, fold_above=window - 1000, fold_to=(window - 1000) * 0.9)   # the window's own band
+    everything['presets']['default']['config'].update(recent_window_tokens=recent, target_chunk_tokens=chunk)
     path.write_text(json.dumps(everything))
 
 
@@ -516,7 +516,7 @@ def lifted(tls, ca) -> str:
     try:
         configure(root, f'https://localhost:{mock_port}', LIFTED, 400, 200)
         everything = json.loads(Path(root, 'settings.json').read_text())
-        everything['defaults']['questions'] = False   # its windows are too small for ask_user's definition
+        everything['presets']['default']['questions'] = False   # its windows are too small for ask_user's definition
         Path(root, 'settings.json').write_text(json.dumps(everything))
         call(port, '/api/sessions', {'name': 'lifted'})
         state = chat(port, 'lifted', 60, 0, LIFTED)
@@ -659,7 +659,7 @@ def tooled(tls, ca, baseline) -> str:
     app, seen['limit'] = start(), window
     configure(root, f'https://localhost:{mock_port}', window, 2381, 595.25)
     everything = json.loads(Path(root, 'settings.json').read_text())
-    everything['defaults']['questions'] = False   # its window's budget is set without ask_user's definition; questions go on where they're tried
+    everything['presets']['default']['questions'] = False   # its window's budget is set without ask_user's definition; questions go on where they're tried
     Path(root, 'settings.json').write_text(json.dumps(everything))
 
     def results(text, answers=None, asked=None):
@@ -1100,6 +1100,65 @@ def accompanied(tls, ca) -> str:
         mock.shutdown()
 
 
+def presetted(port, root, ca):
+    """The presets, on an app whose settings have a provider plain besides default: a preset copied,
+    changed and refused as a session's settings are, a session made from one, the provider it's on
+    kept, the preset default kept, and, in an app of its own, settings.json from before presets
+    upgraded as the app starts."""
+    presets = lambda body: call(port, '/api/presets', body)['presets']
+    base = call(port, '/api/settings')['presets']['default']
+    made = presets({'name': ' roomy ', 'from': 'default', 'set': {'provider': 'plain', 'model': 'mock-2', 'system': 'be roomy', 'config': {'recent_window_tokens': 999}}})['roomy']
+    if made != (expected := {**base, 'provider': 'plain', 'model': 'mock-2', 'system': 'be roomy', 'config': {**base['config'], 'recent_window_tokens': 999}}):
+        raise SystemExit(f'a copy of the preset default, with changes, is {made}')
+    presets({'name': 'roomy', 'set': {'window': base['window'] * 2}})   # changed as a session's settings change
+    workspace = tempfile.mkdtemp()
+    if (fresh := call(port, '/api/sessions', {'name': 'roomy-made', 'preset': 'roomy', 'workspace': workspace})['settings']) != {**expected, 'window': base['window'] * 2, 'workspace': workspace}:
+        raise SystemExit(f'a session made from the preset roomy has the settings {fresh}')
+    for wrong in [{'name': 'roomy', 'set': {'fold_to': base['fold_above'] + 1}},   # what a session's settings can't take
+                  {'name': 'roomy', 'set': {'provider': 'nowhere'}},
+                  {'name': 'roomy', 'from': 'default'},       # a copy over a preset there is
+                  {'name': 'other', 'from': 'nowhere'},       # a copy of one there isn't
+                  {'name': 'nowhere', 'set': {'system': 'x'}},   # a change to one there isn't
+                  {'name': ' ', 'from': 'default'},
+                  {'name': 'default', 'delete': True}]:       # the one a session not given another starts from
+        try:
+            call(port, '/api/presets', wrong)
+            raise SystemExit(f'the presets took {wrong}')
+        except urllib.error.HTTPError as error:
+            if error.code != 400:
+                raise
+    try:
+        call(port, '/api/settings', {'name': 'plain', 'delete': True})
+        raise SystemExit('a provider a preset is on was deleted')
+    except urllib.error.HTTPError as error:
+        if error.code != 400 or 'roomy' not in json.loads(error.read())['error']:
+            raise
+    try:
+        call(port, '/api/sessions', {'name': 'unmade', 'preset': 'nowhere'})
+        raise SystemExit('a session started from a preset there isn\'t')
+    except urllib.error.HTTPError as error:
+        if error.code != 400 or Path(root, 'unmade').exists():
+            raise
+    if 'roomy' in presets({'name': 'roomy', 'delete': True}) or call(port, '/api/s/roomy-made')['settings']['system'] != 'be roomy':
+        raise SystemExit('a preset deleted is still there, or took the settings of a session made from it')
+    written, old_root, old_port = json.loads(Path(root, 'settings.json').read_text()), tempfile.mkdtemp(), free_port()
+    written['defaults'] = written.pop('presets')['default'] | {'system': 'from before presets'}   # settings.json from before presets
+    Path(old_root, 'settings.json').write_text(json.dumps(written))
+    old_app = launch(old_root, old_port, ca)                        # which, as the app starts, has its defaults as the preset default
+    try:
+        kept = call(old_port, '/api/sessions', {'name': 'kept'})['settings']['system']
+        upgraded, mode = json.loads(Path(old_root, 'settings.json').read_text()), os.stat(os.path.join(old_root, 'settings.json')).st_mode & 0o777
+    finally:
+        old_app.terminate()
+    if kept != 'from before presets' or upgraded != {**{k: v for k, v in written.items() if k != 'defaults'}, 'presets': {'default': written['defaults']}} or mode != 0o600:
+        raise SystemExit(f'settings.json from before presets, as the app started, became {upgraded} (mode {mode:o}), and a session made then has the system prompt {kept!r}')
+    both = {**upgraded, 'defaults': {**written['defaults'], 'system': 'beside presets'}}   # defaults beside presets, as only a hand could write: left as they are
+    Path(old_root, 'settings.json').write_text(json.dumps(both))
+    launch(old_root, old_port, ca).terminate()
+    if json.loads(Path(old_root, 'settings.json').read_text()) != both:
+        raise SystemExit('settings.json with presets and defaults both had them changed as the app started')
+
+
 def chatted(turns, tls, ca, baseline) -> str:
     """The long chat, the fork and the settings; the main session's price multiplier goes to `baseline`."""
     mock_port, plain_port, port, root = free_port(), free_port(), free_port(), tempfile.mkdtemp()
@@ -1208,13 +1267,14 @@ def chatted(turns, tls, ca, baseline) -> str:
         call(port, '/api/settings', {'name': 'spare', 'base': 'https://spare.example'})
         if 'spare' in [p['name'] for p in call(port, '/api/settings', {'name': 'spare', 'delete': True})['providers']]:
             raise SystemExit('a provider deleted is still there')
-        for wrong in [{'name': 'spare', 'delete': True}, {'name': 'default', 'delete': True}]:   # one there isn't, and the one new sessions start on
+        for wrong in [{'name': 'spare', 'delete': True}, {'name': 'default', 'delete': True}]:   # one there isn't, and one a preset is on
             try:
                 call(port, '/api/settings', wrong)
                 raise SystemExit(f'the settings took {wrong}')
             except urllib.error.HTTPError as error:
                 if error.code != 400:
                     raise
+        presetted(port, root, ca)
         Path(root, 'old').mkdir()                                       # a session without settings has none to run with
         if 'session_settings.json' not in (call(port, '/api/s/old')['problem'] or '') or call(port, '/api/s/old/messages') != []:
             raise SystemExit('a session without settings did not say so, or show its log')
@@ -2011,7 +2071,7 @@ def folded(tls, ca) -> str:
         if seen['problems'] or len(modeled) != len(sent):
             raise SystemExit(f'the model refused {seen["problems"][:1]}; Claude Code sent {len(sent)} requests, the model got {len(modeled)}')
         bare = lambda messages: [{**m, 'content': [b for b in content(m) if b['type'] != 'thinking']} for m in messages]
-        label = json.loads(Path(root, 'settings.json').read_text())['defaults']['config']['summary_label']
+        label = json.loads(Path(root, 'settings.json').read_text())['presets']['default']['config']['summary_label']
         first, ahead, kept = None, None, 0
         for n, (claude, got) in enumerate(zip(sent, modeled)):
             mine, theirs = claude['body']['messages'], got['messages']

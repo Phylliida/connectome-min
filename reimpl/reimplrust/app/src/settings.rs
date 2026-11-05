@@ -11,39 +11,42 @@ use std::{collections::{BTreeMap, BTreeSet}, io::Write, path::{Path, PathBuf}};
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub providers: BTreeMap<String, Provider>,
-    pub defaults: SessionSettings, // what a new session starts with
+    // what a new session can start with, by name: a copy of the one chosen, its workspace the page's;
+    // the one named default, which stays, when none is
+    pub presets: BTreeMap<String, SessionSettings>,
     pub sandbox: Sandbox,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub search: Option<String>, // a SearXNG server, which web_search asks
 }
 
 impl Settings {
     /// What settings.json starts as: a provider named default, Anthropic's API without a key yet, and
-    /// new sessions on it (on the one model it lists) with a window of 180k tokens, 30k of it the
-    /// reply's, a prompt that folds past 90k down to 65k, a raw tail of 20k, chunks of 3k (the
+    /// a preset named default on it (on the one model it lists) with a window of 180k tokens, 30k of it
+    /// the reply's, a prompt that folds past 90k down to 65k, a raw tail of 20k, chunks of 3k (the
     /// library's), merges of 3 memories at least, and memories of up to 20k tokens.
     pub fn first() -> Settings {
         let (defaults, base) = (SessionSettings::default(), "https://api.anthropic.com".into());
         let config = Config { summary_participant: "assistant".into(), recent_window_tokens: 20000.0, target_chunk_tokens: 3000.0, min_merge_memories: 3, compression_max_tokens: Some(20000.0), ..Config::default() };
         let providers = BTreeMap::from([("default".into(), Provider { base, key: String::new(), models: vec![defaults.model.clone()], command: None })]);
-        let defaults = SessionSettings { fold_above: 90000.0, fold_to: 65000.0, config, ..defaults };
-        Settings { providers, defaults, sandbox: Sandbox::default(), search: None }
+        let preset = SessionSettings { fold_above: 90000.0, fold_to: 65000.0, config, ..defaults };
+        Settings { providers, presets: BTreeMap::from([("default".into(), preset)]), sandbox: Sandbox::default(), search: None }
     }
 
-    /// The providers as the page sees them: never a key, only whether there is one.
-    pub fn providers(&self) -> Value {
-        let shown = self.providers.iter().map(|(name, p)| sparse(obj! {"name" => name.as_str(), "base" => p.base.as_str(), "key" => !p.key.is_empty(), "models" => p.models.clone(), "command" => p.command.clone()}));
-        obj! {"providers" => shown.collect::<Vec<_>>()}
+    /// The settings as the page sees them: the providers, never a key, only whether there is one; and
+    /// the presets.
+    pub fn shown(&self) -> Value {
+        let providers = self.providers.iter().map(|(name, p)| sparse(obj! {"name" => name.as_str(), "base" => p.base.as_str(), "key" => !p.key.is_empty(), "models" => p.models.clone(), "command" => p.command.clone()}));
+        obj! {"providers" => providers.collect::<Vec<_>>(), "presets" => serde_json::to_value(&self.presets).expect("settings are JSON")}
     }
 
     /// A provider added, or its base URL or key changed, by what `v` gives that isn't blank, and its
     /// models, if `v` lists them, those it lists (each once, in their order); or, if `v` says delete,
-    /// deleted, unless new sessions start on it (sessions on it then need another).
+    /// deleted, unless a preset is on it (sessions on it then need another).
     pub fn provide(&mut self, v: &Value) -> Result<(), String> {
         let given = |k: &str| v[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
         let name = given("name").ok_or("a provider's name")?;
         if v["delete"] == true {
-            if name == self.defaults.provider {
-                return Err(format!("new sessions start on {name}: name another in settings.json's defaults first"));
+            if let Some((preset, _)) = self.presets.iter().find(|(_, preset)| preset.provider == name) {
+                return Err(format!("the preset {preset} is on {name}: put it on another provider first"));
             }
             return self.providers.remove(&name).map(drop).ok_or(format!("no provider {name}"));
         }
@@ -54,6 +57,27 @@ impl Settings {
             p.models = listed.filter(|m| !m.is_empty()).unique().map(String::from).collect();
         }
         if p.base.is_empty() && p.command.is_none() { Err("a provider's base URL".into()) } else { Ok(()) }
+    }
+
+    /// A preset changed by what `v` sets, as a session's settings change (SessionSettings::tuned); or,
+    /// if `v` says which preset it's `from`, made as a copy of that one, with what `v` sets; or, if `v`
+    /// says delete, deleted, unless it's default, which a new session starts from when not given another.
+    pub fn preset(&mut self, v: &Value) -> Result<(), String> {
+        let name = v["name"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or("a preset's name")?;
+        if v["delete"] == true {
+            if name == "default" {
+                return Err("the preset default stays: a new session starts from it when not given another".into());
+            }
+            return self.presets.remove(name).map(drop).ok_or(format!("no preset {name}"));
+        }
+        let old = match v["from"].as_str() {
+            Some(_) if self.presets.contains_key(name) => return Err(format!("there's a preset {name} already")),
+            Some(from) => self.presets.get(from).ok_or(format!("no preset {from}"))?,
+            None => self.presets.get(name).ok_or(format!("no preset {name}"))?,
+        };
+        let new = old.tuned(&v["set"], Formed { chunked: false, merged: false }, self)?;
+        self.presets.insert(name.into(), new);
+        Ok(())
     }
 }
 
@@ -76,7 +100,8 @@ pub struct Sandbox {
     #[default(true)] pub network: bool,
 }
 
-/// A session's settings; new sessions start from settings.json's defaults, which start as these.
+/// A session's settings, or a preset's: a new session's start as a copy of one of settings.json's
+/// presets.
 #[derive(Clone, Serialize, Deserialize, SmartDefault)]
 pub struct SessionSettings {
     #[default("default")] pub provider: String,
@@ -190,6 +215,18 @@ pub fn expand(path: &str) -> PathBuf {
         (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => PathBuf::from(path),
     }
+}
+
+/// settings.json as it was before presets, upgraded: its `defaults`, what every new session started
+/// with, become the preset named default.
+pub fn upgrade(path: &Path) -> Result<(), String> {
+    let mut all: Value = read(path)?;
+    let defaults = all.as_object_mut().filter(|all| !all.contains_key("presets")).and_then(|all| all.remove("defaults"));
+    if let Some(defaults) = defaults {
+        all["presets"] = obj! {"default" => defaults};
+        write(path, &all)?;
+    }
+    Ok(())
 }
 
 pub fn read<T: DeserializeOwned>(path: &Path) -> Result<T, String> {

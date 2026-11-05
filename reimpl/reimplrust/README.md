@@ -76,16 +76,21 @@ since one holds the keys:
 
 - `ROOT/settings.json`: `providers`, each a name with a `base` URL, a `key` and the `models` the page
   offers a session on it (the page's Settings edits them, adds providers and deletes them, all but
-  the one new sessions start on); `defaults`, what a
-  new session starts with; `sandbox`, what a sandboxed command sees; and `search`, a SearXNG
+  those a preset is on); `presets`, what a new session can start with, by name, each a session's
+  settings (below) that a new session's file starts as a copy of (the page's new-session dialog
+  chooses one, `default` if none is named, and gives the workspace); the page's Settings, on its
+  Presets tab, edits a preset's main fields as a session's are edited and refused, adds one as a
+  copy of another, and deletes them, all but `default`, and changing one changes no session made
+  before; `sandbox`, what a sandboxed command sees; and `search`, a SearXNG
   server's address (say `http://10.0.0.139:8288`), which gives sessions the `web_search` tool. The
   first run writes it with a provider named `default` for `https://api.anthropic.com` without a key,
-  which the page then asks for, listing `claude-sonnet-5-5`, and defaults for a window of 180k tokens,
+  which the page then asks for, listing `claude-sonnet-5-5`, and a preset named `default` for a window of 180k tokens,
   30k of them reserved for the reply (and its reasoning: a reply that reaches its reserve stops
   there), a prompt that folds past 90k tokens down to 65k (`fold_above`, `fold_to`), a raw tail of
   20k, chunks of 3k, merges of 3 memories at least, memories of up to 20k tokens
   (`config.compression_max_tokens`), and,
-  on Linux, bash in the sandbox.
+  on Linux, bash in the sandbox. A settings.json from before presets has its `defaults`, what every
+  new session started with, made the preset `default` as the app starts.
 - `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, whether the model can ask you `questions` (on
   unless the file says otherwise; off, it has no tool to: no `ask_user`, and Claude Code is run with
@@ -93,7 +98,7 @@ since one holds the keys:
   `window`, `reserve`, the band its prompt folds in (`fold_above` and `fold_to`, always numbers: past
   `fold_above` tokens the context folds, down to `fold_to`; the band the window gives is what it leaves
   the reply, down to `config.slack`, 10%, under that), its `system` prompt, and the library's settings (`config`). A new session's
-  file is a copy of `defaults` (its workspace given on the page), and a fork's a copy of its
+  file is a copy of a preset (its workspace given on the page), and a fork's a copy of its
   parent's; a session without one has none to run with, and the page says so. The page edits the
   main fields, the chunk size (`config.target_chunk_tokens`: the tokens of text a chunk closes at,
   and that a merge gathers memories to), the least memories a merge takes (`config.min_merge_memories`, 2 or more, though a merge takes 2 when the context can't fold down to `fold_to` otherwise; it can change at any time, since each merge records what it took), the raw head (`config.head_window_tokens`: the oldest tokens, never folded, which every memory's request starts with), the raw tail (`config.recent_window_tokens`: the newest tokens, never folded) and a
@@ -376,7 +381,7 @@ Tests:
 ```sh
 cargo test                  # unit tests of the JavaScript and Python arithmetic the ports share
 python3 tests/test_rust.py  # every compile, request and file record the same as reimplclean2's, handoffs both ways, the planner
-python3 tests/test_app.py   # the app against mock APIs over HTTPS, its parts at once: chat, memories, forks, settings, certificates, bash, its sandbox, approvals, timeouts and tools through fake MCP servers, flat memory, the gateway, Claude Code sessions through a fake of it (fake_claude.py), their requests folded in the gateway to a model that checks preserved thinking
+python3 tests/test_app.py   # the app against mock APIs over HTTPS, its parts at once: chat, memories, forks, settings, presets (and settings.json from before them), certificates, bash, its sandbox, approvals, timeouts and tools through fake MCP servers, flat memory, the gateway, Claude Code sessions through a fake of it (fake_claude.py), their requests folded in the gateway to a model that checks preserved thinking
 python3 tests/mutants.py tests/test_app.py app/src/work.rs=mutants.json   # mutation testing, each mutant in a copy of its own, many at once
 ```
 

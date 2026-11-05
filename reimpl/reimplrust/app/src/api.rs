@@ -86,8 +86,9 @@ pub fn handle(app: &App, mut stream: TcpStream) -> io::Result<()> {
             None => Err("not found".into()),
         },
         ("GET", ["api", "sessions"]) => Ok(Some(sessions(app))),
-        ("GET", ["api", "settings"]) => app.settings().map(|all| Some(all.providers())),
-        ("POST", ["api", "settings"]) => app.ask(|reply| Routed::Provide(body.clone(), reply)).map(|all| Some(all.providers())),
+        ("GET", ["api", "settings"]) => app.settings().map(|all| Some(all.shown())),
+        ("POST", ["api", "settings"]) => app.ask(|reply| Routed::Provide(body.clone(), reply)).map(|all| Some(all.shown())),
+        ("POST", ["api", "presets"]) => app.ask(|reply| Routed::Preset(body.clone(), reply)).map(|all| Some(all.shown())),
         ("POST", ["api", "sessions"]) => create(app, &body).map(Some),
         ("GET", ["api", "channels"]) => Ok(Some(channels::listing(app))),
         ("POST", ["api", "channels"]) => founded(app, &body).map(Some),
@@ -239,12 +240,15 @@ fn founded(app: &App, v: &Value) -> Result<Value, String> {
     channels::make(app, name).map(|()| channels::listing(app))
 }
 
-/// A session as the page shows it, its settings, if it's new, the defaults with the workspace `v` gives.
+/// A session as the page shows it, its settings, if it's new, the preset `v` names (default if none) with
+/// the workspace `v` gives.
 fn create(app: &App, v: &Value) -> Result<Value, String> {
     let name = v["name"].as_str().filter(|name| named(name)).ok_or("a session's name is letters, digits, - and _")?;
     if !app.profile_path(name).exists() {
         let all = app.settings()?;
-        let first = all.defaults.tuned(&obj! {"workspace" => v["workspace"].clone()}, Formed { chunked: false, merged: false }, &all)?;
+        let preset_name = v["preset"].as_str().unwrap_or("default");
+        let preset = all.presets.get(preset_name).ok_or(format!("no preset {preset_name}"))?;
+        let first = preset.tuned(&obj! {"workspace" => v["workspace"].clone()}, Formed { chunked: false, merged: false }, &all)?;
         std::fs::create_dir_all(app.root.join(name)).map_err(|e| format!("{name}: {e}"))?;
         settings::write(&app.profile_path(name), &first)?;
     }
