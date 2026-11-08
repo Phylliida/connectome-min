@@ -178,7 +178,7 @@ class Mock(BaseHTTPRequestHandler):
                 + [{'type': 'text', 'text': f'Reply {seen["chat"]}: ' + ' '.join(['words'] * 80)}]
         memory = 'memory' in last and ('Write the memory' in last or 'consolidate' in last)
         if 'wren-' in json.dumps(messages):   # the headed session's: what it starts with, and whether it folded
-            seen['heads'].append((memory, ' '.join(b.get('text', '') for b in messages[0]['content']), 'What do you remember from earlier?' in json.dumps(messages)))
+            seen['heads'].append((memory, ' '.join(b.get('text', '') for b in messages[0]['content']), 'your own compressed memory' in json.dumps(messages)))
         cut = 'cut off once' in last and last not in seen['cut']
         seen['cut'] += [last] * cut
         self.stream(blocks, prompt, 0.25 if 'slowly' in last else 0.01 if memory else 0, stop, cut)   # a memory takes a moment, as a page may see

@@ -22,7 +22,8 @@ pub struct Config {
     #[default(3)] pub min_merge_memories: u64,                       // memories a merge by tokens takes at least, a lifted one's too, 2 or more, but 2 when folding can't reach its target otherwise; may change at any time, as each merge records what it took
     #[default(0.02)] pub over_budget_grace: f64,                     // overBudgetGraceRatio
     // rendering
-    #[default("What do you remember from earlier?")] pub summary_label: String, // summaryContextLabel
+    #[default("[Context Manager] What follows is your own compressed memory of this part of the conversation, written by you while you had the full log in context. That full log, including tool calls and results, isn't shown here.")]
+    pub summary_label: String,                                       // summaryContextLabel, whose default ("What do you remember from earlier?") doesn't say the log is out of sight, and models took memories for hallucinations
     #[default("Claude")] pub summary_participant: String,           // summaryParticipant (the harness sets 'assistant')
     // memory formation (memory.rs)
     pub compression_model: String,                                   // compressionModel: the summarizer, whose voice memories are in
