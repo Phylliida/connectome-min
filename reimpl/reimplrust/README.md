@@ -16,7 +16,7 @@ autobiographical compaction) and a web app around it.
   `lifted`), even past a memory that keeps failing, which would hold back any other. `merge_by_count` merges `merge_threshold` at a time and never lifts, as the port does
   (the differential test runs that way); a memory without `merges` is read as such a group, so a
   session that merged by count goes on by tokens from where it was. The head (`head_window_tokens`, the
-  library's `headWindowTokens`, 0 by default): the oldest messages, up to that many tokens, stay raw at
+  library's `headWindowTokens`; 0 in the library's settings, 10k in a first run's preset): the oldest messages, up to that many tokens, stay raw at
   the context's start, and every memory's request starts with them, their reasoning left out, so a
   memory is written in the agent's own voice and the context doesn't become all summaries. It's
   measured uncalibrated, and once a chunk has closed it is what came before it, so it never moves
@@ -86,10 +86,10 @@ since one holds the keys:
   before; `sandbox`, what a sandboxed command sees; and `search`, a SearXNG
   server's address (say `http://10.0.0.139:8288`), which gives sessions the `web_search` tool. The
   first run writes it with a provider named `default` for `https://api.anthropic.com` without a key,
-  which the page then asks for, listing `claude-sonnet-5-5`, and a preset named `default` for a window of 180k tokens,
+  which the page then asks for, listing `claude-sonnet-5-5`, and a preset named `default` for a window of 210k tokens,
   30k of them reserved for the reply (and its reasoning: a reply that reaches its reserve stops
-  there), a prompt that folds past 90k tokens down to 65k (`fold_above`, `fold_to`), a raw tail of
-  20k, chunks of 3k, merges of 3 memories at least, memories of up to 20k tokens
+  there), a prompt that folds past 85k tokens down to 65k (`fold_above`, `fold_to`), a raw head of
+  10k, a raw tail of 20k, chunks of 15k, merges of 3 memories at least, memories of up to 20k tokens
   (`config.compression_max_tokens`), and,
   on Linux, bash in the sandbox. A settings.json from before presets has its `defaults`, what every
   new session started with, made the preset `default` as the app starts.

@@ -357,15 +357,16 @@ def configure(root, base, window, recent, chunk):
     """settings.json as the app's first run wrote it, edited as a user would: the default provider at
     `base`, and new sessions on the mock's model in `window` tokens, 1000 of them the reply's, folding
     in the band the window gives (fold_above the window less the reply, fold_to config.slack, 10%,
-    under that), with `chunk`s and a recent window of `recent` sized for it."""
+    under that), with `chunk`s and a recent window of `recent` sized for it, and no head."""
     path = Path(root, 'settings.json')
     everything = json.loads(path.read_text())
-    if everything['presets']['default']['sandbox'] != sys.platform.startswith('linux') or everything['providers']['default']['models'] != [everything['presets']['default']['model']] \
-            or everything['presets']['default']['config']['target_chunk_tokens'] != 3000 or (everything['presets']['default']['fold_above'], everything['presets']['default']['fold_to']) != (90000, 65000):
-        raise SystemExit(f'a first run wrote {everything["presets"]["default"]["sandbox"]=}, {everything["providers"]["default"]["models"]=} and chunks of {everything["presets"]["default"]["config"]["target_chunk_tokens"]}')
+    preset, config = everything['presets']['default'], everything['presets']['default']['config']
+    sizes = (preset['window'], preset['reserve'], preset['fold_above'], preset['fold_to'], config['head_window_tokens'], config['recent_window_tokens'], config['target_chunk_tokens'], config['min_merge_memories'], config['compression_max_tokens'])
+    if preset['sandbox'] != sys.platform.startswith('linux') or everything['providers']['default']['models'] != [preset['model']] or sizes != (210000, 30000, 85000, 65000, 10000, 20000, 15000, 3, 20000):
+        raise SystemExit(f'a first run wrote {preset["sandbox"]=}, {everything["providers"]["default"]["models"]=} and sizes {sizes}')
     everything['providers']['default']['base'] = base
-    everything['presets']['default'].update(model='mock', window=window, reserve=1000, fold_above=window - 1000, fold_to=(window - 1000) * 0.9)   # the window's own band
-    everything['presets']['default']['config'].update(recent_window_tokens=recent, target_chunk_tokens=chunk)
+    preset.update(model='mock', window=window, reserve=1000, fold_above=window - 1000, fold_to=(window - 1000) * 0.9)   # the window's own band
+    config.update(head_window_tokens=0, recent_window_tokens=recent, target_chunk_tokens=chunk)
     path.write_text(json.dumps(everything))
 
 

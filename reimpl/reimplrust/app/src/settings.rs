@@ -20,14 +20,14 @@ pub struct Settings {
 
 impl Settings {
     /// What settings.json starts as: a provider named default, Anthropic's API without a key yet, and
-    /// a preset named default on it (on the one model it lists) with a window of 180k tokens, 30k of it
-    /// the reply's, a prompt that folds past 90k down to 65k, a raw tail of 20k, chunks of 3k (the
-    /// library's), merges of 3 memories at least, and memories of up to 20k tokens.
+    /// a preset named default on it (on the one model it lists) with a window of 210k tokens, 30k of it
+    /// the reply's, a prompt that folds past 85k down to 65k, a raw head of 10k, a raw tail of 20k,
+    /// chunks of 15k, merges of 3 memories at least, and memories of up to 20k tokens.
     pub fn first() -> Settings {
         let (defaults, base) = (SessionSettings::default(), "https://api.anthropic.com".into());
-        let config = Config { summary_participant: "assistant".into(), recent_window_tokens: 20000.0, target_chunk_tokens: 3000.0, min_merge_memories: 3, compression_max_tokens: Some(20000.0), ..Config::default() };
+        let config = Config { summary_participant: "assistant".into(), head_window_tokens: 10000.0, recent_window_tokens: 20000.0, target_chunk_tokens: 15000.0, min_merge_memories: 3, compression_max_tokens: Some(20000.0), ..Config::default() };
         let providers = BTreeMap::from([("default".into(), Provider { base, key: String::new(), models: vec![defaults.model.clone()], command: None })]);
-        let preset = SessionSettings { fold_above: 90000.0, fold_to: 65000.0, config, ..defaults };
+        let preset = SessionSettings { window: 210000.0, reserve: 30000.0, fold_above: 85000.0, fold_to: 65000.0, config, ..defaults };
         Settings { providers, presets: BTreeMap::from([("default".into(), preset)]), sandbox: Sandbox::default(), search: None }
     }
 
