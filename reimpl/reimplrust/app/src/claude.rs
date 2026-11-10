@@ -287,7 +287,7 @@ impl Worker<'_> {
                     self.log_reply(&mut reply);
                     let prompts = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
                     let used = Usage { cost: total_cost_usd, input: prompts, cached: usage.cache_read_input_tokens, output: usage.output_tokens };
-                    if let Some(spent) = costs::spend(&self.s, For::Reply, used, last_prompt, limits.clone()) { self.event(Event::Spent(spent)) }
+                    if let Some(spent) = costs::spend(&self.s, For::Reply, used, last_prompt, limits.clone(), vec![]) { self.event(Event::Spent(spent)) }
                     if is_error { break Err(result.unwrap_or(subtype)) }
                     // what Claude Code was told after its reply ends it takes in next, as a turn of its own in the same run
                     if told.iter().all(|t| t.logged) { break Ok(()) }

@@ -18,8 +18,8 @@ pub enum For { Reply, Memories }
 /// A record of the costs log: what requests `used`, and the session's running totals by what they
 /// were for; a reply's also says which message it is and which compile its request was built from,
 /// and, for a reply that took several requests (a Claude Code turn's, whose `used` sums them), the
-/// last one's prompt, the context it ended with; and, from a run of Claude Code on a plan, the plan's
-/// limits as it said them.
+/// last one's prompt, the context it ended with; from a run of Claude Code on a plan, the plan's
+/// limits as it said them; and, on a provider that splices, what the splices before its requests came to.
 #[derive(Serialize, Deserialize)]
 struct Cost {
     #[serde(rename = "for")] what: For,
@@ -27,6 +27,7 @@ struct Cost {
     #[serde(default, skip_serializing_if = "Option::is_none")] compile: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")] prompt: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")] limits: Option<Limits>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] spliced: Vec<serde_json::Value>, // what the splices before its requests came to (work.rs splice)
     used: Usage,
     total: BTreeMap<For, Usage>,
 }
@@ -75,15 +76,16 @@ fn replies(s: &Session) -> impl Iterator<Item = Cost> + '_ {
 }
 
 /// What requests `used` for `what` joins the costs log, if they used anything, with the running
-/// totals, for a reply of several requests the last one's `prompt`, and the plan's `limits` Claude Code
-/// said; and the totals as the page shows them.
-pub fn spend(s: &Session, what: For, used: Usage, prompt: Option<f64>, limits: Option<Limits>) -> Option<Spent> {
+/// totals, for a reply of several requests the last one's `prompt`, the plan's `limits` Claude Code
+/// said, and what the splices before the requests came to (`spliced`); and the totals as the page
+/// shows them.
+pub fn spend(s: &Session, what: For, used: Usage, prompt: Option<f64>, limits: Option<Limits>, spliced: Vec<serde_json::Value>) -> Option<Spent> {
     if used.input + used.output == 0.0 { return None }
     let mut total = costs(s).next().map(|c| c.total).unwrap_or_default();
     total.entry(what).and_modify(|t| *t = *t + used).or_insert(used);
     let reply = what == For::Reply;
     let (message, compile) = (reply.then(|| s.count("messages")), reply.then(|| s.count("compiles").checked_sub(1)).flatten());
-    let cost = Cost { what, message, compile, prompt, limits, used, total };
+    let cost = Cost { what, message, compile, prompt, limits, spliced, used, total };
     s.append("costs", serde_json::to_value(&cost).expect("a cost is JSON"));
     Spent::of(cost.total)
 }

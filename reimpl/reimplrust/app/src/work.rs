@@ -10,10 +10,10 @@
 //! hub what the pages following the job see (Msg). The user can stop a turn: it ends where it is
 //! (Worker::stopped). A Claude Code session's turn is Claude Code's instead (claude.rs).
 
-use crate::{api::brief, boards, channels, claude, claude_memory::Remembering, companion::{self, Heard, How}, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Llm, Piece, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, ask, bash, edit, image, mcp, search, Toolbox}, App};
-use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
+use crate::{api::brief, boards, channels, claude, claude_memory::Remembering, companion::{self, Heard, How}, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{carried, Llm, Piece, Source, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, ask, bash, edit, image, mcp, search, Toolbox}, App};
+use connectome::{blocks::{density_tokens, At}, drive::{append, current, drive}, emit::{answer, select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, store::Session, turns::Turn};
-use std::{cell::{Cell, RefCell}, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
+use std::{cell::{Cell, RefCell}, collections::{HashMap, HashSet, VecDeque}, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
 
 /// A message from `who` of `text`, as the log keeps it.
 pub fn said(who: &str, text: String) -> Value { obj! {"participant" => who, "content" => vec![obj! {"type" => "text", "text" => text}]} }
@@ -83,7 +83,7 @@ impl Setup {
     pub fn new(app: &App, name: &str) -> Result<Setup, String> {
         let (all, settings) = (app.settings()?, app.profile(name)?);
         let p = all.providers.get(&settings.provider).ok_or_else(|| format!("no provider {} in settings.json", settings.provider))?;
-        let llm = Llm { base: p.base.clone(), key: p.key.clone(), agent: app.agent.clone(), spent: Default::default() };
+        let llm = Llm { base: p.base.clone(), key: p.key.clone(), agent: app.agent.clone(), spent: Default::default(), splice: p.splice };
         let boards = boards::of(app, &settings);
         let reach: Vec<PathBuf> = boards.iter().map(|b| app.board_path(b)).collect();
         let mut sandbox = all.sandbox;
@@ -97,13 +97,19 @@ impl Setup {
     }
 }
 
-/// The summarizer, the library's host: the session's model unless the library names one, and the
-/// agent's tools, which the library sends with tool choice "none" so a memory's request can carry tool
-/// blocks; no system prompt. A request its turn's user stops ends at once, as never made (INTERRUPTED).
+/// The summarizer, the library's host: the session's model unless the library names one, its system
+/// prompt, so a memory's request starts as the session's do (and a provider's cache of their start
+/// serves both), and the agent's tools, which the library sends with tool choice "none" so a memory's
+/// request can carry tool blocks. On a provider that splices, each request's cache is first built from
+/// pieces of cached conversations (splice). A request its turn's user stops ends at once, as never made
+/// (INTERRUPTED).
 struct Summarizer<'a> {
     setup: &'a Setup,
     stopped: tools::Stopped<'a>,
     ended: Option<(String, f64)>, // how its last reply ended, and the tokens it had
+    s: &'a Session,
+    main: Option<&'a Sent>, // the session's last request, which a splice copies messages from
+    spliced: Vec<Value>,    // what the splices before its requests came to
 }
 
 /// What forming memories came to: one formed (or a stub), none could, a reply without a memory in it or
@@ -118,14 +124,93 @@ enum Formed {
 impl Host for Summarizer<'_> {
     fn tools(&self) -> Option<&Value> { self.setup.definitions.as_ref() }
 
+    fn system(&self) -> Option<&str> { self.setup.system.as_deref() }
+
     fn complete(&mut self, request: &Request, reader: &mut Reader) -> Result<Value, String> {
         let model = if request.model.is_empty() { &self.setup.settings.model } else { &request.model };
         let none = request.tools.as_ref().map(|_| obj! {"type" => "none"});
-        let head = sparse(obj! {"model" => model.as_str(), "max_tokens" => request.max_tokens, "tools" => request.tools.clone(), "tool_choice" => none});
+        let head = sparse(obj! {"model" => model.as_str(), "max_tokens" => request.max_tokens, "system" => request.system.as_deref(), "tools" => request.tools.clone(), "tool_choice" => none});
+        self.spliced.extend(splice(self.setup, self.s, &head, &request.messages, 0, self.main, reader));
         let reply = self.setup.llm.messages(head, &request.messages, reader, false, |_| !(self.stopped)(), self.stopped, |_, _| {});
         self.ended = reply.as_ref().ok().map(|r| (r["stopReason"].as_str().unwrap_or("nothing").to_string(), request.max_tokens));
         if (self.stopped)() { Err(INTERRUPTED.into()) } else { reply }
     }
+}
+
+/// The last request a session's steps sent: its fields and turns, the cached conversation a splice
+/// copies the session's messages from. The session's thread keeps it while it runs.
+pub struct Sent { head: Value, turns: Vec<Turn> }
+
+/// What a splice before a request came to, for the costs log: the pieces given and placed, and the
+/// server's counts of the tokens built, or why it failed (the request goes all the same: so too when
+/// a source has images, which the server refuses); None on a provider that doesn't splice, for a
+/// request with images, which the server can't splice, or one with no pieces. The request is `head`'s
+/// fields and `turns`; its pieces come from turn `from` on.
+fn splice(setup: &Setup, s: &Session, head: &Value, turns: &[Turn], from: usize, main: Option<&Sent>, reader: &mut Reader) -> Option<Value> {
+    if !setup.llm.splice || imaged(turns) { return None }
+    let (sources, pieces) = pieces(s, turns, from, main, reader);
+    if pieces.is_empty() { return None }
+    Some(match setup.llm.splice(head, turns, &sources, &pieces, reader) {
+        Ok(a) => {
+            let placed = a["pieces"].arr().iter().filter(|p| p["placed"] == true).count();
+            sparse(obj! {"pieces" => pieces.len(), "placed" => placed, "built" => a["built"].clone(), "prefix" => a["prefix"].clone(), "copied" => a["copied"].clone(), "prefilled" => a["prefilled"].clone(), "t_ms" => a["t_ms"].clone()})
+        }
+        Err(why) => obj! {"pieces" => pieces.len(), "error" => why},
+    })
+}
+
+/// Whether turns hold images (a tool result's too, even as placeholders).
+fn imaged(turns: &[Turn]) -> bool { turns.iter().flat_map(|t| &t.content).any(|b| !b.images.is_empty()) }
+
+/// The pieces a splice copies into a request's cache (KV-SPLICE.md), from its turn `from` on, each its
+/// source's index and the text it starts with, and those sources: a piece for each text (a text block,
+/// or a tool result's) that occurs once among them, from the reply that wrote it, for a memory's, or,
+/// for a message's, from the session's last request (`main`) if that has the message, else from the
+/// reply that wrote the L1 of its chunk, whose request showed the chunk raw. Every text gets one, not
+/// a stretch's first only, since a memory's request shows messages without the agent's reasoning, and
+/// a piece ends where the two differ. What the library writes in a request (labels, markers,
+/// instructions) and messages no source has get none.
+fn pieces<'a>(s: &Session, turns: &[Turn], from: usize, main: Option<&'a Sent>, reader: &mut Reader) -> (Vec<Source<'a>>, Vec<(usize, String)>) {
+    let reply = |file: &str, id: u64| answer(&s.read(file, id)).iter().filter(|b| b.kind() == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n");
+    let shown: HashSet<(u64, usize)> = main.iter().flat_map(|m| &m.turns).flat_map(|t| &t.content).filter_map(|b| match &b.at { At::Disk(file, id, j, _) if file == "messages" => Some((*id, *j)), _ => None }).collect();
+    let mut chunks: Option<Vec<(u64, u64)>> = None; // each L1's first and last message, read once a message needs them
+    let mut found: Vec<(Option<String>, String)> = vec![]; // each text's source (None, the session's last request; else a reply) and itself
+    for b in turns.iter().skip(from).flat_map(|t| carried(t, false)) {
+        let source = match &b.at {
+            At::Disk(file, id, _, _) if file.starts_with("layer") => Some(Some(reply(file, *id))),
+            At::Disk(file, id, j, _) if file == "messages" && shown.contains(&(*id, *j)) => Some(None),
+            At::Disk(file, id, _, _) if file == "messages" => {
+                let chunks = chunks.get_or_insert_with(|| (0..s.count("layer1")).map(|k| s.read("layer1", k)).map(|m| (m["first"].u64(), m["last"].u64())).collect());
+                chunks.iter().position(|&(first, last)| (first..=last).contains(id)).map(|k| Some(reply("layer1", k as u64)))
+            }
+            _ => None,
+        };
+        let Some(source) = source else { continue };
+        let block = reader.load(b);
+        let texts = match &block["content"] {
+            Value::String(text) => vec![text.clone()],
+            Value::Array(nested) => nested.iter().filter(|c| c.kind() == "text").filter_map(|c| c["text"].as_str().map(str::to_string)).collect(),
+            _ => block["text"].as_str().map(str::to_string).into_iter().collect(),
+        };
+        found.extend(texts.into_iter().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).map(|t| (source.clone(), t)));
+    }
+    let mut times: HashMap<&str, usize> = HashMap::new();
+    for (_, text) in &found {
+        *times.entry(text).or_default() += 1;
+    }
+    let (mut sources, mut indexed, mut pieces) = (vec![], HashMap::new(), vec![]);
+    for (source, text) in found.iter().filter(|(_, text)| times[text.as_str()] == 1) {
+        let i = *indexed.entry(source.clone()).or_insert_with(|| {
+            sources.push(match (source, main) {
+                (Some(reply), _) => Source::Reply(reply.clone()),
+                (None, Some(m)) => Source::Request(&m.head, &m.turns),
+                (None, None) => unreachable!("a message the session's last request shows, without one"),
+            });
+            sources.len() - 1
+        });
+        pieces.push((i, text.clone()));
+    }
+    (sources, pieces)
 }
 
 /// A session's tools: bash (unless --no-bash), edit and, if it takes `images`, read_image in its
@@ -170,7 +255,7 @@ pub fn overhead(system: Option<&str>, definitions: &Option<Value>) -> f64 {
 /// fails, and the next runs. Out of jobs, it tells the hub how many it has taken (Msg::Idle), so the
 /// hub sends it the user's next queued turn, if it was sent no other.
 pub fn work(app: &App, name: &str, jobs: Receiver<(u64, Job)>) {
-    let (later, taken) = (RefCell::new(VecDeque::new()), Cell::new(0));
+    let (later, taken, sent) = (RefCell::new(VecDeque::new()), Cell::new(0), RefCell::new(None));
     let took = |job: (u64, Job)| { taken.set(taken.get() + 1); job };
     loop {
         let next = later.borrow_mut().pop_front().or_else(|| jobs.try_recv().ok().map(took));
@@ -180,7 +265,7 @@ pub fn work(app: &App, name: &str, jobs: Receiver<(u64, Job)>) {
         });
         let Some((id, job)) = next else { return };
         let (stop, halt) = channel();
-        let done = catch_unwind(AssertUnwindSafe(|| Worker { app, name, s: app.session(name), halt, jobs: &jobs, taken: &taken, later: &later }.run(id, job, stop)));
+        let done = catch_unwind(AssertUnwindSafe(|| Worker { app, name, s: app.session(name), halt, jobs: &jobs, taken: &taken, later: &later, sent: &sent }.run(id, job, stop)));
         if done.is_err() {
             app.tell(name, Msg::Event(Event::Forming(false)));
             app.tell(name, Msg::Event(Event::End(Some("the session's thread failed; the server's output says why".into()))));
@@ -200,6 +285,7 @@ pub struct Worker<'a> {
     pub jobs: &'a Receiver<(u64, Job)>,
     pub taken: &'a Cell<u64>, // how many jobs the thread has taken from `jobs`
     pub later: &'a RefCell<VecDeque<(u64, Job)>>,
+    sent: &'a RefCell<Option<Sent>>, // the last request the session's steps sent
 }
 
 impl Worker<'_> {
@@ -354,9 +440,16 @@ impl Worker<'_> {
             !self.stopped() && !looped
         };
         let retrying = |n, why: &str| self.event(Event::Retry { n, of: RETRIES.len(), why: why.into() });
-        let reply = setup.llm.messages(head, &turns, &mut Reader::new(s, false), true, piece, &|| self.stopped(), retrying);
+        // the turns past those the last request had: if it goes on from that one, they're new, no source has them,
+        // and nothing is spliced; if the context folded, its cache is built from pieces first
+        let spliced = self.sent.borrow().as_ref().and_then(|last| {
+            let kept = last.turns.iter().zip(&turns).take_while(|(a, b)| a.content == b.content).count(); // the same blocks are the same message, its marks aside
+            splice(&setup, s, &head, &turns, kept, Some(last), &mut Reader::new(s, false))
+        });
+        let reply = setup.llm.messages(head.clone(), &turns, &mut Reader::new(s, false), true, piece, &|| self.stopped(), retrying);
         let reply = reply.map_err(|why| if self.stopped() { STOPPED.into() } else { why })?;
-        self.spend(&setup, For::Reply);
+        *self.sent.borrow_mut() = Some(Sent { head, turns });
+        self.spend(&setup, For::Reply, spliced.into_iter().collect());
         append(s, &obj! {"participant" => "assistant", "content" => reply["content"].clone()}, cfg);
         self.logged();
         // a reply cut short once its text or reasoning began is kept as far as it came, and the turn ends there:
@@ -467,14 +560,15 @@ impl Worker<'_> {
         let tried = self.s.count("attempts");
         // a Claude Code session's memories are written by Claude Code, a run each (claude_memory.rs); others' by requests to the session's provider
         let cfg = &setup.settings.config;
-        let (drove, ended) = match claude::command(self.app, self.name).ok().flatten() {
+        let (drove, ended, spliced) = match claude::command(self.app, self.name).ok().flatten() {
             Some(command) => {
                 let mut remembering = Remembering { worker: self, command, ended: None };
-                (drive(&self.s, &mut remembering, cfg), remembering.ended)
+                (drive(&self.s, &mut remembering, cfg), remembering.ended, vec![])
             }
             None => {
-                let mut summarizer = Summarizer { setup, stopped: &|| self.stopped(), ended: None };
-                (drive(&self.s, &mut summarizer, cfg), summarizer.ended)
+                let main = self.sent.borrow();
+                let mut summarizer = Summarizer { setup, stopped: &|| self.stopped(), ended: None, s: &self.s, main: main.as_ref(), spliced: vec![] };
+                (drive(&self.s, &mut summarizer, cfg), summarizer.ended, summarizer.spliced)
             }
         };
         let formed = match drove {
@@ -490,16 +584,17 @@ impl Worker<'_> {
         if let Formed::Unused(why) | Formed::Failed(why) = &formed {
             eprintln!("{}: forming a memory: {why}", self.name);
         }
-        self.spend(setup, For::Memories);
+        self.spend(setup, For::Memories, spliced);
         self.event(Event::Forming(false));
         formed
     }
 
-    /// What the step's requests used since this was last told (Llm::spent), for `what`, joins the
-    /// session's costs log; the pages hear the totals, and a reply's prompt.
-    fn spend(&self, setup: &Setup, what: For) {
+    /// What the step's requests used since this was last told (Llm::spent), for `what`, and what the
+    /// splices before them came to, join the session's costs log; the pages hear the totals, and a
+    /// reply's prompt.
+    fn spend(&self, setup: &Setup, what: For, spliced: Vec<Value>) {
         let used = setup.llm.spent.take();
-        if let Some(spent) = costs::spend(&self.s, what, used, None, None) {
+        if let Some(spent) = costs::spend(&self.s, what, used, None, None, spliced) {
             self.event(Event::Spent(spent));
             if what == For::Reply { self.event(Event::Prompt(used.input)) }
         }

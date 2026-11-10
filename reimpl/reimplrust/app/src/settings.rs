@@ -26,7 +26,7 @@ impl Settings {
     pub fn first() -> Settings {
         let (defaults, base) = (SessionSettings::default(), "https://api.anthropic.com".into());
         let config = Config { summary_participant: "assistant".into(), head_window_tokens: 10000.0, recent_window_tokens: 20000.0, target_chunk_tokens: 15000.0, min_merge_memories: 3, compression_max_tokens: Some(20000.0), ..Config::default() };
-        let providers = BTreeMap::from([("default".into(), Provider { base, key: String::new(), models: vec![defaults.model.clone()], command: None })]);
+        let providers = BTreeMap::from([("default".into(), Provider { base, key: String::new(), models: vec![defaults.model.clone()], command: None, splice: false })]);
         let preset = SessionSettings { window: 210000.0, reserve: 30000.0, fold_above: 85000.0, fold_to: 65000.0, config, ..defaults };
         Settings { providers, presets: BTreeMap::from([("default".into(), preset)]), sandbox: Sandbox::default(), search: None }
     }
@@ -34,13 +34,13 @@ impl Settings {
     /// The settings as the page sees them: the providers, never a key, only whether there is one; and
     /// the presets.
     pub fn shown(&self) -> Value {
-        let providers = self.providers.iter().map(|(name, p)| sparse(obj! {"name" => name.as_str(), "base" => p.base.as_str(), "key" => !p.key.is_empty(), "models" => p.models.clone(), "command" => p.command.clone()}));
+        let providers = self.providers.iter().map(|(name, p)| sparse(obj! {"name" => name.as_str(), "base" => p.base.as_str(), "key" => !p.key.is_empty(), "models" => p.models.clone(), "command" => p.command.clone(), "splice" => p.splice.then_some(true)}));
         obj! {"providers" => providers.collect::<Vec<_>>(), "presets" => serde_json::to_value(&self.presets).expect("settings are JSON")}
     }
 
-    /// A provider added, or its base URL or key changed, by what `v` gives that isn't blank, and its
-    /// models, if `v` lists them, those it lists (each once, in their order); or, if `v` says delete,
-    /// deleted, unless a preset is on it (sessions on it then need another).
+    /// A provider added, or its base URL or key changed, by what `v` gives that isn't blank, its models,
+    /// if `v` lists them, those it lists (each once, in their order), and whether it splices, if `v`
+    /// says; or, if `v` says delete, deleted, unless a preset is on it (sessions on it then need another).
     pub fn provide(&mut self, v: &Value) -> Result<(), String> {
         let given = |k: &str| v[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
         let name = given("name").ok_or("a provider's name")?;
@@ -52,6 +52,9 @@ impl Settings {
         }
         let p = self.providers.entry(name).or_default();
         (p.base, p.key) = (given("base").unwrap_or(std::mem::take(&mut p.base)), given("key").unwrap_or(std::mem::take(&mut p.key)));
+        if let Some(splice) = v.get("splice") {
+            p.splice = splice.as_bool().ok_or("whether a provider splices, true or false")?;
+        }
         if let Some(models) = v.get("models") {
             let listed = models.as_array().ok_or("a provider's models, a list")?.iter().filter_map(Value::as_str).map(str::trim);
             p.models = listed.filter(|m| !m.is_empty()).unique().map(String::from).collect();
@@ -89,6 +92,9 @@ pub struct Provider {
     // a Claude Code provider: how to run Claude Code, say ["claude"]; its sessions take their turns in
     // it (claude.rs), and `base` and `key` go unused
     #[serde(default, skip_serializing_if = "Option::is_none")] pub command: Option<Vec<String>>,
+    // whether its server builds a request's cache from pieces of cached conversations (KV-SPLICE.md), as
+    // the Kimi-K3 server does: before a request a fold changed and before each memory request
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")] pub splice: bool,
 }
 
 /// What a sandboxed command sees besides its workspace: the paths in `ro` that exist, read-only, and

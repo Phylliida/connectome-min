@@ -30,9 +30,14 @@ POST /kv/splice
 {
   "format": "anthropic",
   "request": { ...the next request, exactly as it will be sent... },
+  "sources": [
+    {"reply": "<a memory's text>"},
+    {"request": { ...a cached conversation's request... }}
+  ],
   "pieces": [
-    {"src": {"reply": "<a memory's text>"}, "anchor": "<the same text>"},
-    {"src": {"request": { ...a cached conversation's request... }}, "anchor": "<the text of a stretch's first message>"}
+    {"src": 0, "anchor": "<the memory's text>"},
+    {"src": 1, "anchor": "<a message's text>"},
+    {"src": 1, "anchor": "<the next message's text>"}
   ]
 }
 ```
@@ -41,13 +46,16 @@ POST /kv/splice
   default). Every body in the call is in it.
 - `request`: the next request, exactly as it will be sent; `max_tokens`, `stream` and the like are ignored. Sending it
   afterwards, or a request that extends it, reuses what the call built.
-- `pieces`: in the order their anchors appear in `request`. A piece's `src` names a cached conversation:
+- `sources`: the cached conversations pieces come from, each named once, however many pieces it gives (a memory
+  request's chunk gives one per text block, and its source request can be 90k tokens long):
   - `{"request": body}`: the cached conversation of that request, with its reply if one was generated, found as the
     current API finds `src` and `dst`.
   - `{"reply": text}`: the cached conversation whose reply was `text`. A reply's key is its text content as the API
     returned it (its text blocks joined with `"\n"`, reasoning left out), compared with surrounding whitespace trimmed;
     if several conversations match, the most recent. The server records the key as it caches a conversation.
-- `anchor`: the text a piece starts with, normally the start of a message's text.
+- `pieces`: in the order their anchors appear in `request`, each its source's index in `sources` (`src`) and the
+  text it starts with (`anchor`), normally a message's text. A piece may still give its source inline, as
+  `"src": {"request": body}` or `"src": {"reply": text}`.
 - `min_tokens` (optional, default 16): a piece shorter than this isn't worth a copy and is prefilled.
 
 The current form (`src`, `src_span`, `dst`, `dst_span`) can stay; a body with `request` is this form.
@@ -109,6 +117,8 @@ Where the server built on K3 departs from the above:
 - A checkpoint is stored at each placed piece's end, so later rollbacks stay cheap.
 - Reply keys are recorded at each completion and saved to `reply-keys.jsonl` beside the disk cache, so they survive
   restarts; only replies generated since the feature exists are known.
+- Pieces name their sources inline only; `sources` with pieces by index (2026-11-10, which connectome-web sends) is
+  still to come.
 - The response also has `prefix_recurrent` and a `timing_ms` breakdown.
 
 ## Response (200)
@@ -139,8 +149,9 @@ Where the server built on K3 departs from the above:
 
 ## How connectome-web uses it
 
-The app calls it before a request that a fold changed and before each memory request, then sends the request. It gives a
-piece for each text block of `request` after the cached prefix whose text occurs there once: a memory's text, a user
+The app (connectome-web's `work.rs`, since 2026-11-10) calls it before a request that a fold changed and before each
+memory request, then sends the request, whatever the call came to; the costs log keeps each call's counts or error. It
+gives a piece for each text block of `request` after the cached prefix whose text occurs there once: a memory's text, a user
 message, an assistant's text, a tool result's text. A piece runs only to the next anchor, so where both sides render the
 same, consecutive pieces cover it end to end, and where they differ, copying starts again at the next text block.
 Sources follow one rule: a memory's text comes from the conversation that wrote it (`{"reply": its text}`); raw messages

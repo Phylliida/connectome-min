@@ -16,6 +16,7 @@ pub struct Llm {
     pub key: String,
     pub agent: ureq::Agent,
     pub spent: Cell<Usage>, // what its replies used since it was last taken
+    pub splice: bool,       // whether the server builds a request's cache from pieces of cached conversations (splice)
 }
 
 /// What replies used, as their providers report it: dollars, if a provider prices them (OpenRouter
@@ -140,7 +141,43 @@ impl Llm {
         self.spent.set(self.spent.get() + used);
         Ok(done)
     }
+
+    /// POSTs to {base}/kv/splice (a base's trailing /v1 left off) the request of `head`'s fields and
+    /// `turns`, for the server to build its cache from `pieces` of the cached conversations `sources`
+    /// (KV-SPLICE.md): each piece its source's index and the text it starts with. The server's answer,
+    /// or why there's none; tried once, since a request goes the same without it.
+    pub fn splice(&self, head: &Value, turns: &[Turn], sources: &[Source], pieces: &[(usize, String)], reader: &mut Reader) -> Result<Value, String> {
+        let base = self.base.trim_end_matches('/');
+        let url = format!("{}/kv/splice", base.strip_suffix("/v1").unwrap_or(base));
+        let mut body = b"{\"format\":\"anthropic\",\"request\":".to_vec();
+        write_body(&mut body, head, turns, reader).map_err(|e| e.to_string())?;
+        body.extend(b",\"sources\":[");
+        for (i, source) in sources.iter().enumerate() {
+            body.extend(if i > 0 { &b","[..] } else { b"" });
+            match source {
+                Source::Request(head, turns) => {
+                    body.extend(b"{\"request\":");
+                    write_body(&mut body, head, turns, reader).map_err(|e| e.to_string())?;
+                    body.extend(b"}");
+                }
+                Source::Reply(text) => body.extend(json::to_string(&obj! {"reply" => text.as_str()}).as_bytes()),
+            }
+        }
+        let pieces: Vec<Value> = pieces.iter().map(|(source, anchor)| obj! {"src" => *source, "anchor" => anchor.as_str()}).collect();
+        body.extend(format!("],\"pieces\":{}}}", json::to_string(&Value::from(pieces))).as_bytes());
+        let response = self.agent.post(&url).header("x-api-key", &self.key).header("content-type", "application/json").send(&body[..]).map_err(|e| format!("{url}: {e}"))?;
+        let status = response.status().as_u16();
+        let text = response.into_body().read_to_string().map_err(|e| format!("{url}: {e}"))?;
+        if status != 200 {
+            return Err(format!("HTTP {status}: {}", text.chars().take(300).collect::<String>()));
+        }
+        serde_json::from_str(&text).map_err(|e| format!("{url}: {e}"))
+    }
 }
+
+/// A cached conversation a splice copies pieces from: a request's, by its fields and turns as it was
+/// sent, or the one that generated a reply, by the reply's text.
+pub enum Source<'a> { Request(&'a Value, &'a [Turn]), Reply(String) }
 
 /// `attempt`, tried until it succeeds, fails in a way that won't pass, or has failed once more than
 /// RETRIES has waits; `retrying` hears each retry (from 1) and why, then `wait` waits for it, a POLL

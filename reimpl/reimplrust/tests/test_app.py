@@ -90,6 +90,8 @@ class Mock(BaseHTTPRequestHandler):
             {'title': 'Wasps', 'url': 'https://example.com/wasps', 'content': 'Less about bees.', 'publishedDate': None}]})
 
     def do_POST(self):
+        if self.path == '/kv/splice':
+            return self.splice()
         if self.path != '/v1/messages':
             return self.problem(f'no endpoint {self.path}')
         if self.headers.get('transfer-encoding') != 'chunked':
@@ -106,6 +108,8 @@ class Mock(BaseHTTPRequestHandler):
         request = json.loads(body)
         if problem := invalid(request):
             return self.problem(problem)
+        if seen.get('wire') is not None:                                # the requests and splices in order, where a part asks
+            seen['wire'].append(('messages', request))
         seen['prefills'] += request['messages'][-1]['role'] == 'assistant'
         if request.get('stream') is not True:
             return self.problem('the request did not ask for a stream')
@@ -183,6 +187,15 @@ class Mock(BaseHTTPRequestHandler):
         cut = 'cut off once' in last and last not in seen['cut']
         seen['cut'] += [last] * cut
         self.stream(blocks, prompt, 0.25 if 'slowly' in last else 0.01 if memory else 0, stop, cut)   # a memory takes a moment, as a page may see
+
+    def splice(self):
+        """A KV splice (KV-SPLICE.md), its pieces all placed, or, while seen says the splicer is down,
+        an error."""
+        call = json.loads(self.rfile.read(int(self.headers['content-length'])))
+        seen['wire'].append(('splice', call))
+        if seen.get('splice down'):
+            return self.answer(500, {'error': 'the splicer is down'})
+        self.answer(200, {'built': 100, 'prefix': 40, 'copied': 50, 'prefilled': 10, 'pieces': [{'placed': True}] * len(call['pieces']), 't_ms': 3})
 
     def stream(self, blocks, input_tokens, pause, stop, cut=False):
         """The reply as server-sent events, its text in five pieces `pause` seconds apart and a tool
@@ -1280,6 +1293,109 @@ def circled(port, root):
         raise SystemExit(f'loops with a call between them: the log holds {kinds}')
 
 
+def unmarked(value):
+    """A request's JSON without its cache breakpoints, which move from request to request."""
+    if isinstance(value, dict):
+        return {k: unmarked(v) for k, v in value.items() if k != 'cache_control'}
+    return [unmarked(v) for v in value] if isinstance(value, list) else value
+
+
+def spliced(tls, ca) -> str:
+    """A session on a provider ticked to splice in the settings (KV-SPLICE.md): before a request that
+    doesn't go on from the last one (the context folded) and before each memory request, the server is
+    asked to build the request's cache from pieces of cached conversations, then sent the request
+    itself; each memory's text comes from the reply that wrote it, each message's from the session's
+    last request, or, once folded out of it, a merge's from the reply that wrote its chunk's L1 (whose
+    request showed it raw), and every piece starts at a text that occurs once in the request. Memory requests
+    carry the session's system prompt. A splice that fails leaves the turn as it was; ticked off, the
+    provider splices no more, and a request that sends images, which the server can't splice, isn't.
+    The costs log keeps what each splice came to."""
+    port, root, mock_port, work = free_port(), tempfile.mkdtemp(), free_port(), tempfile.mkdtemp()
+    mock = serve(mock_port, tls)
+    app = launch(root, port, ca, '--no-bash')
+    seen['wire'], system = [], 'You keep a lighthouse.'
+
+    def turns(n, at):
+        for t in range(at, at + n):
+            said = 4 if t == 5 else t                                    # the fifth message says the fourth's again
+            say(port, 'spliced', f'Message {said}: ' + ' '.join(f'word{said}x{i}' for i in range(80)))   # a turn that fails fails the part
+            settle(port, 'spliced')
+    try:
+        configure(root, f'https://localhost:{mock_port}/v1', 4000, 400, 200)   # its splices go to /kv/splice
+        everything = json.loads(Path(root, 'settings.json').read_text())
+        everything['presets']['default']['questions'] = False
+        Path(root, 'settings.json').write_text(json.dumps(everything))
+        call(port, '/api/settings', {'name': 'default', 'splice': True})
+        if call(port, '/api/settings')['providers'][0].get('splice') is not True or json.loads(Path(root, 'settings.json').read_text())['providers']['default'].get('splice') is not True:
+            raise SystemExit('the provider ticked to splice does not')
+        call(port, '/api/sessions', {'name': 'spliced'})
+        call(port, '/api/s/spliced/settings', {'system': system})
+        turns(16, 0)
+        wire, memory = seen['wire'], lambda r: 'Write the memory' in json.dumps(r['messages'][-1]) or 'consolidate' in json.dumps(r['messages'][-1])
+        texts = lambda r: [c['text'] if 'text' in c else c['content'] for m in r['messages'] for b in m['content'] for c in [b, *(b['content'] if isinstance(b.get('content'), list) else [])] if c['type'] == 'text' or isinstance(c.get('content'), str)]
+        main, splices, merged = None, {'main': 0, 'memory': 0}, 0
+        for i, (kind, sent) in enumerate(wire):
+            if kind == 'messages':
+                if not memory(sent):
+                    extends = main is not None and unmarked(sent['messages'][:len(main['messages'])]) == unmarked(main['messages'])
+                    if main is not None and (wire[i - 1][0] == 'splice') == extends:
+                        raise SystemExit(f'a request that {"goes on from" if extends else "does not go on from"} the last one was {"" if extends else "not "}spliced first')
+                    main = sent
+                elif sent.get('system') != system:
+                    raise SystemExit(f'a memory request\'s system prompt: {sent.get("system")!r}')
+                continue
+            request, sources, pieces = sent['request'], sent['sources'], sent['pieces']
+            following = wire[i + 1][1] if i + 1 < len(wire) and wire[i + 1][0] == 'messages' else {}
+            if sent['format'] != 'anthropic' or any(request.get(k) != following.get(k) for k in ('messages', 'system', 'tools')) or not pieces:
+                raise SystemExit(f'a splice of {len(pieces)} pieces in {sent["format"]} for a request other than the one sent next')
+            splices['memory' if memory(request) else 'main'] += 1
+            for piece in pieces:
+                source, everywhere = sources[piece['src']], [text for text in texts(request) if piece['anchor'] in text]
+                folded = 'reply' in source and memory(request) and piece['anchor'].startswith(('Message ', 'Reply '))   # a merge's message from its L1's reply
+                merged += folded
+                if 'reply' in source and (not source['reply'].startswith('I remember stretch') or piece['anchor'] != source['reply'].strip() and not folded):
+                    raise SystemExit(f'a piece {piece["anchor"][:40]!r} from the reply {source["reply"][:40]!r}')
+                if 'request' in source and unmarked(source['request']['messages']) != unmarked(main['messages']):
+                    raise SystemExit('a piece from a request other than the session\'s last')
+                if len(everywhere) != 1 or everywhere[0].count(piece['anchor']) != 1:
+                    raise SystemExit(f'a piece starts at {piece["anchor"][:40]!r}, in the request {len(everywhere)} times')
+            if not memory(request) and (not any('reply' in s for s in sources) or any('reply' in sources[p['src']] and p['anchor'] in json.dumps(main) for p in pieces)):
+                raise SystemExit('a fold\'s splice copies no memory, or one the last request showed')
+            changed = next(k for k, m in enumerate(request['messages']) if k >= len(main['messages']) or unmarked(m) != unmarked(main['messages'][k]))
+            after = [text.strip() for text in texts({'messages': request['messages'][changed:]})]
+            if not memory(request) and (missing := {text for text in after if (text in json.dumps(main) or text.startswith('I remember')) and texts(request).count(text) == 1} - {p['anchor'] for p in pieces}):
+                raise SystemExit(f'a fold\'s splice copies none of {sorted(missing)[0][:40]!r} and {len(missing) - 1} more of its new memories and the texts the last request had')
+            raw = [text.strip() for text in texts(request) if text.startswith(('Message ', 'Reply '))]
+            if memory(request) and (missing := {text for text in raw if raw.count(text) == 1} - {p['anchor'] for p in pieces}):
+                raise SystemExit(f'a memory request\'s splice copies none of {sorted(missing)[0][:40]!r} and {len(missing) - 1} more of its messages')
+        if not splices['main'] or not splices['memory'] or not merged or splices['memory'] != sum(1 for kind, r in wire if kind == 'messages' and memory(r)):
+            raise SystemExit(f'splices before {splices["main"]} folded requests and {splices["memory"]} memory requests, of {sum(1 for kind, r in wire if kind == "messages" and memory(r))}; {merged} messages from L1s')
+        seen['splice down'], called = True, len(wire)                    # down: the turns go on as before
+        turns(4, 16)
+        seen['splice down'], imaging = False, len(wire)                  # an image in the context
+        Path(work, 'dot.png').write_bytes(b'\x89PNG\r\n\x1a\nfake')
+        call(port, '/api/s/spliced/settings', {'workspace': work, 'images': True, 'allow': ['read_image']})
+        say(port, 'spliced', 'call ' + json.dumps([['read_image', {'path': 'dot.png'}]]))
+        turns(3, 30)
+        imaged = lambda r: '"type": "image"' in json.dumps(r)
+        if not any(kind == 'messages' and imaged(r) for kind, r in wire[imaging:]) or any(kind == 'splice' and imaged(s) for kind, s in wire):
+            raise SystemExit('no request sent an image, or a splice had one')
+        call(port, '/api/settings', {'name': 'default', 'splice': False})
+        ticked_off = len(wire)
+        turns(6, 40)
+        if any(kind == 'splice' for kind, _ in wire[ticked_off:]) or not any(kind == 'messages' and memory(r) and r.get('system') == system for kind, r in wire[ticked_off:]):
+            raise SystemExit('a provider ticked off still splices, or its memory requests lost the system prompt')
+        logged = [s for line in Path(root, 'spliced', 'costs.jsonl').read_text().splitlines() for s in json.loads(line).get('spliced', [])]
+        down = [s for s in logged if 'error' in s]
+        if len(logged) != sum(kind == 'splice' for kind, _ in wire) or not down or any(s['error'] != 'HTTP 500: {"error": "the splicer is down"}' for s in down) \
+                or any((s['placed'], s['built'], s['t_ms']) != (s['pieces'], 100, 3) for s in logged if 'error' not in s) or len(down) != sum(kind == 'splice' for kind, _ in wire[called:imaging]):
+            raise SystemExit(f'the costs log keeps splices {logged[:3]}, {len(down)} of them failed')
+        return f'{splices["main"]} folded requests and {splices["memory"]} memory requests spliced first ({merged} pieces of merges from L1s), {len(down)} splices failed'
+    finally:
+        app.terminate()
+        mock.shutdown()
+
+
 def chatted(turns, tls, ca, baseline) -> str:
     """The long chat, the fork and the settings; the main session's price multiplier goes to `baseline`."""
     mock_port, plain_port, port, root = free_port(), free_port(), free_port(), tempfile.mkdtemp()
@@ -2276,7 +2392,7 @@ def main(turns=60):
     parts = {'chat': lambda: chatted(turns, (cert, key), ca, baseline), 'tools': lambda: tooled((cert, key), ca, baseline), 'large': lambda: streamed_large((cert, key), ca),
              'companion': lambda: accompanied((cert, key), ca), 'lifted': lambda: lifted((cert, key), ca), 'channels': lambda: channeled((cert, key), ca),
              'boards': lambda: boarded((cert, key), ca), 'gateway': lambda: gatewayed((cert, key), ca),
-             'claude': lambda: clauded((cert, key), ca), 'fold': lambda: folded((cert, key), ca)}
+             'claude': lambda: clauded((cert, key), ca), 'fold': lambda: folded((cert, key), ca), 'spliced': lambda: spliced((cert, key), ca)}
     running = [forked.Process(target=part, args=(name, run, done)) for name, run in parts.items()]
     summaries, totals, failure = {}, {'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0}, None
     try:
@@ -2301,7 +2417,7 @@ def main(turns=60):
         print(failure)
         return 1
     print(f'{totals["chat"]} chat turns and {totals["memory"]} memory requests; {summaries["chat"]}; {totals["bytes"] // 1024} KB of requests streamed '
-          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}; {summaries["gateway"]}; {summaries["claude"]}; {summaries["fold"]}')
+          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}; {summaries["gateway"]}; {summaries["claude"]}; {summaries["fold"]}; {summaries["spliced"]}')
     return 0
 
 

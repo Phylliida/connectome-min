@@ -62,7 +62,7 @@ impl Host for Remembering<'_, '_> {
                 Ok(Said::Result { subtype, is_error, result, stop_reason, total_cost_usd, usage }) => {
                     let prompts = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
                     let used = Usage { cost: total_cost_usd, input: prompts, cached: usage.cache_read_input_tokens, output: usage.output_tokens };
-                    if let Some(spent) = costs::spend(&self.worker.s, For::Memories, used, None, limits.take()) { self.worker.event(Event::Spent(spent)) }
+                    if let Some(spent) = costs::spend(&self.worker.s, For::Memories, used, None, limits.take(), vec![]) { self.worker.event(Event::Spent(spent)) }
                     if is_error { break Err(result.unwrap_or(subtype)) }
                     let stop = stop_reason.unwrap_or_else(|| "end_turn".into());
                     break Ok(obj! {"stopReason" => stop.as_str(), "content" => std::mem::take(&mut written), "usage" => obj! {"inputTokens" => prompts, "outputTokens" => usage.output_tokens}});

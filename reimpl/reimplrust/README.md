@@ -74,9 +74,9 @@ priced as the planner prices them.
 Settings are JSON files you can edit by hand, read again at each use, and only you can read them,
 since one holds the keys:
 
-- `ROOT/settings.json`: `providers`, each a name with a `base` URL, a `key` and the `models` the page
-  offers a session on it (the page's Settings edits them, adds providers and deletes them, all but
-  those a preset is on); `presets`, what a new session can start with, by name, each a session's
+- `ROOT/settings.json`: `providers`, each a name with a `base` URL, a `key`, the `models` the page
+  offers a session on it, and whether its server can `splice` (the page's Settings edits them, adds
+  providers and deletes them, all but those a preset is on; see Splicing below); `presets`, what a new session can start with, by name, each a session's
   settings (below) that a new session's file starts as a copy of (the page's new-session dialog
   chooses one, `default` if none is named, and gives the workspace, warning that without one the
   session has no bash or edit; as a workspace's path is typed there, or in a session's settings, the
@@ -259,8 +259,23 @@ back (DeepSeek V4.1 Flash on OpenRouter takes such reasoning as done, and answer
 tools without reasoning more); three such replies in a row end the turn, saying so. Every request carries the system prompt and the tool definitions, so their tokens
 come out of the window the context compiles to, and out of the usage that calibrates prices; while
 calibration catches up with a request bigger than its estimate, the next context compiles that much
-smaller. Memory requests declare the same tools with tool choice "none", as the library does, so a
-memory can cover tool calls. The page's Continue button runs a turn without a message: after an
+smaller. Memory requests carry the session's system prompt too, so they start as its requests do and
+a provider's cache of that start serves both, and declare the same tools with tool choice "none", as
+the library does, so a memory can cover tool calls.
+
+Splicing: a provider whose `splice` is on (a tick on its card in Settings) has a server that builds a
+request's cache from pieces of conversations it has cached (`KV-SPLICE.md`; the Kimi-K3 llama.cpp
+server does), so a fold or a memory's request isn't read again from the start. Before a request that
+doesn't go on from the session's last one (its context folded) and before each memory request, the
+app posts the request to `/kv/splice` (at the base, less a trailing `/v1`) with a piece for each text
+in it that occurs there once: a memory's from the reply that wrote it, a message's from the session's
+last request, or, once folded out of that, from the reply that wrote its chunk's L1, whose request
+showed the chunk raw (the app keeps the last request while it runs; after a restart a fold before
+the next request isn't spliced). Each text gets its own piece because a memory's request shows the
+messages without the agent's reasoning, and a piece ends where the two differ. A request with images
+isn't spliced. A splice that fails changes nothing: the request goes all the same. The costs log keeps
+what each came to (`spliced` on a step's or memory round's record: the pieces given and placed and the
+server's counts, or the error). The page's Continue button runs a turn without a message: after an
 interruption (a failed request, a stop, a restart) the model goes on from the log as it is (and if
 the server stopped in a step, its calls logged but not their results, each call first gets a failed
 result saying so, as it does before any turn), and after a reply cut short it goes on from that
