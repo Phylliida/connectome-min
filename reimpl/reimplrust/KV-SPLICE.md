@@ -1,7 +1,8 @@
 # KV splice: building a request's cache from pieces
 
-Proposal, 2026-11-09, for the Kimi-K3 server (the llama.cpp fork run by `./run-kimi.sh` at http://127.0.0.1:8091) and
-connectome-web. It replaces the span-for-span form of `POST /kv/splice`.
+For the Kimi-K3 server (the llama.cpp fork run by `./run-kimi.sh` at http://127.0.0.1:8091) and connectome-web. Proposed
+2026-11-09; the server has it since 2026-11-10 as `POST /kv/splice2` (also `/kv/splice` with a `request` body), with the
+changes listed under "The server's implementation". It replaces the span-for-span form of `POST /kv/splice`.
 
 ## Why
 
@@ -96,6 +97,20 @@ everything after the chunk; the memory could then tell of later events.
 For a fold, the last piece runs to the end of the main session's cached tokens, so its state is the main session's own
 final state.
 
+### The server's implementation
+
+Where the server built on K3 departs from the above:
+
+- Anchor alignment: a piece starts at the first token boundary within the anchor's first 64 characters that both sides
+  share, since a tokenizer can glue the character before an anchor onto its first word on one side only. Exact token
+  equality still decides how far a piece runs.
+- `max_advance` (default 2048 tokens): the furthest a checkpoint is advanced, for pieces and for the prefix; past that,
+  the nearer checkpoint's state is used as it is.
+- A checkpoint is stored at each placed piece's end, so later rollbacks stay cheap.
+- Reply keys are recorded at each completion and saved to `reply-keys.jsonl` beside the disk cache, so they survive
+  restarts; only replies generated since the feature exists are known.
+- The response also has `prefix_recurrent` and a `timing_ms` breakdown.
+
 ## Response (200)
 
 ```json
@@ -124,43 +139,56 @@ final state.
 
 ## How connectome-web uses it
 
-The app calls it before a request that a fold changed and before each memory request, then sends the request. Sources
-follow one rule: a memory's text comes from the conversation that wrote it (`{"reply": its text}`); raw messages come
-from the main session's last request, or, in a merge, from the conversation that wrote the member's L1, which showed the
-chunk raw. An anchor is the first text block of a message: a memory's text, a user message, an assistant's text, a tool
-result's text. When a message's text isn't unique, the app anchors at a later message of the stretch, and the messages
-before it are prefilled.
+The app calls it before a request that a fold changed and before each memory request, then sends the request. It gives a
+piece for each text block of `request` after the cached prefix whose text occurs there once: a memory's text, a user
+message, an assistant's text, a tool result's text. A piece runs only to the next anchor, so where both sides render the
+same, consecutive pieces cover it end to end, and where they differ, copying starts again at the next text block.
+Sources follow one rule: a memory's text comes from the conversation that wrote it (`{"reply": its text}`); raw messages
+come from the main session's last request, or, in a merge, from the conversation that wrote the member's L1, which
+showed the chunk raw.
+
+Every text block gets an anchor, not only a stretch's first, because memory requests replay messages without the agent's
+reasoning (the library's `raw`, as Anima does), while main requests carry it on the turns that call tools. On K3 the two
+render the same but for that turn's think block:
+
+```
+main:   <|open|>message role="assistant"<|sep|><|open|>think<|sep|>REASONING<|close|>think<|sep|><|open|>response<|sep|>Let me look.<|close|>response...
+memory: <|open|>message role="assistant"<|sep|><|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|>Let me look.<|close|>response...
+```
+
+So a piece of a chunk stops at each such turn, and the next starts at the turn's text ("Let me look."), or at the tool
+result's text when the turn has none, the tool call then prefilled.
 
 A fold, which replaces two chunks with memories M3 and M4:
 
 ```
 [head][label][M1][label][M2] [label] [M3] [label] [M4] [the rest of the main session ...] [new message]
- prefix                       gap     piece gap    piece gap  piece                         left for the request
+ prefix                       gap     piece gap    piece gap  pieces                        left for the request
 ```
 
-The pieces are `{"reply": M3}` and `{"reply": M4}` anchored at their texts, then `{"request": the last main request}`
-anchored at the text of the first message after the fold, running to the end of the main session's cached tokens.
+The pieces are `{"reply": M3}` and `{"reply": M4}` anchored at their texts, then one from `{"request": the last main
+request}` per text block of the rest, which together run to the end of the main session's cached tokens.
 
 An L1 request for chunk k:
 
 ```
 [head][recall L1-3][M3][recall L1-4][M4][marker][chunk k ...][instruction]
- prefix gap         piece gap        piece gap   piece        left for the request
+ prefix gap         piece gap        piece gap   pieces       left for the request
 ```
 
-The pieces are `{"reply": M3}` and `{"reply": M4}`, then `{"request": the last main request}` anchored at the text of
-the chunk's first message. A merge of L1s takes each member's chunk from `{"reply": that L1's text}`, anchored at the
-text of the chunk's first message; a merge of higher memories takes their members' texts from `{"reply": ...}` too.
+The pieces are `{"reply": M3}` and `{"reply": M4}`, then one from `{"request": the last main request}` per text block of
+the chunk. A merge of L1s takes each member's chunk from `{"reply": that L1's text}`, a piece per text block; a merge of
+higher memories takes their members' texts from `{"reply": ...}` too.
 
 The app keeps the last main request it sent, a list of references to blocks on disk. After the app restarts it has
 none until its next request, so a fold before then is prefilled.
 
 ### Prerequisites in connectome-web
 
-- The prefix covers the head only if memory requests render the same tokens as main requests from the first token.
-  Today they don't send the session's system prompt (`app/src/work.rs:124` builds their head without one), and they send
-  `tool_choice: none`. Memory requests should send the system prompt. If `/apply-template` shows that `tool_choice: none`
-  changes the rendered prompt, drop it and reject a reply that calls a tool, as Anima does.
+- Memory requests send the session's system prompt. K3's template puts it after the tool declarations and before the
+  first message, so without it (`app/src/work.rs:124` builds a memory request's head without one) a memory request
+  shares only the tool declarations with the main session. `tool_choice: none`, which memory requests also send,
+  renders the same as no `tool_choice` (checked with `/apply-template`, 2026-11-10).
 - Requests use `format: "anthropic"`, so the app sends the same bodies it sends to `/v1/messages`.
 - A session with images doesn't use it.
 
