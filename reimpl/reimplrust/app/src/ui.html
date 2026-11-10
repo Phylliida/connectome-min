@@ -892,6 +892,7 @@ function SessionForm({ preset }) {
     ${!preset && html`<label title="The folder its bash and edit work in; without one it has neither">Workspace <input name="workspace" list="folders" defaultValue=${s.workspace ?? ''} placeholder="none: no bash or edit" onFocus=${offer} onInput=${offer} /></label>`}
     <label><input name="sandbox" type="checkbox" defaultChecked=${!!s.sandbox} /> ${inClaude ? 'Claude Code' : 'bash'} in the sandbox</label>
     <label title="Off, the model has no tool to ask you questions"><input name="questions" type="checkbox" defaultChecked=${s.questions !== false} /> Questions: the model can ask you</label>
+    ${!inClaude && html`<label title="On, the model can look at image files in its workspace (read_image); only for a model that takes images, since an image in its context fails every request to one that doesn't"><input name="images" type="checkbox" defaultChecked=${!!s.images} /> Images: the model can look at them</label>`}
     <label>Window <input name="window" type="number" defaultValue=${s.window ?? ''} /></label>
     <label>Reply reserve <input name="reserve" type="number" defaultValue=${s.reserve ?? ''} /></label>
     <label title="The oldest this many tokens of the context stay as they were, never folded, and every memory's request starts with them, so memories stay in the model's own voice; fixed once a chunk has closed">Raw head

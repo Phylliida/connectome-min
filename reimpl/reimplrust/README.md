@@ -96,7 +96,8 @@ since one holds the keys:
 - `ROOT/NAME/session_settings.json`: the session's `provider` (by name) and `model`, its
   `workspace`, whether bash runs in the `sandbox`, whether the model can ask you `questions` (on
   unless the file says otherwise; off, it has no tool to: no `ask_user`, and Claude Code is run with
-  `--disallowedTools AskUserQuestion`), the tools it always allows (`allow`), its
+  `--disallowedTools AskUserQuestion`), whether its model takes `images` (off unless the file says
+  otherwise; on, it has `read_image`), the tools it always allows (`allow`), its
   `window`, `reserve`, the band its prompt folds in (`fold_above` and `fold_to`, always numbers: past
   `fold_above` tokens the context folds, down to `fold_to`; the band the window gives is what it leaves
   the reply, down to `config.slack`, 10%, under that), its `system` prompt, and the library's settings (`config`). A new session's
@@ -120,7 +121,11 @@ workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in th
 by replacing text in it, which must occur once unless the call says `all`, or made; its paths can't
 lead out of the workspace, through `..`, an absolute path or a link; in the sandbox it reads and
 writes through commands run in bash's sandbox, so the kernel keeps it to what a sandboxed command
-may touch), `web_search` (when settings.json names a SearXNG server: a query asked through its JSON
+may touch), `read_image` (while the session's `images` is on: an image file in the workspace, found
+as `edit` finds files and read as it reads them, given back as an image after its path; it takes PNG,
+JPEG and GIF, what both the Messages API and llama.cpp's server take, of up to 3.75 MB, 5 MB in
+base64 as the API allows, and refuses the rest, since an image a provider can't take would fail every
+request after it; off by default for the same reason, for models that take no images), `web_search` (when settings.json names a SearXNG server: a query asked through its JSON
 API, which its settings.yml must allow by listing `json` in `search.formats`, the pages found given
 back as text, each one's title, address, date when known and excerpt), `ask_user` (while the
 session's `questions` is on: one to four questions, each with two to four options to pick, one or

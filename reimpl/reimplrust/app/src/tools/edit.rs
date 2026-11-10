@@ -46,7 +46,7 @@ fn edit(files: &Files, input: &Value, stopped: Stopped) -> Outcome {
         files.write(&file, new, true, stopped).map_err(failed)?;
         return Ok(format!("made {path}, {} lines", new.lines().count()).into());
     }
-    let text = files.read(&file, stopped).map_err(failed)?;
+    let text = files.read(&file, stopped).and_then(|bytes| String::from_utf8(bytes).map_err(|_| "not text (UTF-8)".into())).map_err(failed)?;
     let Some(at) = text.find(old) else { return Err(format!("the text to replace isn't in {path}").into()) };
     let (times, line) = (text.matches(old).count(), text[..at].matches('\n').count() + 1);
     if times > 1 && input["all"] != true {
@@ -56,23 +56,22 @@ fn edit(files: &Files, input: &Value, stopped: Stopped) -> Outcome {
     Ok(if times == 1 { format!("edited {path} at line {line}") } else { format!("edited {path} in {times} places, the first at line {line}") }.into())
 }
 
-/// Where an edit reads and writes: here, or, given a sandbox, through commands run in it; and the
-/// folders besides its workspace it may.
-struct Files {
-    dir: PathBuf,
-    also: Vec<PathBuf>,
-    limit: Duration,
-    sandbox: Option<Sandbox>,
+/// Where an edit reads and writes (and read_image reads, image.rs): here, or, given a sandbox, through
+/// commands run in it; and the folders besides its workspace it may.
+pub(super) struct Files {
+    pub(super) dir: PathBuf,
+    pub(super) also: Vec<PathBuf>,
+    pub(super) limit: Duration,
+    pub(super) sandbox: Option<Sandbox>,
 }
 
 impl Files {
-    /// A file's text.
-    fn read(&self, file: &Path, stopped: Stopped) -> Result<String, String> {
-        let bytes = match &self.sandbox {
-            None => std::fs::read(file).map_err(|e| e.to_string())?,
-            Some(b) => self.run(b, r#"exec cat -- "$1""#, file, b"", stopped)?,
-        };
-        String::from_utf8(bytes).map_err(|_| "not text (UTF-8)".into())
+    /// A file's bytes.
+    pub(super) fn read(&self, file: &Path, stopped: Stopped) -> Result<Vec<u8>, String> {
+        match &self.sandbox {
+            None => std::fs::read(file).map_err(|e| e.to_string()),
+            Some(b) => self.run(b, r#"exec cat -- "$1""#, file, b"", stopped),
+        }
     }
 
     /// `text` into a file, a `new` one (none there, and its directories made) or one there is.
@@ -121,7 +120,7 @@ impl Files {
 
 /// `path` in `dir`, or in one of the folders `also`, or why it isn't: relative to `dir`, or absolute
 /// within it or one of them, with no `..`, and no link on the way that leads out of it.
-fn inside(dir: &Path, also: &[PathBuf], path: &str) -> Result<PathBuf, String> {
+pub(super) fn inside(dir: &Path, also: &[PathBuf], path: &str) -> Result<PathBuf, String> {
     let (file, real) = (dir.join(path), |p: &Path| p.canonicalize().map_err(|e| format!("{}: {e}", p.display())));
     let known = file.ancestors().find(|p| p.symlink_metadata().is_ok()).ok_or(format!("{path}: no such directory"))?; // the deepest part there is
     let resolved = real(known)?.join(file.strip_prefix(known).expect("an ancestor"));

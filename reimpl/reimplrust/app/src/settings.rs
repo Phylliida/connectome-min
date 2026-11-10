@@ -110,6 +110,8 @@ pub struct SessionSettings {
     #[default(cfg!(target_os = "linux"))] pub sandbox: bool, // where bubblewrap runs
     // whether the model can ask the user questions: ask_user (tools/ask.rs), or Claude Code's AskUserQuestion
     #[default(true)] #[serde(default = "on")] pub questions: bool,
+    // whether the model takes images: read_image (tools/image.rs), off since an image fails every request to a model that doesn't
+    #[serde(default)] pub images: bool,
     pub allow: BTreeSet<String>,          // the tools that run without asking
     #[default(180000.0)] pub window: f64, // tokens a request may take, the reply's included
     #[default(30000.0)] pub reserve: f64, // tokens for the reply (its reasoning too)

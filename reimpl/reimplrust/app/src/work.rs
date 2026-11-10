@@ -10,7 +10,7 @@
 //! hub what the pages following the job see (Msg). The user can stop a turn: it ends where it is
 //! (Worker::stopped). A Claude Code session's turn is Claude Code's instead (claude.rs).
 
-use crate::{api::brief, boards, channels, claude, claude_memory::Remembering, companion::{self, Heard, How}, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Llm, Piece, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, ask, bash, edit, mcp, search, Toolbox}, App};
+use crate::{api::brief, boards, channels, claude, claude_memory::Remembering, companion::{self, Heard, How}, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{Llm, Piece, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, ask, bash, edit, image, mcp, search, Toolbox}, App};
 use connectome::{blocks::density_tokens, drive::{append, current, drive}, emit::{select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
 use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, store::Session, turns::Turn};
 use std::{cell::{Cell, RefCell}, collections::VecDeque, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
@@ -88,7 +88,7 @@ impl Setup {
         let reach: Vec<PathBuf> = boards.iter().map(|b| app.board_path(b)).collect();
         let mut sandbox = all.sandbox;
         sandbox.rw.extend(reach.iter().map(|p| p.to_string_lossy().into_owned()));
-        let tools = toolbox(app, settings.workspace.as_deref(), settings.sandbox.then_some(sandbox), all.search.as_deref(), &reach) + companion::tools(app, name, &settings) + channels::tools(app, name, &settings)
+        let tools = toolbox(app, settings.workspace.as_deref(), settings.sandbox.then_some(sandbox), settings.images, all.search.as_deref(), &reach) + companion::tools(app, name, &settings) + channels::tools(app, name, &settings)
             + if settings.questions { ask::tool() } else { Toolbox::default() };
         let definitions = tools.definitions();
         let parts: Vec<String> = [settings.system.clone().filter(|s| !s.is_empty()), boards::note(app, &boards, name)].into_iter().flatten().collect();
@@ -128,18 +128,20 @@ impl Host for Summarizer<'_> {
     }
 }
 
-/// A session's tools: bash (unless --no-bash) and edit in its `workspace`, edit reaching its `boards`'
-/// folders too, bash in `sandbox` if given, both declared but failing without a workspace; web_search,
-/// if settings.json names a SearXNG server (`searching`); then the MCP servers'.
-pub fn toolbox(app: &App, workspace: Option<&Path>, sandbox: Option<Sandbox>, searching: Option<&str>, boards: &[PathBuf]) -> Toolbox {
+/// A session's tools: bash (unless --no-bash), edit and, if it takes `images`, read_image in its
+/// `workspace`, edit and read_image reaching its `boards`' folders too, all in `sandbox` if given, and
+/// declared but failing without a workspace; web_search, if settings.json names a SearXNG server
+/// (`searching`); then the MCP servers'.
+pub fn toolbox(app: &App, workspace: Option<&Path>, sandbox: Option<Sandbox>, images: bool, searching: Option<&str>, boards: &[PathBuf]) -> Toolbox {
     let why = "it has no workspace; the user can set one in the session's settings";
-    let (bash, edit) = match workspace {
-        Some(dir) => (bash::tool(dir.into(), app.limit, sandbox.clone()), edit::tool(dir.into(), boards.to_vec(), app.limit, sandbox)),
-        None => (bash::unavailable(why), edit::unavailable(why)),
+    let (bash, edit, image) = match workspace {
+        Some(dir) => (bash::tool(dir.into(), app.limit, sandbox.clone()), edit::tool(dir.into(), boards.to_vec(), app.limit, sandbox.clone()), image::tool(dir.into(), boards.to_vec(), app.limit, sandbox)),
+        None => (bash::unavailable(why), edit::unavailable(why), image::unavailable(why)),
     };
     let bash = if app.bash { bash } else { Toolbox::default() };
+    let image = if images { image } else { Toolbox::default() };
     let web = searching.map_or_else(Toolbox::default, |base| search::tool(base.into(), app.agent.clone(), app.limit));
-    bash + edit + web + mcp::toolbox(&app.mcp)
+    bash + edit + image + web + mcp::toolbox(&app.mcp)
 }
 
 /// Why the context can't compile, as the user can do something about it: at its most folded it's

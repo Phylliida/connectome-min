@@ -38,6 +38,7 @@ the channels, the boards, the gateway, Claude Code, its fold) run at once, in pr
 
     python3 tests/test_app.py [turns]
 """
+import base64
 import datetime
 import hashlib
 import itertools
@@ -657,7 +658,9 @@ def tooled(tls, ca, baseline) -> str:
     in the log and on the page; the requests fit the window with the tool definitions counted, which
     leave the price multiplier near a session's without them (from `baseline`); a turn that never stops
     calling tools runs on past 64 steps until the user stops it, memories forming between its steps;
-    and memories of the calls form with the tools declared but not callable. ask_user's questions wait
+    and memories of the calls form with the tools declared but not callable. With the session's
+    images on, read_image gives back a PNG, JPEG or GIF in the workspace as an image, and refuses other
+    files, ones past what the API takes and ones out of the workspace; off, it isn't declared. ask_user's questions wait
     for the user's answers, which are their result, or their decline, never the allow list; with the
     session's questions off, it isn't declared."""
     port, root, work, fake, window, mock_port = free_port(), tempfile.mkdtemp(), tempfile.mkdtemp(), str(HERE / 'fake_mcp.py'), 12000, free_port()
@@ -791,6 +794,27 @@ def tooled(tls, ca, baseline) -> str:
             if missing != (f'notes/none.txt: cat: {work}/notes/none.txt: No such file or directory' if sandboxed else 'notes/none.txt: No such file or directory (os error 2)'):
                 raise SystemExit(f'an edit of a file there isn\'t{", in the sandbox," if sandboxed else ""} said {missing!r}')
             say(port, 'reading', 'echo next')                           # the mock answers results and a message together with a reply
+        call(port, '/api/sessions', {'name': 'seeing', 'workspace': work})   # read_image, for a model that takes images: images, and refusals of the rest
+        call(port, '/api/s/seeing/settings', {'images': True, 'allow': ['read_image']})
+        pictures = {'pictures/dot.png': b'\x89PNG\r\n\x1a\nfake', 'pictures/dot.jpg': b'\xff\xd8\xff\xe0fake', 'pictures/big.gif': b'GIF89a' + bytes(5 * 1024 * 1024 // 4 * 3 - 5)}
+        for path, data in pictures.items():
+            Path(work, path).parent.mkdir(exist_ok=True)
+            Path(work, path).write_bytes(data)
+        reads = ['pictures/dot.png', 'pictures/dot.jpg', 'notes/a.txt', 'pictures/big.gif', '../x.png']
+        shown = lambda path, kind: ([{'type': 'text', 'text': path}, {'type': 'image', 'source': {'type': 'base64', 'media_type': f'image/{kind}', 'data': base64.b64encode(pictures[path]).decode()}}], False)
+        expected = [shown('pictures/dot.png', 'png'), shown('pictures/dot.jpg', 'jpeg'), ("notes/a.txt isn't a PNG, JPEG or GIF; convert it to one first", True),
+                    ('pictures/big.gif is 3.8 MB, past the 3.75 MB an image may be; make it smaller first', True), (f'../x.png is outside the workspace, {work}', True)]
+        for sandboxed in (True, False):
+            call(port, '/api/s/seeing/settings', {'sandbox': sandboxed})
+            say(port, 'seeing', 'call ' + json.dumps([['read_image', {'path': p}] for p in reads]))
+            got = {r['tool_use_id'].split('-')[1]: r for r in seen['results'][-1]}
+            outcomes = [(got[str(k)]['content'], got[str(k)].get('is_error', False)) for k in range(len(reads))]
+            if outcomes != expected or call(port, '/api/s/seeing')['tools'][:3] != ['bash', 'edit', 'read_image']:
+                raise SystemExit(f'read_image{" in the sandbox" if sandboxed else ""}: {str(outcomes)[:600]}; the tools {call(port, "/api/s/seeing")["tools"]}')
+        call(port, '/api/s/seeing/settings', {'images': False})
+        say(port, 'seeing', 'hello')
+        if 'read_image' in seen['requests'][-1][1] or 'read_image' not in seen['requests'][-2][1] or 'read_image' in call(port, '/api/s/tools')['tools']:
+            raise SystemExit(f'with images off the session declares {seen["requests"][-1][1]}; the tools session, never on, has {call(port, "/api/s/tools")["tools"]}')
         got = results('call [["hang", {}], ["picture", {}]]', asked=['hang'])
         if got['0']['content'] != 'MCP server first: tools/call timed out after 1 s' or got['1'].get('is_error'):
             raise SystemExit(f'a call past its timeout, then another of the same server: {got}')

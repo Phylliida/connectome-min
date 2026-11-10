@@ -44,6 +44,7 @@ dependencies = [
 name = "connectome-web"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "connectome",
  "include_dir",
  "itertools",
