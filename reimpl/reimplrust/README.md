@@ -292,10 +292,13 @@ log so, without a call it was still writing; a call not yet run doesn't run, its
 one running ends (bash kills its command and what it started, and an MCP call is left to the
 server's timeout); a memory forming is dropped, not counted as a failed attempt; and no step comes
 after. A message (or Continue) sent while the session is busy waits, queued, above the message box,
-where you can edit it (✎, in place) or take it back (×) until it goes to the model: the hub holds it
-until the session's thread has done everything it was sent (`POST /api/s/NAME/queued` with `{id,
-text}` or `{id, cancel: true}`; the session lists them as `queued`, and the stream says
-`{"queue": […]}` as they change). What a companion, a channel or a board tells a session still joins
+where you can edit it (✎, in place) or take it back (×) until it goes to the model (`POST
+/api/s/NAME/queued` with `{id, text}` or `{id, cancel: true}`; the session lists them as `queued`,
+and the stream says `{"queue": […]}` as they change). The hub holds it until the turn running has run
+a step's calls: the messages at the queue's front then join the log after the calls' results, each
+as its own message, and the next step sees them. A turn that answers without calls ends first, and
+what's queued then (a Continue, and what's queued after it, always) goes once the session's thread has
+done everything it was sent, a turn each. What a companion, a channel or a board tells a session still joins
 the turn running.
 
 A page follows its session on one stream (`GET /api/s/NAME/stream`, JSON lines; `hub::Event` lists

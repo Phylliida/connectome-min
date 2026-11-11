@@ -124,6 +124,9 @@ class Mock(BaseHTTPRequestHandler):
         results = [b for b in messages[-1]['content'] if b['type'] == 'tool_result']
         asked = next(' '.join(b.get('text', '') for b in m['content']) for m in reversed(messages) if m['role'] == 'user' and any(b['type'] == 'text' for b in m['content']))
         stop = 'end_turn'
+        memory = 'memory' in last and ('Write the memory' in last or 'consolidate' in last)
+        if last.strip() and not memory:                             # a turn told to use tools forever goes on as its message folds away
+            seen['forever'] = 'forever' in last
         if 'circles between calls' in asked:                       # by request: a loop, a call, two loops, an answer
             seen['chat'] += 1
             seen['between'] = seen.get('between', -1) + 1
@@ -163,7 +166,7 @@ class Mock(BaseHTTPRequestHandler):
             blocks = [{'type': 'thinking', 'thinking': PONDERED * 40, 'signature': 'bWVt'}, {'type': 'text', 'text': f'I remember stretch {seen["memory"]}: the user talked about ' + ' '.join(['things'] * 60)}]
             if seen['long-winded']:                                # its tokens run out while it thinks
                 blocks, stop = blocks[:1], 'max_tokens'
-        elif 'use tools' in last or last.startswith('call ') or results and 'forever' in asked:
+        elif 'use tools' in last or last.startswith('call ') or results and seen.get('forever'):
             seen['chat'] += 1
             seen['results'].append(results)
             calls = json.loads(last[5:]) if last.startswith('call ') else [['add', {'a': 2, 'b': 3}]] if results else \
@@ -181,7 +184,6 @@ class Mock(BaseHTTPRequestHandler):
                 seen['results'].append(results)
             blocks = [{'type': 'thinking', 'thinking': 'Let me think about it.', 'signature': 'c2ln'}] * (seen['chat'] % 4 == 0) \
                 + [{'type': 'text', 'text': f'Reply {seen["chat"]}: ' + ' '.join(['words'] * 80)}]
-        memory = 'memory' in last and ('Write the memory' in last or 'consolidate' in last)
         if 'wren-' in json.dumps(messages):   # the headed session's: what it starts with, and whether it folded
             seen['heads'].append((memory, ' '.join(b.get('text', '') for b in messages[0]['content']), 'your own compressed memory' in json.dumps(messages)))
         cut = 'cut off once' in last and last not in seen['cut']
@@ -667,7 +669,7 @@ def tooled(tls, ca, baseline) -> str:
     workspace, read-write, and the paths settings.json names, as an edit by hand leaves them, and a
     timeout still kills all it started. A page that comes in while a turn waits for an answer gets
     the turn so far, then the rest as it happens, the same as the page that started it, and answers;
-    a message sent meanwhile waits for the turn; a page following no turn gets nothing. Every call gets its result,
+    a page following no turn gets nothing. Every call gets its result,
     in the log and on the page; the requests fit the window with the tool definitions counted, which
     leave the price multiplier near a session's without them (from `baseline`); a turn that never stops
     calling tools runs on past 64 steps until the user stops it, memories forming between its steps;
@@ -859,10 +861,6 @@ def tooled(tls, ca, baseline) -> str:
         except urllib.error.HTTPError as error:
             if error.code != 400:
                 raise
-        queued = 'Message queued while a turn waits'
-        waiter = threading.Thread(target=lambda: say(port, 'tools', queued))
-        waiter.start()
-        time.sleep(0.2)                                                 # it reaches the session's thread before the answer
         late = []
         r, events = following(port, 'tools')
         with r:
@@ -873,20 +871,21 @@ def tooled(tls, ca, baseline) -> str:
                 if e.get('done') == job[0]:
                     break
         starter.join()
-        waiter.join()
-        # it hears the session (the turn running, and the message queued for after it), then the turn's start and where
+        queued = 'Message after the turn'
+        say(port, 'tools', queued)
+        # it hears the session (the turn running), then the turn's start and where
         # the log stands (the message and the reply that calls logged, none of the reply's pieces), then what the first
         # page hears from there on, but the messages, which each page reads from the log from where it started, and the
         # queue, which a page hears in the session as it comes in and then as it changes
         outline = lambda events: [e for e in events if not {'text', 'thinking', 'message', 'state', 'queue'} & set(e)]
         kinds = [next(iter(e)) for e in outline(late) if not {'logged', 'forming', 'spent', 'prompt'} & set(e)]
-        if outline(first)[-len(outline(late)) + 1:] != outline(late)[1:] or not late[0]['state']['running'] or [q['text'] for q in late[0]['state']['queued']] != [queued] \
+        if outline(first)[-len(outline(late)) + 1:] != outline(late)[1:] or not late[0]['state']['running'] \
                 or outline(late)[:2] != [{'turn': job[0]}, {'logged': state['messages'] + 2}] \
                 or 'approve' not in outline(late)[2] or kinds != ['turn', 'approve', 'answered', 'running', 'result', 'end', 'done'] or call(port, '/api/s/tools')['running']:
             raise SystemExit(f'a page that came in during the turn got {kinds} from {late[:3]}; the page that started it {len(first)} events, it {len(late)}')
         told = call(port, f'/api/s/tools/messages?from={state["messages"]}')
         if [m['participant'] for m in told] != ['user', 'assistant', 'user', 'assistant', 'user', 'assistant'] or words(told[4]) != queued:
-            raise SystemExit(f'a message sent while a turn ran joined the log as {[(m["participant"], words(m)[:20]) for m in told]}')
+            raise SystemExit(f'the turn and the one after it joined the log as {[(m["participant"], words(m)[:20]) for m in told]}')
         r, events = following(port, 'tools', timeout=1)                 # a page following a session no turn runs in hears the session, and no more
         with r:
             heard = [next(events)]
@@ -1391,6 +1390,45 @@ def spliced(tls, ca) -> str:
                 or any((s['placed'], s['built'], s['t_ms']) != (s['pieces'], 100, 3) for s in logged if 'error' not in s) or len(down) != sum(kind == 'splice' for kind, _ in wire[called:imaging]):
             raise SystemExit(f'the costs log keeps splices {logged[:3]}, {len(down)} of them failed')
         return f'{splices["main"]} folded requests and {splices["memory"]} memory requests spliced first ({merged} pieces of merges from L1s), {len(down)} splices failed'
+    finally:
+        app.terminate()
+        mock.shutdown()
+
+
+def queued(tls, ca) -> str:
+    """A message sent while a turn's call waits for the user's answer stays queued, the user's to change,
+    until the call has run; then it joins the turn after the call's result, each queued message its own,
+    the pages told at once, and the next step answers it, in the same turn. (A message sent while a turn answers without calls
+    waits for its end, a turn of its own: accompanied's lone session.)"""
+    port, root, mock_port, work = free_port(), tempfile.mkdtemp(), free_port(), tempfile.mkdtemp()
+    mock = serve(mock_port, tls)
+    app = launch(root, port, ca)
+    try:
+        configure(root, f'https://localhost:{mock_port}', 20000, 2000, 1000)
+        call(port, '/api/sessions', {'name': 'waiting', 'workspace': work})
+        texts, heard = ['First message queued while a call waits', 'Second message queued while a call waits'], []
+        r, events = following(port, 'waiting')
+        with r:
+            next(events)
+            job = call(port, '/api/s/waiting/say', {'text': 'call ' + json.dumps([['bash', {'command': 'echo ran'}]])})['job']
+            for e in events:
+                heard.append(e)
+                if 'approve' in e:
+                    draft = call(port, '/api/s/waiting/say', {'text': 'a draft'})['job']
+                    second = call(port, '/api/s/waiting/say', {'text': texts[1]})['job']
+                    call(port, '/api/s/waiting/queued', {'id': draft, 'text': texts[0]})   # still the user's to change while the call waits
+                    if (waiting := call(port, '/api/s/waiting')['queued']) != [{'id': draft, 'text': texts[0]}, {'id': second, 'text': texts[1]}]:
+                        raise SystemExit(f'while the call waited, the queue was {waiting}')
+                    call(port, '/api/s/waiting/approve', {'id': e['approve']['id'], 'answer': 'allow'})
+                if e.get('done') == job:
+                    break
+        told, state = call(port, '/api/s/waiting/messages?from=0'), call(port, '/api/s/waiting')
+        kinds = [(m['participant'], [b['type'] for b in m['content'] if b['type'] != 'thinking']) for m in told]
+        if kinds != [('user', ['text']), ('assistant', ['text', 'tool_use']), ('user', ['tool_result']), ('user', ['text']), ('user', ['text']), ('assistant', ['text'])] \
+                or [words(m) for m in told[3:5]] != texts or not words(told[5]).startswith('Reply') or state['queued'] or state['running'] \
+                or {'logged': 5} not in heard or heard.index({'logged': 5}) > next(i for i, e in enumerate(heard) if 'text' in e and i > heard.index({'logged': 3})):   # told before the reply to them streams
+            raise SystemExit(f'messages queued while a call waited joined the log as {[(m["participant"], words(m)[:24]) for m in told]}, the queue {state["queued"]}')
+        return 'messages queued while a call waited joined its turn after the result'
     finally:
         app.terminate()
         mock.shutdown()
@@ -2452,7 +2490,7 @@ def main(turns=60):
              'companion': lambda: accompanied((cert, key), ca), 'lifted': lambda: lifted((cert, key), ca), 'channels': lambda: channeled((cert, key), ca),
              'boards': lambda: boarded((cert, key), ca), 'gateway': lambda: gatewayed((cert, key), ca),
              'claude': lambda: clauded((cert, key), ca), 'fold': lambda: folded((cert, key), ca), 'spliced': lambda: spliced((cert, key), ca),
-             'moved': lambda: moved((cert, key), ca)}
+             'moved': lambda: moved((cert, key), ca), 'queued': lambda: queued((cert, key), ca)}
     running = [forked.Process(target=part, args=(name, run, done)) for name, run in parts.items()]
     summaries, totals, failure = {}, {'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0}, None
     try:
@@ -2477,7 +2515,7 @@ def main(turns=60):
         print(failure)
         return 1
     print(f'{totals["chat"]} chat turns and {totals["memory"]} memory requests; {summaries["chat"]}; {totals["bytes"] // 1024} KB of requests streamed '
-          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}; {summaries["gateway"]}; {summaries["claude"]}; {summaries["fold"]}; {summaries["spliced"]}; {summaries["moved"]}')
+          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}; {summaries["gateway"]}; {summaries["claude"]}; {summaries["fold"]}; {summaries["spliced"]}; {summaries["moved"]}; {summaries["queued"]}')
     return 0
 
 

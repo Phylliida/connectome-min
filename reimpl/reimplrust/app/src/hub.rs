@@ -52,7 +52,7 @@ pub enum Msg {
     /// number answered) for as long as the server runs; but what its partner tells it while one of its
     /// calls waits for the answer goes to that call (answered 0), and a turn the user asks for (Say)
     /// waits here, queued, while the thread is busy, so the user can still change it or take it back
-    /// (Queued).
+    /// (Queued), until the turn running takes it in after a step's calls (Take).
     Job(Job, Sender<u64>),
     /// From the session's thread: it has taken this many jobs, done them, and waits for another; if
     /// that's every job it was sent, the user's next queued turn goes to it.
@@ -62,6 +62,10 @@ pub enum Msg {
     Queued { id: u64, text: Option<String>, reply: Sender<Result<(), String>> },
     /// From the session's thread: a call waits for what the partner tells it next.
     Await(Sender<Heard>),
+    /// From the session's thread: its turn, a step's calls done, takes in the user's messages queued
+    /// meanwhile; answered with them, in order: those at the queue's front that are messages (a
+    /// continue, and what's queued after it, waits for the turn's end).
+    Take(Sender<Vec<String>>),
     /// The session's companion made (companion::make): the two are paired, Auto on; answered with
     /// whether the back-and-forth needs starting (no turn here has yet to hand over its end).
     Pair(String, Sender<Result<bool, String>>),
@@ -345,6 +349,15 @@ impl Live {
                 Err(SendError(heard)) => self.handle(app, name, Msg::Job(Job::Hear(heard), reply)), // the call has stopped waiting
             },
             Msg::Await(waiting) => self.awaiting = Some(waiting),
+            Msg::Take(reply) => {
+                let mut taken = vec![];
+                while let Some(text) = self.queued.front().and_then(|q| q.text.clone()) {
+                    self.queued.pop_front();
+                    taken.push(text);
+                }
+                let _ = reply.send(taken);
+                self.show_queue();
+            }
             Msg::Pair(companion, reply) => {
                 let paired = settings::change(&app.profile_path(name), |s: &mut SessionSettings| match s.partner() {
                     Some(partner) => Err(format!("{name} is paired with {partner} already")),

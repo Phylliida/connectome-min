@@ -4,7 +4,8 @@
 //! to write the session's log. A turn's chat message joins the log, then the turn takes steps until a
 //! reply calls no tools and the partner has told it nothing more, each reading the settings again:
 //! the context compiles and streams from disk into the request, the reply joins the log, and the tools
-//! it calls run, each once the user allows it, their results joining the log. The turn's end goes to
+//! it calls run, each once the user allows it, their results joining the log, then the user's
+//! messages queued meanwhile, which would otherwise wait for the turn's end. The turn's end goes to
 //! the partner (companion.rs), then memories form; they form between steps too. After a step that ran
 //! tools, the hub looks at the boards the session is on again (boards.rs). The thread tells the
 //! hub what the pages following the job see (Msg). The user can stop a turn: it ends where it is
@@ -335,7 +336,9 @@ impl Worker<'_> {
     /// A chat turn: the log mended if the server stopped in a step (mend), its message joins the log,
     /// then steps run, as many as it takes, until a reply answers (calls no tools, and its reasoning
     /// didn't loop: then the next step goes on from it) and the partner has told the session nothing
-    /// more (deliver), or the user stops it, or LOOPS replies in a row loop. Without a message, the turn continues the
+    /// more (deliver), or the user stops it, or LOOPS replies in a row loop. After a step's calls, the
+    /// user's messages queued meanwhile join the turn (take_queued); those queued when it answers wait
+    /// for its end, turns of their own. Without a message, the turn continues the
     /// log as it is: after an interruption the context ends with the user's message or the tool
     /// results, and after a reply cut short with that reply, which the Messages API continues (a
     /// prefill).
@@ -358,6 +361,7 @@ impl Worker<'_> {
             let stepped = self.step()?;
             loops = if stepped == Stepped::Looped { loops + 1 } else { 0 };
             if loops == LOOPS { return Err(LOOPED.into()) }
+            if stepped == Stepped::Called { self.take_queued()? }
             if !self.deliver()? && stepped == Stepped::Answered { return Ok(()) }
         }
     }
@@ -392,6 +396,17 @@ impl Worker<'_> {
         }
         if heard { self.logged() }
         Ok(heard)
+    }
+
+    /// The user's messages queued while the turn ran (Msg::Take) join the log, each as its own message,
+    /// after the step's calls' results, so the next step sees them rather than the turn after it.
+    fn take_queued(&self) -> Result<(), String> {
+        let taken: Vec<String> = self.app.ask_session(self.name, Msg::Take);
+        for text in &taken {
+            append(&self.s, &said("user", text.clone()), &self.app.profile(self.name)?.config);
+        }
+        if !taken.is_empty() { self.logged() }
+        Ok(())
     }
 
     /// The turn that started at message `start` and `ended` so, to the session's partner, if it has
