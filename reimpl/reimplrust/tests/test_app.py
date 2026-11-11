@@ -1396,6 +1396,65 @@ def spliced(tls, ca) -> str:
         mock.shutdown()
 
 
+def moved(tls, ca) -> str:
+    """Sessions moved to another root, the app started on it: a fork, and a fork of it, still share
+    their parents' messages, their fork.json naming each parent by its path relative to the fork's. A
+    fork.json from before, naming its parent by its old absolute path, is repaired as it's read, to the
+    session of that name beside the fork, past an empty folder at the old path (as opening a stale path
+    once left behind). A fork whose parent is nowhere (named by an absolute path, where only an empty
+    folder stands and none of its name beside the fork, or by a relative path where nothing is) is
+    listed with the rest, and reading it says where its parent was looked for, without making a folder
+    there."""
+    port, root, mock_port = free_port(), tempfile.mkdtemp(), free_port()
+    mock = serve(mock_port, tls)
+    app = launch(root, port, ca, '--no-bash')
+    try:
+        configure(root, f'https://localhost:{mock_port}', 20000, 2000, 1000)
+        call(port, '/api/sessions', {'name': 'trunk'})
+        for t in range(3):
+            say(port, 'trunk', f'echo trunk {t}')
+        call(port, '/api/s/trunk/fork', {'at': 3, 'name': 'twig'})
+        say(port, 'twig', 'echo on the twig')
+        call(port, '/api/s/twig/fork', {'at': 5, 'name': 'leaf'})
+        call(port, '/api/s/trunk/fork', {'at': 1, 'name': 'lost'})
+        call(port, '/api/s/trunk/fork', {'at': 1, 'name': 'orphan'})
+        before = {name: call(port, f'/api/s/{name}/messages?from=0') for name in ('trunk', 'twig', 'leaf')}
+        parents = lambda at: {name: json.loads(Path(at, name, 'fork.json').read_text())['parent'] for name in ('twig', 'leaf', 'lost')}
+        if parents(root) != {'twig': '../trunk', 'leaf': '../twig', 'lost': '../trunk'}:
+            raise SystemExit(f'forks name their parents {parents(root)}')
+    finally:
+        app.terminate()
+        app.wait()
+    new, port, gone = os.path.join(tempfile.mkdtemp(), 'moved'), free_port(), os.path.join(tempfile.mkdtemp(), 'gone')
+    shutil.move(root, new)
+    for name, parent in (('twig', os.path.join(root, 'trunk')), ('lost', gone), ('orphan', '../nowhere')):   # twig's and lost's as fork.json named a parent before
+        meta = Path(new, name, 'fork.json')
+        meta.write_text(json.dumps({**json.loads(meta.read_text()), 'parent': parent}))
+    for empty in (Path(root, 'trunk'), Path(gone)):                     # empty folders a stale path left
+        empty.mkdir(parents=True)
+    app = launch(new, port, ca, '--no-bash')
+    try:
+        after = {name: call(port, f'/api/s/{name}/messages?from=0') for name in ('trunk', 'twig', 'leaf')}
+        if after != before or len(after['leaf']) != 6:
+            raise SystemExit(f'moved, the sessions hold {[len(m) for m in after.values()]} messages, not {[len(m) for m in before.values()]}')
+        if parents(new) != {'twig': '../trunk', 'leaf': '../twig', 'lost': gone} or os.listdir(Path(root, 'trunk')) or os.listdir(gone):
+            raise SystemExit(f'moved, the forks name their parents {parents(new)}')
+        listed = {s['name']: s['messages'] for s in call(port, '/api/sessions')}
+        if (listed.get('lost'), listed.get('orphan')) != (2, 2):
+            raise SystemExit(f'forks whose parents are nowhere are listed {listed}')
+        for name, expected in (('lost', f'{gone}, isn\'t there, nor a session of its name beside the fork'), ('orphan', 'the fork\'s parent, ../nowhere, isn\'t there')):
+            r, events = following(port, name, start=None)
+            with r:
+                told = next(events).get('broken', '')
+            if expected not in told or os.path.exists(os.path.join(new, 'nowhere')):
+                raise SystemExit(f'reading {name}, whose parent is nowhere, told {told!r}')
+        return 'a moved fork and its fork kept their histories, an old fork.json was repaired, a lost parent was named'
+    finally:
+        app.terminate()
+        mock.shutdown()
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def chatted(turns, tls, ca, baseline) -> str:
     """The long chat, the fork and the settings; the main session's price multiplier goes to `baseline`."""
     mock_port, plain_port, port, root = free_port(), free_port(), free_port(), tempfile.mkdtemp()
@@ -2392,7 +2451,8 @@ def main(turns=60):
     parts = {'chat': lambda: chatted(turns, (cert, key), ca, baseline), 'tools': lambda: tooled((cert, key), ca, baseline), 'large': lambda: streamed_large((cert, key), ca),
              'companion': lambda: accompanied((cert, key), ca), 'lifted': lambda: lifted((cert, key), ca), 'channels': lambda: channeled((cert, key), ca),
              'boards': lambda: boarded((cert, key), ca), 'gateway': lambda: gatewayed((cert, key), ca),
-             'claude': lambda: clauded((cert, key), ca), 'fold': lambda: folded((cert, key), ca), 'spliced': lambda: spliced((cert, key), ca)}
+             'claude': lambda: clauded((cert, key), ca), 'fold': lambda: folded((cert, key), ca), 'spliced': lambda: spliced((cert, key), ca),
+             'moved': lambda: moved((cert, key), ca)}
     running = [forked.Process(target=part, args=(name, run, done)) for name, run in parts.items()]
     summaries, totals, failure = {}, {'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0}, None
     try:
@@ -2417,7 +2477,7 @@ def main(turns=60):
         print(failure)
         return 1
     print(f'{totals["chat"]} chat turns and {totals["memory"]} memory requests; {summaries["chat"]}; {totals["bytes"] // 1024} KB of requests streamed '
-          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}; {summaries["gateway"]}; {summaries["claude"]}; {summaries["fold"]}; {summaries["spliced"]}')
+          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}; {summaries["gateway"]}; {summaries["claude"]}; {summaries["fold"]}; {summaries["spliced"]}; {summaries["moved"]}')
     return 0
 
 

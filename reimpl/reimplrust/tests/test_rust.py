@@ -61,7 +61,7 @@ def python(r, folder: str, snapshot: str | None = None) -> tuple[list, dict]:
     for t in range(PASSES):
         now[0], before, fork = t, os.path.basename(s.path), None
         if t == HANDOFF and snapshot:
-            copy(folder, snapshot)
+            shutil.copytree(folder, snapshot)                       # forks name their parents relatively, so the copy's stay in it
         if r.random() < 0.02 and (n := s.count('messages')) > 2:
             fork = [r.randrange(n), f'fork{t}']
             s = Session.fork(s, fork[0], os.path.join(folder, fork[1]))
@@ -162,24 +162,15 @@ def tail(script: dict, h: int) -> dict:
     return {**script, 'start': first['before'], 'passes': script['passes'][h:], 'replies': script['replies'][first['replies']:]}
 
 
-def copy(folder: str, to: str) -> None:
-    """A session folder's copy, its forks' parents in the copy."""
-    shutil.copytree(folder, to)
-    for meta in Path(to).rglob('fork.json'):
-        fork = json.loads(meta.read_text())
-        meta.write_text(json.dumps({**fork, 'parent': fork['parent'].replace(os.path.abspath(folder), os.path.abspath(to))}))
-
-
 def passes(events: list, lo: int, hi: int) -> list:
     return [e for e in events if lo <= int(e[0].split()[1]) < hi]
 
 
 def files(folder: str) -> dict:
-    """Every record of every file, fork.json without the parent's path."""
+    """Every record of every file, fork.json's too, whose parent is a path relative to the fork."""
     out = {}
     for path in sorted(Path(folder).rglob('*.json*')):
-        records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-        out[str(path.relative_to(folder))] = [{k: v for k, v in r.items() if k != 'parent'} for r in records]
+        out[str(path.relative_to(folder))] = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     return out
 
 

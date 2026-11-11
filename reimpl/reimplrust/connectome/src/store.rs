@@ -14,19 +14,20 @@
 //!   attempts.jsonl   memory attempts that failed: {id, target, messages, outcome}
 //!
 //! A fork (Session::fork) shares its parent's history through one message: fork.json names the
-//! parent and, per file, how many of the parent's records the fork shares (the messages through that
-//! one, and the chunks and memories that end by then). The fork's own records continue those ids.
+//! parent, by its path relative to the fork's, so sessions moved together stay linked, and, per file,
+//! how many of the parent's records the fork shares (the messages through that one, and the chunks and
+//! memories that end by then). The fork's own records continue those ids.
 //!
 //! The session is the only writer of its files. A failed read or write of a file panics: the store
 //! is the session's memory, and nothing can go on without it.
 
 use crate::{estimate::Priced, json::{self, Json, Value}, obj};
-use std::{cell::RefCell, collections::{HashMap, HashSet}, fs::{self, File, OpenOptions}, path::{Path, PathBuf}, rc::Rc};
+use std::{cell::RefCell, collections::{HashMap, HashSet}, fs::{self, File, OpenOptions}, path::{Component, Path, PathBuf}, rc::Rc};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 
 pub struct Session {
     pub path: PathBuf,
-    parent: Option<Box<Session>>,
+    parent: Option<Result<Box<Session>, String>>, // a fork's parent, or why it isn't there
     pub fork: Value, // fork.json: {parent, at, shared: {file: records shared}}, or null
     counts: RefCell<HashMap<String, (u64, u64)>>, // file -> (its size, its count) when last counted
     repaired: RefCell<HashSet<String>>,
@@ -34,14 +35,74 @@ pub struct Session {
     pub(crate) priced: RefCell<HashMap<u64, Rc<Priced>>>,
 }
 
+/// Where fork `path`'s parent is, by its fork.json, or why it isn't there. A fork.json from before
+/// parents were named relatively names it by an absolute path, which moving the sessions leaves
+/// stale; it's repaired as it's read: the parent is the session of that name beside the fork (the two
+/// moved together), or else the one at that path, and fork.json then names it relatively. A folder is
+/// a session if it has a log of messages or is a fork; an empty one isn't, as opening a stale path
+/// once left behind. No folder is made for a parent that isn't there.
+fn parent_of(path: &Path, fork: &mut Value) -> Result<PathBuf, String> {
+    let named = PathBuf::from(fork["parent"].as_str().expect("fork.json parent"));
+    let session = |dir: &Path| dir.join("messages.jsonl").is_file() || dir.join("fork.json").is_file();
+    let missing = |looked: &str| format!("{}: the fork's parent, {}, isn't there{looked}", path.join("fork.json").display(), named.display());
+    if named.is_relative() {
+        let dir = normal(&path.join(&named));
+        return if session(&dir) { Ok(dir) } else { Err(missing("")) };
+    }
+    let beside = named.file_name().and_then(|name| path.parent().map(|up| up.join(name)));
+    let found = [beside, Some(named.clone())].into_iter().flatten().find(|dir| session(dir)).ok_or_else(|| missing(", nor a session of its name beside the fork"))?;
+    fork["parent"] = relative(&found, path).to_string_lossy().as_ref().into();
+    write_fork(path, fork);
+    Ok(normal(&found))
+}
+
+/// A fork's fork.json written, whole or not at all.
+fn write_fork(path: &Path, fork: &Value) {
+    let (meta, new) = (path.join("fork.json"), path.join("fork.json.new"));
+    fs::write(&new, json::to_string(fork)).and_then(|()| fs::rename(&new, &meta)).expect("fork.json");
+}
+
+/// `to` as a path relative to `from`, both made absolute by name, as Python's os.path.relpath makes it.
+fn relative(to: &Path, from: &Path) -> PathBuf {
+    let absolute = |p: &Path| normal(&std::path::absolute(p).expect("a path"));
+    let (to, from) = (absolute(to), absolute(from));
+    let common = to.components().zip(from.components()).take_while(|(a, b)| a == b).count();
+    let up = from.components().skip(common).map(|_| Component::ParentDir);
+    let path: PathBuf = up.chain(to.components().skip(common)).collect();
+    if path.as_os_str().is_empty() { PathBuf::from(".") } else { path }
+}
+
+/// A path with its `.` and `..` resolved by name, as Python's os.path.normpath resolves them.
+fn normal(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(out.components().next_back(), Some(Component::Normal(_))) => { out.pop(); }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 impl Session {
     pub fn open(path: impl AsRef<Path>) -> Session {
         let path = path.as_ref().to_path_buf();
         fs::create_dir_all(&path).expect("session directory");
         let meta = path.join("fork.json");
-        let fork = if meta.exists() { json::parse(&fs::read(&meta).expect("fork.json")).expect("fork.json") } else { Value::Null };
-        let parent = (!fork.is_null()).then(|| Box::new(Session::open(fork["parent"].as_str().expect("fork.json parent"))));
+        let mut fork = if meta.exists() { json::parse(&fs::read(&meta).expect("fork.json")).expect("fork.json") } else { Value::Null };
+        let parent = (!fork.is_null()).then(|| parent_of(&path, &mut fork).map(|dir| Box::new(Session::open(dir))));
         Session { path, parent, fork, counts: RefCell::default(), repaired: RefCell::default(), priced: RefCell::default() }
+    }
+
+    /// A fork's parent. Reading what a fork shares when its parent isn't there panics, saying where it
+    /// was looked for.
+    fn parent(&self) -> &Session {
+        match &self.parent {
+            Some(Ok(parent)) => parent,
+            Some(Err(why)) => panic!("{why}"),
+            None => unreachable!("only a fork shares records"),
+        }
     }
 
     /// A new session at `path` whose history is `parent`'s through message `at`. It starts from the
@@ -54,9 +115,7 @@ impl Session {
         }
         let path = path.as_ref();
         fs::create_dir_all(path).expect("fork directory");
-        let parent_path = std::path::absolute(&parent.path).expect("parent path");
-        let meta = obj! {"parent" => parent_path.to_string_lossy().as_ref(), "at" => at, "shared" => shared};
-        fs::write(path.join("fork.json"), json::to_string(&meta)).expect("fork.json");
+        write_fork(path, &obj! {"parent" => relative(&parent.path, path).to_string_lossy().as_ref(), "at" => at, "shared" => shared});
         let child = Session::open(path);
         let last = parent.last("compiles").unwrap_or(obj! {});
         let frontier: Vec<Value> = last["frontier"].arr().iter().take_while(|node| node.arr()[1].u64() < child.shared(&format!("layer{}", node.arr()[0].u64()))).cloned().collect();
@@ -73,7 +132,7 @@ impl Session {
     pub fn last(&self, name: &str) -> Option<Value> {
         match last_line(&self.file(name), u64::MAX) {
             Some(line) => Some(json::parse(&line).expect("a record")),
-            None => (self.shared(name) > 0).then(|| self.parent.as_ref().unwrap().read(name, self.shared(name) - 1)),
+            None => (self.shared(name) > 0).then(|| self.parent().read(name, self.shared(name) - 1)),
         }
     }
 
@@ -101,7 +160,7 @@ impl Session {
     /// Records first..=last, in order, read as they're iterated.
     pub fn span(&self, name: &str, first: u64, last: u64) -> Box<dyn Iterator<Item = Value> + '_> {
         let (n, start) = (self.shared(name), first.max(self.shared(name)));
-        let inherited = self.parent.as_ref().filter(|_| first < n && first <= last).map(|parent| parent.span(name, first, last.min(n - 1)));
+        let inherited = (first < n && first <= last).then(|| self.parent().span(name, first, last.min(n - 1)));
         let own = (start <= last).then(|| self.scan(name, start).take_while(move |r| r.id() <= last));
         Box::new(inherited.into_iter().flatten().chain(own.into_iter().flatten()))
     }
@@ -226,5 +285,20 @@ fn repair(path: &Path) {
         file.set_len(start).expect("truncate");
     } else if end == size {
         file.seek(SeekFrom::Start(size)).and_then(|_| file.write_all(b"\n")).expect("write");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_relative_and_normal_as_python_makes_them() {
+        assert_eq!(relative(Path::new("/a/b/trunk"), Path::new("/a/b/twig")), Path::new("../trunk"));
+        assert_eq!(relative(Path::new("/a/b"), Path::new("/a/b/fork")), Path::new(".."));
+        assert_eq!(relative(Path::new("/a/x/../b"), Path::new("/a/c/d")), Path::new("../../b"));
+        assert_eq!(relative(Path::new("/a"), Path::new("/a")), Path::new("."));
+        assert_eq!(normal(Path::new("s/twig/./../trunk")), Path::new("s/trunk"));
+        assert_eq!(normal(Path::new("../s/../t")), Path::new("../t"));
     }
 }

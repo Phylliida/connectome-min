@@ -115,6 +115,12 @@ since one holds the keys:
 - `ROOT/NAME/draft.json`: the message you're writing to the session, as a JSON string, saved as you
   type it (one save at a time, the newest text next) and emptied as you send it, so each session
   keeps its own and a page opening the session, here or on another device, puts it back in the box.
+- `ROOT/NAME/fork.json`, in a session forked from another: its parent, by its path relative to the
+  fork's (so `ROOT` can be moved or copied whole), the message it was forked at, and how many of the
+  parent's records it shares. One from before, naming the parent by an absolute path a move leaves
+  stale, is repaired as the session is read: the parent is the session of that name beside the fork,
+  else the one at that path (an empty folder there isn't one). A fork whose parent is nowhere is still
+  listed, and reading it says where its parent was looked for.
 
 Tools (`app/src/tools/`): the model can call `bash` (a command in a new shell in the session's
 workspace, or `cmd` on Windows; `--no-bash` leaves it out), `edit` (a file in the workspace changed

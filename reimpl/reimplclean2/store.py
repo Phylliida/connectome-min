@@ -10,8 +10,9 @@ state is the logs' tails:
   compiles.jsonl   one record per compile: the frontier shown, calibration, cache keys, escalation
   attempts.jsonl   memory attempts that failed: {id, target, messages, outcome}
 
-A fork (Session.fork) shares its parent's history through one message: fork.json names the parent and,
-per file, how many of the parent's records the fork shares (the messages through that one, and the
+A fork (Session.fork) shares its parent's history through one message: fork.json names the parent, by
+its path relative to the fork's, so sessions moved together stay linked, and, per file, how many of the
+parent's records the fork shares (the messages through that one, and the
 chunks and memories that end by then). The fork's own records continue those ids.
 """
 import json
@@ -31,7 +32,7 @@ class Session:
         self.get = lru_cache(maxsize=cached)(self.read)       # records never change once written
         meta = os.path.join(path, 'fork.json')
         fork = json.load(open(meta)) if os.path.exists(meta) else {}
-        self.parent, self.shared = Session(fork['parent'], cached) if fork else None, fork.get('shared', {})
+        self.parent, self.shared = Session(os.path.normpath(os.path.join(path, fork['parent'])), cached) if fork else None, fork.get('shared', {})
 
     @classmethod
     def fork(cls, parent: 'Session', at: int, path: str) -> 'Session':
@@ -42,7 +43,7 @@ class Session:
             shared[f'layer{n}'] = bisect_left(range(parent.count(f'layer{n}')), True, key=lambda i: parent.get(f'layer{n}', i)['last'] > at)
         os.makedirs(path, exist_ok=True)
         with open(os.path.join(path, 'fork.json'), 'w') as f:
-            json.dump({'parent': os.path.abspath(parent.path), 'at': at, 'shared': shared}, f)
+            json.dump({'parent': os.path.relpath(parent.path, path), 'at': at, 'shared': shared}, f)
         child, last = cls(path), parent.last('compiles') or {}
         frontier = list(takewhile(lambda node: node[1] < shared.get(f'layer{node[0]}', 0), last.get('frontier', [])))
         child.append('compiles', {'frontier': frontier, 'multiplier': last.get('multiplier', 1.0), 'armed': 0, 'keys': None, 'escalated': False})
