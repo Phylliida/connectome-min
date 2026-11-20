@@ -1,8 +1,9 @@
 # KV splice: building a request's cache from pieces
 
 For the Kimi-K3 server (the llama.cpp fork run by `./run-kimi.sh` at http://127.0.0.1:8091) and connectome-web. Proposed
-2026-11-09; the server has it since 2026-11-10 as `POST /kv/splice2` (also `/kv/splice` with a `request` body), with the
-changes listed under "The server's implementation". It replaces the span-for-span form of `POST /kv/splice`.
+2026-11-09; the server has it since 2026-11-10 as `POST /kv/splice2` (also `/kv/splice` with a `request` body), and the
+form connectome-web sends (`sources`, pieces by index) since 2026-11-20, with the changes listed under "The server's
+implementation". It replaces the span-for-span form of `POST /kv/splice`.
 
 ## Why
 
@@ -112,13 +113,20 @@ Where the server built on K3 departs from the above:
 - Anchor alignment: a piece starts at the first token boundary within the anchor's first 64 characters that both sides
   share, since a tokenizer can glue the character before an anchor onto its first word on one side only. Exact token
   equality still decides how far a piece runs.
-- `max_advance` (default 2048 tokens): the furthest a checkpoint is advanced, for pieces and for the prefix; past that,
-  the nearer checkpoint's state is used as it is.
-- A checkpoint is stored at each placed piece's end, so later rollbacks stay cheap.
+- Recurrent state (since 2026-11-20): a piece takes its source's state only where that state is exact, when the piece
+  runs to the source's cached end or a checkpoint sits at the piece's end. Only the last piece's state stays in the
+  slot, so only it falls back to the latest checkpoint before its end, advanced or used as it is. After any other piece
+  the gap starts from the state built so far. Advancing a state for every piece cost up to `max_advance` tokens of
+  evaluation per piece, more than a fold of one piece per message saves, for the few tokens of the gap that follows.
+- `max_advance` (default 2048 tokens): the furthest a checkpoint is advanced, for the last piece and for the prefix;
+  past that, the nearer checkpoint's state is used as it is.
+- A checkpoint is stored at the end of each piece that took a state of its own, so later rollbacks stay cheap (not at
+  every piece: the slot keeps at most 32 checkpoints, and a fold can have hundreds of pieces).
+- Each source is loaded once, however many pieces it gives. A piece's `src` is an index in `sources` or a source
+  inline (`sources` and indices since 2026-11-20).
 - Reply keys are recorded at each completion and saved to `reply-keys.jsonl` beside the disk cache, so they survive
-  restarts; only replies generated since the feature exists are known.
-- Pieces name their sources inline only; `sources` with pieces by index (2026-11-10, which connectome-web sends) is
-  still to come.
+  restarts; only replies generated since the feature exists are known. A reply cut off at `max_tokens` can't be a
+  source: its last token has no cache entry, so its full text is not in the conversation.
 - The response also has `prefix_recurrent` and a `timing_ms` breakdown.
 
 ## Response (200)
@@ -144,6 +152,7 @@ Where the server built on K3 departs from the above:
 ## Errors (HTTP 400, nothing changed)
 
 - `request` is missing, or a body doesn't render.
+- A piece's `src` is neither an index in `sources` nor a source.
 - `request` or a source contains images.
 - A request is running.
 
