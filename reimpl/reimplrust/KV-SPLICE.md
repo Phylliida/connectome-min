@@ -164,8 +164,8 @@ gives a piece for each text block of `request` after the cached prefix whose tex
 message, an assistant's text, a tool result's text. A piece runs only to the next anchor, so where both sides render the
 same, consecutive pieces cover it end to end, and where they differ, copying starts again at the next text block.
 Sources follow one rule: a memory's text comes from the conversation that wrote it (`{"reply": its text}`); raw messages
-come from the main session's last request, or, in a merge, from the conversation that wrote the member's L1, which
-showed the chunk raw.
+come from the main session's last request, or from the conversation that wrote their chunk's L1, which showed the chunk
+raw. Memory requests copy memories only, since 2026-11-20: their messages are prefilled (see "Checking quality").
 
 Every text block gets an anchor, not only a stretch's first, because memory requests replay messages without the agent's
 reasoning (the library's `raw`, as Anima does), while main requests carry it on the turns that call tools. On K3 the two
@@ -196,9 +196,10 @@ An L1 request for chunk k:
  prefix gap         piece gap        piece gap   pieces       left for the request
 ```
 
-The pieces are `{"reply": M3}` and `{"reply": M4}`, then one from `{"request": the last main request}` per text block of
-the chunk. A merge of L1s takes each member's chunk from `{"reply": that L1's text}`, a piece per text block; a merge of
-higher memories takes their members' texts from `{"reply": ...}` too.
+The pieces are `{"reply": M3}` and `{"reply": M4}`; the chunk is left for the request, which prefills it. (Until
+2026-11-20 the chunk also had a piece per text block from `{"request": the last main request}`, and a merge of L1s took
+each member's chunk from `{"reply": that L1's text}`; see "Checking quality" for why that stopped.) A merge of higher
+memories takes their members' texts from `{"reply": ...}`.
 
 The app keeps the last main request it sent, a list of references to blocks on disk. After the app restarts it has
 none until its next request, so a fold before then is prefilled.
@@ -222,6 +223,19 @@ synthetic session:
 - folds: the log-probabilities of the same continuation, or answers at temperature 0, with and without the call, and
   questions about facts that only the folded messages held;
 - memory requests: memories written with and without the call, and whether a built one tells of events after its chunk.
+
+Results on K3 (2026-11-20, `k3-research/kv-splice` in llm-tests, greedy, thinking off and low):
+
+- A fold matches a fresh prefill (same answer, first-token KL 0.004).
+- The mechanics are exact: a memory request built whole from a copy of itself (only its system prompt differed) wrote the
+  same memory as a fresh prefill, word for word, in two runs (KL 0.025-0.039).
+- A memory request whose chunk is copied from the main session writes the wrong memory: of days 1-8 instead of its
+  chunk's days 5-8. K3 writes a memory only of what its recurrent layers (69 of 93) read, and the copied chunk's
+  attention entries don't suffice. Given no state for the chunk, K3 summarized the recalled memory or looped; given the
+  main session's state at the chunk's end, it summarized every earlier chunk too, since that state read them raw. No
+  cached state has read only the chunk, so memory requests don't copy their messages.
+- Copying the recalled memories alone is harmless: with the chunk prefilled, the memory was right (KL 0.02-0.04), even
+  with the state of the conversation that wrote the recalled memory, which read chunk 1 raw.
 
 connectome-web logs each call's response next to the request it preceded, so a turn that ran on a built cache can be
 told from one that didn't.

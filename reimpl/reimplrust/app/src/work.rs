@@ -101,16 +101,15 @@ impl Setup {
 /// The summarizer, the library's host: the session's model unless the library names one, its system
 /// prompt, so a memory's request starts as the session's do (and a provider's cache of their start
 /// serves both), and the agent's tools, which the library sends with tool choice "none" so a memory's
-/// request can carry tool blocks. On a provider that splices, each request's cache is first built from
-/// pieces of cached conversations (splice). A request its turn's user stops ends at once, as never made
-/// (INTERRUPTED).
+/// request can carry tool blocks. On a provider that splices, the memories a request recalls are first
+/// copied into its cache from the replies that wrote them (splice); the messages it summarizes are
+/// prefilled (see pieces). A request its turn's user stops ends at once, as never made (INTERRUPTED).
 struct Summarizer<'a> {
     setup: &'a Setup,
     stopped: tools::Stopped<'a>,
     ended: Option<(String, f64)>, // how its last reply ended, and the tokens it had
     s: &'a Session,
-    main: Option<&'a Sent>, // the session's last request, which a splice copies messages from
-    spliced: Vec<Value>,    // what the splices before its requests came to
+    spliced: Vec<Value>, // what the splices before its requests came to
 }
 
 /// What forming memories came to: one formed (or a stub), none could, a reply without a memory in it or
@@ -131,7 +130,7 @@ impl Host for Summarizer<'_> {
         let model = if request.model.is_empty() { &self.setup.settings.model } else { &request.model };
         let none = request.tools.as_ref().map(|_| obj! {"type" => "none"});
         let head = sparse(obj! {"model" => model.as_str(), "max_tokens" => request.max_tokens, "system" => request.system.as_deref(), "tools" => request.tools.clone(), "tool_choice" => none});
-        self.spliced.extend(splice(self.setup, self.s, &head, &request.messages, 0, self.main, reader));
+        self.spliced.extend(splice(self.setup, self.s, &head, &request.messages, 0, None, reader));
         let reply = self.setup.llm.messages(head, &request.messages, reader, false, |_| !(self.stopped)(), self.stopped, |_, _| {});
         self.ended = reply.as_ref().ok().map(|r| (r["stopReason"].as_str().unwrap_or("nothing").to_string(), request.max_tokens));
         if (self.stopped)() { Err(INTERRUPTED.into()) } else { reply }
@@ -166,11 +165,14 @@ fn imaged(turns: &[Turn]) -> bool { turns.iter().flat_map(|t| &t.content).any(|b
 /// The pieces a splice copies into a request's cache (KV-SPLICE.md), from its turn `from` on, each its
 /// source's index and the text it starts with, and those sources: a piece for each text (a text block,
 /// or a tool result's) that occurs once among them, from the reply that wrote it, for a memory's, or,
-/// for a message's, from the session's last request (`main`) if that has the message, else from the
-/// reply that wrote the L1 of its chunk, whose request showed the chunk raw. Every text gets one, not
-/// a stretch's first only, since a memory's request shows messages without the agent's reasoning, and
-/// a piece ends where the two differ. What the library writes in a request (labels, markers,
-/// instructions) and messages no source has get none.
+/// in a fold (given the session's last request, `main`), for a message's, from `main` if that has the
+/// message, else from the reply that wrote the L1 of its chunk, whose request showed the chunk raw.
+/// Every text gets one, not a stretch's first only, since a piece ends where the two sides differ. What
+/// the library writes in a request (labels, markers, instructions) and messages no source has get none.
+/// A memory's request (no `main`) copies memories only: K3 writes a memory only of what its recurrent
+/// layers (69 of its 93) read, and a copied chunk brings none to read but the main session's state, which
+/// read every earlier chunk raw too, so a memory of chunk 2 told of days 1-8 instead of 5-8
+/// (k3-research/kv-splice/README.md in llm-tests, 2026-11-20).
 fn pieces<'a>(s: &Session, turns: &[Turn], from: usize, main: Option<&'a Sent>, reader: &mut Reader) -> (Vec<Source<'a>>, Vec<(usize, String)>) {
     let reply = |file: &str, id: u64| answer(&s.read(file, id)).iter().filter(|b| b.kind() == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n");
     let shown: HashSet<(u64, usize)> = main.iter().flat_map(|m| &m.turns).flat_map(|t| &t.content).filter_map(|b| match &b.at { At::Disk(file, id, j, _) if file == "messages" => Some((*id, *j)), _ => None }).collect();
@@ -179,6 +181,7 @@ fn pieces<'a>(s: &Session, turns: &[Turn], from: usize, main: Option<&'a Sent>, 
     for b in turns.iter().skip(from).flat_map(|t| carried(t, false)) {
         let source = match &b.at {
             At::Disk(file, id, _, _) if file.starts_with("layer") => Some(Some(reply(file, *id))),
+            At::Disk(file, _, _, _) if file == "messages" && main.is_none() => None,
             At::Disk(file, id, j, _) if file == "messages" && shown.contains(&(*id, *j)) => Some(None),
             At::Disk(file, id, _, _) if file == "messages" => {
                 let chunks = chunks.get_or_insert_with(|| (0..s.count("layer1")).map(|k| s.read("layer1", k)).map(|m| (m["first"].u64(), m["last"].u64())).collect());
@@ -581,8 +584,7 @@ impl Worker<'_> {
                 (drive(&self.s, &mut remembering, cfg), remembering.ended, vec![])
             }
             None => {
-                let main = self.sent.borrow();
-                let mut summarizer = Summarizer { setup, stopped: &|| self.stopped(), ended: None, s: &self.s, main: main.as_ref(), spliced: vec![] };
+                let mut summarizer = Summarizer { setup, stopped: &|| self.stopped(), ended: None, s: &self.s, spliced: vec![] };
                 (drive(&self.s, &mut summarizer, cfg), summarizer.ended, summarizer.spliced)
             }
         };
