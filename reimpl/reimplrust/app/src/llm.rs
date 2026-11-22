@@ -16,7 +16,6 @@ pub struct Llm {
     pub key: String,
     pub agent: ureq::Agent,
     pub spent: Cell<Usage>, // what its replies used since it was last taken
-    pub splice: bool,       // whether the server builds a request's cache from pieces of cached conversations (splice)
 }
 
 /// What replies used, as their providers report it: dollars, if a provider prices them (OpenRouter

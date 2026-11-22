@@ -1344,14 +1344,17 @@ def unmarked(value):
 
 
 def spliced(tls, ca) -> str:
-    """A session on a provider ticked to splice in the settings (KV-SPLICE.md): before a request that
+    """A session ticked to splice in its settings, or made from a preset that is (KV-SPLICE.md; off in a
+    first run's preset, and a provider's splice from before sessions had theirs counts for nothing and
+    goes at the next write of settings.json): before a request that
     doesn't go on from the last one (the context folded) and before each memory request that recalls a
     memory, the server is asked to build the request's cache from pieces of cached conversations, then
     sent the request itself; each memory's text comes from the reply that wrote it, each message's from
     the session's last request, and every piece starts at a text that occurs once in the request. A
     memory request copies only the memories it recalls: what it summarizes, its chunk's messages or a
-    merge's members (L1s as recall pairs), is prefilled. Memory requests carry the session's system prompt. A splice that fails leaves the turn as it was; ticked off, the
-    provider splices no more, and a request that sends images, which the server can't splice, isn't.
+    merge's members (L1s as recall pairs), is prefilled. Memory requests carry the session's system
+    prompt. A splice that fails leaves the turn as it was; ticked off, the session splices no more, and
+    a request that sends images, which the server can't splice, isn't.
     The costs log keeps what each splice came to."""
     port, root, mock_port, work = free_port(), tempfile.mkdtemp(), free_port(), tempfile.mkdtemp()
     mock = serve(mock_port, tls)
@@ -1367,12 +1370,14 @@ def spliced(tls, ca) -> str:
         configure(root, f'https://localhost:{mock_port}/v1', 4000, 400, 200)   # its splices go to /kv/splice
         everything = json.loads(Path(root, 'settings.json').read_text())
         everything['presets']['default']['questions'] = False
+        everything['providers']['default']['splice'] = True                 # as the provider's tick was saved before sessions had theirs
         Path(root, 'settings.json').write_text(json.dumps(everything))
-        call(port, '/api/settings', {'name': 'default', 'splice': True})
-        if call(port, '/api/settings')['providers'][0].get('splice') is not True or json.loads(Path(root, 'settings.json').read_text())['providers']['default'].get('splice') is not True:
-            raise SystemExit('the provider ticked to splice does not')
         call(port, '/api/sessions', {'name': 'spliced'})
-        call(port, '/api/s/spliced/settings', {'system': system})
+        if everything['presets']['default'].get('splice') is not False or call(port, '/api/s/spliced')['settings'].get('splice') is not False:
+            raise SystemExit(f'a first run\'s preset splices ({everything["presets"]["default"].get("splice")}), or a session made from it does')
+        call(port, '/api/s/spliced/settings', {'system': system, 'splice': True})
+        if json.loads(Path(root, 'spliced', 'session_settings.json').read_text()).get('splice') is not True:
+            raise SystemExit('the session ticked to splice does not')
         memory = lambda r: 'Write the memory' in json.dumps(r['messages'][-1]) or 'consolidate' in json.dumps(r['messages'][-1])
         texts = lambda r: [c['text'] if 'text' in c else c['content'] for m in r['messages'] for b in m['content'] for c in [b, *(b['content'] if isinstance(b.get('content'), list) else [])] if c['type'] == 'text' or isinstance(c.get('content'), str)]
         asks = re.compile(r'\[CM\] Recall memory L(\d+)-\d+\.')
@@ -1437,7 +1442,10 @@ def spliced(tls, ca) -> str:
         if not splices['main'] or not splices['memory'] or not merged:
             raise SystemExit(f'splices before {splices["main"]} folded requests and {splices["memory"]} memory requests; {merged} members of merges prefilled')
         seen['wire'] = []                                                # merged by count, a merge shows its L1s' chunks raw, prefilled too
-        call(port, '/api/sessions', {'name': 'counted'})
+        call(port, '/api/presets', {'name': 'splicing', 'from': 'default', 'set': {'splice': True}})   # a session made from a preset that splices does
+        if 'splice' in json.loads(Path(root, 'settings.json').read_text())['providers']['default']:
+            raise SystemExit('settings.json keeps a provider\'s splice once written again')
+        call(port, '/api/sessions', {'name': 'counted', 'preset': 'splicing'})
         call(port, '/api/s/counted/settings', {'system': system, 'config': {'merge_by_count': True, 'merge_threshold': 3}})
         turns(16, 0, 'counted')
         _, _, counted = check(seen['wire'])
@@ -1454,11 +1462,11 @@ def spliced(tls, ca) -> str:
         imaged = lambda r: '"type": "image"' in json.dumps(r)
         if not any(kind == 'messages' and imaged(r) for kind, r in wire[imaging:]) or any(kind == 'splice' and imaged(s) for kind, s in wire):
             raise SystemExit('no request sent an image, or a splice had one')
-        call(port, '/api/settings', {'name': 'default', 'splice': False})
+        call(port, '/api/s/spliced/settings', {'splice': False})
         ticked_off = len(wire)
         turns(6, 40)
         if any(kind == 'splice' for kind, _ in wire[ticked_off:]) or not any(kind == 'messages' and memory(r) and r.get('system') == system for kind, r in wire[ticked_off:]):
-            raise SystemExit('a provider ticked off still splices, or its memory requests lost the system prompt')
+            raise SystemExit('a session ticked off still splices, or its memory requests lost the system prompt')
         logged = [s for line in Path(root, 'spliced', 'costs.jsonl').read_text().splitlines() for s in json.loads(line).get('spliced', [])]
         down = [s for s in logged if 'error' in s]
         if len(logged) != sum(kind == 'splice' for kind, _ in wire) or not down or any(s['error'] != 'HTTP 500: {"error": "the splicer is down"}' for s in down) \

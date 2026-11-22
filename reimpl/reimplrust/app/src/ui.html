@@ -843,8 +843,8 @@ function Presets() {
 
 // a provider's card: its base URL and its key (which the page never sees), saved by its button, or, for
 // Claude Code, the command that runs it (settings.json's, shown); its models, saved as each is added
-// (Enter, or +) or taken off (×); whether its server splices, saved as it's ticked; and a button that
-// deletes it, once the user confirms; without `p`, a new provider's, named
+// (Enter, or +) or taken off (×); and a button that deletes it, once the user confirms; without `p`,
+// a new provider's, named
 function Provider({ p }) {
   const card = p?.name ?? '';
   const save = async (e) => {
@@ -870,8 +870,6 @@ function Provider({ p }) {
       <input name="model" placeholder="Add a model, as the provider names it" onKeyDown=${enter} />
       <button type="button" class="add" title="Add the model" aria-label="Add the model" onClick=${add}>+</button>
     </div>`}
-    ${p && !p.command && html`<label title="Its server builds a request's cache from pieces of conversations it has cached, so a fold or a memory's request isn't read again from the start (KV-SPLICE.md: the Kimi-K3 server does)">
-      <input name="splice" type="checkbox" checked=${!!p.splice} onChange=${(e) => provide(card, { name: card, splice: e.target.checked })} /> Splice: build caches from pieces</label>`}
     <div class="buttons">
       ${p && html`<button type="button" class="icon delete" title=${'Delete ' + card} aria-label=${'Delete ' + card} onClick=${forget}>${ICONS.trash()}</button>`}
       <small>${page.settings.notes[card]}</small>
@@ -904,6 +902,7 @@ function SessionForm({ preset }) {
     <label><input name="sandbox" type="checkbox" defaultChecked=${!!s.sandbox} /> ${inClaude ? 'Claude Code' : 'bash'} in the sandbox</label>
     <label title="Off, the model has no tool to ask you questions"><input name="questions" type="checkbox" defaultChecked=${s.questions !== false} /> Questions: the model can ask you</label>
     ${!inClaude && html`<label title="On, the model can look at image files in its workspace (read_image); only for a model that takes images, since an image in its context fails every request to one that doesn't"><input name="images" type="checkbox" defaultChecked=${!!s.images} /> Images: the model can look at them</label>`}
+    ${!inClaude && html`<label title="On, the provider's server is asked to build each folded request's cache, and each memory request's, from pieces of conversations it has cached, so they aren't read again from the start (KV-SPLICE.md); only for a server that can, like the Kimi-K3 one"><input name="splice" type="checkbox" defaultChecked=${!!s.splice} /> Splice: build caches from pieces</label>`}
     <label>Window <input name="window" type="number" defaultValue=${s.window ?? ''} /></label>
     <label>Reply reserve <input name="reserve" type="number" defaultValue=${s.reserve ?? ''} /></label>
     <label title="The oldest this many tokens of the context stay as they were, never folded, and every memory's request starts with them, so memories stay in the model's own voice; fixed once a chunk has closed">Raw head

@@ -85,7 +85,7 @@ impl Setup {
     pub fn new(app: &App, name: &str) -> Result<Setup, String> {
         let (all, settings) = (app.settings()?, app.profile(name)?);
         let p = all.providers.get(&settings.provider).ok_or_else(|| format!("no provider {} in settings.json", settings.provider))?;
-        let llm = Llm { base: p.base.clone(), key: p.key.clone(), agent: app.agent.clone(), spent: Default::default(), splice: p.splice };
+        let llm = Llm { base: p.base.clone(), key: p.key.clone(), agent: app.agent.clone(), spent: Default::default() };
         let boards = boards::of(app, &settings);
         let reach: Vec<PathBuf> = boards.iter().map(|b| app.board_path(b)).collect();
         let mut sandbox = all.sandbox;
@@ -243,7 +243,7 @@ pub struct Sent { head: Value, turns: Vec<Turn> }
 /// request with images, which the server can't splice, or one with no pieces. The request is `head`'s
 /// fields and `turns`; its pieces come from turn `from` on.
 fn splice(setup: &Setup, s: &Session, head: &Value, turns: &[Turn], from: usize, copying: Copying, reader: &mut Reader) -> Option<Value> {
-    if !setup.llm.splice || imaged(turns) { return None }
+    if !setup.settings.splice || imaged(turns) { return None }
     let (sources, pieces) = pieces(s, turns, from, copying, reader);
     if pieces.is_empty() { return None }
     Some(match setup.llm.splice(head, turns, &sources, &pieces, reader) {

@@ -80,8 +80,8 @@ Settings are JSON files you can edit by hand, read again at each use, and only y
 since one holds the keys:
 
 - `ROOT/settings.json`: `providers`, each a name with a `base` URL, a `key`, the `models` the page
-  offers a session on it, and whether its server can `splice` (the page's Settings edits them, adds
-  providers and deletes them, all but those a preset is on; see Splicing below); `presets`, what a new session can start with, by name, each a session's
+  offers a session on it (the page's Settings edits them, adds providers and deletes them, all but
+  those a preset is on); `presets`, what a new session can start with, by name, each a session's
   settings (below) that a new session's file starts as a copy of (the page's new-session dialog
   chooses one, `default` if none is named, and gives the workspace, warning that without one the
   session has no bash or edit; as a workspace's path is typed there, or in a session's settings, the
@@ -102,7 +102,8 @@ since one holds the keys:
   `workspace`, whether bash runs in the `sandbox`, whether the model can ask you `questions` (on
   unless the file says otherwise; off, it has no tool to: no `ask_user`, and Claude Code is run with
   `--disallowedTools AskUserQuestion`), whether its model takes `images` (off unless the file says
-  otherwise; on, it has `read_image`), the tools it always allows (`allow`), its
+  otherwise; on, it has `read_image`), whether its requests are spliced (`splice`, off unless the
+  file says otherwise; see Splicing below), the tools it always allows (`allow`), its
   `window`, `reserve`, the band its prompt folds in (`fold_above` and `fold_to`, always numbers: past
   `fold_above` tokens the context folds, down to `fold_to`; the band the window gives is what it leaves
   the reply, down to `config.slack`, 10%, under that), its `system` prompt, and the library's settings (`config`). A new session's
@@ -274,9 +275,10 @@ smaller. Memory requests carry the session's system prompt too, so they start as
 a provider's cache of that start serves both, and declare the same tools with tool choice "none", as
 the library does, so a memory can cover tool calls.
 
-Splicing: a provider whose `splice` is on (a tick on its card in Settings) has a server that builds a
-request's cache from pieces of conversations it has cached (`KV-SPLICE.md`; the Kimi-K3 llama.cpp
-server does), so a fold or a memory's request isn't read again from the start. Before a request that
+Splicing: a session whose `splice` is on (a tick in its settings, or its preset's, off in a first
+run's) asks its provider's server to build a request's cache from pieces of conversations it has
+cached (`KV-SPLICE.md`; the Kimi-K3 llama.cpp server can), so a fold or a memory's request isn't
+read again from the start; a server that can't fails each call, which changes nothing. Before a request that
 doesn't go on from the session's last one (its context folded) and before each memory request that
 recalls a memory, the app posts the request to `/kv/splice` (at the base, less a trailing `/v1`) with
 a piece for each text in it that occurs there once: a memory's from the reply that wrote it, a
