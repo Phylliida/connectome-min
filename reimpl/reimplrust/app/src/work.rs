@@ -13,7 +13,7 @@
 
 use crate::{api::brief, boards, channels, claude, claude_memory::Remembering, companion::{self, Heard, How}, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{carried, Llm, Piece, Source, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, ask, bash, edit, image, mcp, search, Toolbox}, App};
 use connectome::{blocks::{density_tokens, At}, drive::{append, current, drive}, emit::{answer, select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
-use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, store::Session, turns::Turn};
+use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, planner::Node, store::Session, turns::Turn};
 use std::{cell::{Cell, RefCell}, collections::{HashMap, HashSet, VecDeque}, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
 
 /// A message from `who` of `text`, as the log keeps it.
@@ -102,8 +102,9 @@ impl Setup {
 /// prompt, so a memory's request starts as the session's do (and a provider's cache of their start
 /// serves both), and the agent's tools, which the library sends with tool choice "none" so a memory's
 /// request can carry tool blocks. On a provider that splices, the memories a request recalls are first
-/// copied into its cache from the replies that wrote them (splice); the messages it summarizes are
-/// prefilled (see pieces). A request its turn's user stops ends at once, as never made (INTERRUPTED).
+/// copied into its cache from the replies that wrote them (splice); what it summarizes, a chunk's
+/// messages or a merge's members, is prefilled (see pieces). A request its turn's user stops ends at
+/// once, as never made (INTERRUPTED).
 struct Summarizer<'a> {
     setup: &'a Setup,
     stopped: tools::Stopped<'a>,
@@ -130,7 +131,7 @@ impl Host for Summarizer<'_> {
         let model = if request.model.is_empty() { &self.setup.settings.model } else { &request.model };
         let none = request.tools.as_ref().map(|_| obj! {"type" => "none"});
         let head = sparse(obj! {"model" => model.as_str(), "max_tokens" => request.max_tokens, "system" => request.system.as_deref(), "tools" => request.tools.clone(), "tool_choice" => none});
-        self.spliced.extend(splice(self.setup, self.s, &head, &request.messages, 0, None, reader));
+        self.spliced.extend(splice(self.setup, self.s, &head, &request.messages, 0, Copying::Memory(&request.recalled), reader));
         let reply = self.setup.llm.messages(head, &request.messages, reader, false, |_| !(self.stopped)(), self.stopped, |_, _| {});
         self.ended = reply.as_ref().ok().map(|r| (r["stopReason"].as_str().unwrap_or("nothing").to_string(), request.max_tokens));
         if (self.stopped)() { Err(INTERRUPTED.into()) } else { reply }
@@ -146,9 +147,9 @@ pub struct Sent { head: Value, turns: Vec<Turn> }
 /// a source has images, which the server refuses); None on a provider that doesn't splice, for a
 /// request with images, which the server can't splice, or one with no pieces. The request is `head`'s
 /// fields and `turns`; its pieces come from turn `from` on.
-fn splice(setup: &Setup, s: &Session, head: &Value, turns: &[Turn], from: usize, main: Option<&Sent>, reader: &mut Reader) -> Option<Value> {
+fn splice(setup: &Setup, s: &Session, head: &Value, turns: &[Turn], from: usize, copying: Copying, reader: &mut Reader) -> Option<Value> {
     if !setup.llm.splice || imaged(turns) { return None }
-    let (sources, pieces) = pieces(s, turns, from, main, reader);
+    let (sources, pieces) = pieces(s, turns, from, copying, reader);
     if pieces.is_empty() { return None }
     Some(match setup.llm.splice(head, turns, &sources, &pieces, reader) {
         Ok(a) => {
@@ -162,25 +163,37 @@ fn splice(setup: &Setup, s: &Session, head: &Value, turns: &[Turn], from: usize,
 /// Whether turns hold images (a tool result's too, even as placeholders).
 fn imaged(turns: &[Turn]) -> bool { turns.iter().flat_map(|t| &t.content).any(|b| !b.images.is_empty()) }
 
+/// What a splice copies: in a fold, given the session's last request, its memories and messages; in a
+/// memory's request, only the memories it recalls (Request::recalled), so what it summarizes, a chunk's
+/// messages or a merge's members, is prefilled. K3 writes a memory only of what its recurrent layers
+/// (69 of its 93) read, and a copied piece brings none to read but its source's state: a memory of chunk
+/// 2 copied from the main session, whose state read every earlier chunk raw, told of days 1-8 instead
+/// of 5-8 (k3-research/kv-splice/README.md in llm-tests, 2026-11-20). A merge's members copied would
+/// leave it the state of the conversation that wrote the last of them, which read that one's chunk.
+enum Copying<'a> {
+    Fold(&'a Sent),
+    Memory(&'a [Node]),
+}
+
 /// The pieces a splice copies into a request's cache (KV-SPLICE.md), from its turn `from` on, each its
 /// source's index and the text it starts with, and those sources: a piece for each text (a text block,
-/// or a tool result's) that occurs once among them, from the reply that wrote it, for a memory's, or,
-/// in a fold (given the session's last request, `main`), for a message's, from `main` if that has the
+/// or a tool result's) that occurs once among them and that `copying` copies, from the reply that wrote
+/// it, for a memory's, or, for a message's, from the session's last request (`main`) if that has the
 /// message, else from the reply that wrote the L1 of its chunk, whose request showed the chunk raw.
 /// Every text gets one, not a stretch's first only, since a piece ends where the two sides differ. What
 /// the library writes in a request (labels, markers, instructions) and messages no source has get none.
-/// A memory's request (no `main`) copies memories only: K3 writes a memory only of what its recurrent
-/// layers (69 of its 93) read, and a copied chunk brings none to read but the main session's state, which
-/// read every earlier chunk raw too, so a memory of chunk 2 told of days 1-8 instead of 5-8
-/// (k3-research/kv-splice/README.md in llm-tests, 2026-11-20).
-fn pieces<'a>(s: &Session, turns: &[Turn], from: usize, main: Option<&'a Sent>, reader: &mut Reader) -> (Vec<Source<'a>>, Vec<(usize, String)>) {
+fn pieces<'a>(s: &Session, turns: &[Turn], from: usize, copying: Copying<'a>, reader: &mut Reader) -> (Vec<Source<'a>>, Vec<(usize, String)>) {
+    let main = match copying { Copying::Fold(main) => Some(main), Copying::Memory(_) => None };
     let reply = |file: &str, id: u64| answer(&s.read(file, id)).iter().filter(|b| b.kind() == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n");
     let shown: HashSet<(u64, usize)> = main.iter().flat_map(|m| &m.turns).flat_map(|t| &t.content).filter_map(|b| match &b.at { At::Disk(file, id, j, _) if file == "messages" => Some((*id, *j)), _ => None }).collect();
     let mut chunks: Option<Vec<(u64, u64)>> = None; // each L1's first and last message, read once a message needs them
     let mut found: Vec<(Option<String>, String)> = vec![]; // each text's source (None, the session's last request; else a reply) and itself
     for b in turns.iter().skip(from).flat_map(|t| carried(t, false)) {
         let source = match &b.at {
-            At::Disk(file, id, _, _) if file.starts_with("layer") => Some(Some(reply(file, *id))),
+            At::Disk(file, id, _, _) if file.starts_with("layer") => match copying {
+                Copying::Memory(recalled) if !recalled.contains(&(file["layer".len()..].parse().expect("a layer's number"), *id)) => None,
+                _ => Some(Some(reply(file, *id))),
+            },
             At::Disk(file, _, _, _) if file == "messages" && main.is_none() => None,
             At::Disk(file, id, j, _) if file == "messages" && shown.contains(&(*id, *j)) => Some(None),
             At::Disk(file, id, _, _) if file == "messages" => {
@@ -462,7 +475,7 @@ impl Worker<'_> {
         // and nothing is spliced; if the context folded, its cache is built from pieces first
         let spliced = self.sent.borrow().as_ref().and_then(|last| {
             let kept = last.turns.iter().zip(&turns).take_while(|(a, b)| a.content == b.content).count(); // the same blocks are the same message, its marks aside
-            splice(&setup, s, &head, &turns, kept, Some(last), &mut Reader::new(s, false))
+            splice(&setup, s, &head, &turns, kept, Copying::Fold(last), &mut Reader::new(s, false))
         });
         let reply = setup.llm.messages(head.clone(), &turns, &mut Reader::new(s, false), true, piece, &|| self.stopped(), retrying);
         let reply = reply.map_err(|why| if self.stopped() { STOPPED.into() } else { why })?;

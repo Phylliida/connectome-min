@@ -274,12 +274,15 @@ the library does, so a memory can cover tool calls.
 Splicing: a provider whose `splice` is on (a tick on its card in Settings) has a server that builds a
 request's cache from pieces of conversations it has cached (`KV-SPLICE.md`; the Kimi-K3 llama.cpp
 server does), so a fold or a memory's request isn't read again from the start. Before a request that
-doesn't go on from the session's last one (its context folded) and before each memory request, the
-app posts the request to `/kv/splice` (at the base, less a trailing `/v1`) with a piece for each text
-in it that occurs there once: a memory's from the reply that wrote it, a message's from the session's
-last request, or, once folded out of that, from the reply that wrote its chunk's L1, whose request
-showed the chunk raw (the app keeps the last request while it runs; after a restart a fold before
-the next request isn't spliced). Each text gets its own piece because a memory's request shows the
+doesn't go on from the session's last one (its context folded) and before each memory request that
+recalls a memory, the app posts the request to `/kv/splice` (at the base, less a trailing `/v1`) with
+a piece for each text in it that occurs there once: a memory's from the reply that wrote it, a
+message's from the session's last request, or, once folded out of that, from the reply that wrote its
+chunk's L1, whose request showed the chunk raw (the app keeps the last request while it runs; after a
+restart a fold before the next request isn't spliced). A memory's request copies only the memories it
+recalls, and what it summarizes, its chunk's messages or a merge's members, is prefilled: K3 writes a
+memory only of what its recurrent layers read, and a copied piece brings only its source's state
+(`KV-SPLICE.md`, "Checking quality"). Each text gets its own piece because an L1's request showed the
 messages without the agent's reasoning, and a piece ends where the two differ. A request with images
 isn't spliced. A splice that fails changes nothing: the request goes all the same. The costs log keeps
 what each came to (`spliced` on a step's or memory round's record: the pieces given and placed and the

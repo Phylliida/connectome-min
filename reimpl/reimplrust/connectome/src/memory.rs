@@ -74,6 +74,7 @@ pub struct Request {
     pub model: String,
     pub max_tokens: f64,
     pub tools: Option<Value>,
+    pub recalled: Vec<Node>, // the memories its recall pairs before the task show, oldest first (not a merge's members)
 }
 
 impl Request {
@@ -334,6 +335,7 @@ fn ask(session: &Session, before: u64, task: Vec<Turn>, host: &dyn Host, cfg: &C
         model: cfg.compression_model.clone(),
         max_tokens: cfg.compression_max_tokens.filter(|&c| c > 0.0).unwrap_or_else(|| 16000f64.max(js_round(cfg.summary_target_tokens * 1.5))),
         tools: host.tools().cloned(),
+        recalled: kept,
     }
 }
 

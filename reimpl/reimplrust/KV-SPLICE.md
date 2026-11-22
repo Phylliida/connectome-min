@@ -10,7 +10,8 @@ implementation". It replaces the span-for-span form of `POST /kv/splice`.
 connectome-web folds the main session's context: old messages are replaced by memories the model wrote in separate
 memory requests, and memories merge into higher ones. A fold changes the context right after the head and the older
 memories, so everything after that point is prefilled again, tens of thousands of tokens, while the turn waits. Memory
-requests prefill a lot too: an L1 request reads its chunk again, and a merge of L1s reads their chunks again.
+requests prefill a lot too: an L1 request reads its chunk again, and a merge of L1s reads their chunks again (since
+2026-11-20 only under `merge_by_count`; merging by tokens, it shows each L1 as its recall pair).
 
 Almost all of that text already sits in some cached conversation, computed once:
 
@@ -159,13 +160,14 @@ Where the server built on K3 departs from the above:
 ## How connectome-web uses it
 
 The app (connectome-web's `work.rs`, since 2026-11-10) calls it before a request that a fold changed and before each
-memory request, then sends the request, whatever the call came to; the costs log keeps each call's counts or error. It
+memory request that recalls a memory, then sends the request, whatever the call came to; the costs log keeps each call's counts or error. It
 gives a piece for each text block of `request` after the cached prefix whose text occurs there once: a memory's text, a user
 message, an assistant's text, a tool result's text. A piece runs only to the next anchor, so where both sides render the
 same, consecutive pieces cover it end to end, and where they differ, copying starts again at the next text block.
 Sources follow one rule: a memory's text comes from the conversation that wrote it (`{"reply": its text}`); raw messages
 come from the main session's last request, or from the conversation that wrote their chunk's L1, which showed the chunk
-raw. Memory requests copy memories only, since 2026-11-20: their messages are prefilled (see "Checking quality").
+raw. Memory requests copy only the memories they recall, since 2026-11-20: what they summarize, a chunk's messages or a
+merge's members, is prefilled (see "Checking quality").
 
 Every text block gets an anchor, not only a stretch's first, because memory requests replay messages without the agent's
 reasoning (the library's `raw`, as Anima does), while main requests carry it on the turns that call tools. On K3 the two
@@ -198,8 +200,11 @@ An L1 request for chunk k:
 
 The pieces are `{"reply": M3}` and `{"reply": M4}`; the chunk is left for the request, which prefills it. (Until
 2026-11-20 the chunk also had a piece per text block from `{"request": the last main request}`, and a merge of L1s took
-each member's chunk from `{"reply": that L1's text}`; see "Checking quality" for why that stopped.) A merge of higher
-memories takes their members' texts from `{"reply": ...}`.
+each member's chunk from `{"reply": that L1's text}`; see "Checking quality" for why that stopped.) A merge likewise
+copies only the memories it recalls, and its members, shown as recall pairs (an L1 as its own, a higher memory as its
+members), are prefilled. A piece that copies a whole reply takes that conversation's state, so with its members copied a
+merge would be left the state of the conversation that wrote the last of them, which read that member's chunk raw: the
+failure below, inferred and not run on K3.
 
 The app keeps the last main request it sent, a list of references to blocks on disk. After the app restarts it has
 none until its next request, so a fold before then is prefilled.

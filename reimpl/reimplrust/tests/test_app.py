@@ -1301,12 +1301,12 @@ def unmarked(value):
 
 def spliced(tls, ca) -> str:
     """A session on a provider ticked to splice in the settings (KV-SPLICE.md): before a request that
-    doesn't go on from the last one (the context folded) and before each memory request, the server is
-    asked to build the request's cache from pieces of cached conversations, then sent the request
-    itself; each memory's text comes from the reply that wrote it, each message's from the session's
-    last request, or, once folded out of it, a merge's from the reply that wrote its chunk's L1 (whose
-    request showed it raw), and every piece starts at a text that occurs once in the request. Memory requests
-    carry the session's system prompt. A splice that fails leaves the turn as it was; ticked off, the
+    doesn't go on from the last one (the context folded) and before each memory request that recalls a
+    memory, the server is asked to build the request's cache from pieces of cached conversations, then
+    sent the request itself; each memory's text comes from the reply that wrote it, each message's from
+    the session's last request, and every piece starts at a text that occurs once in the request. A
+    memory request copies only the memories it recalls: what it summarizes, its chunk's messages or a
+    merge's members (L1s as recall pairs), is prefilled. Memory requests carry the session's system prompt. A splice that fails leaves the turn as it was; ticked off, the
     provider splices no more, and a request that sends images, which the server can't splice, isn't.
     The costs log keeps what each splice came to."""
     port, root, mock_port, work = free_port(), tempfile.mkdtemp(), free_port(), tempfile.mkdtemp()
@@ -1314,11 +1314,11 @@ def spliced(tls, ca) -> str:
     app = launch(root, port, ca, '--no-bash')
     seen['wire'], system = [], 'You keep a lighthouse.'
 
-    def turns(n, at):
+    def turns(n, at, name='spliced'):
         for t in range(at, at + n):
             said = 4 if t == 5 else t                                    # the fifth message says the fourth's again
-            say(port, 'spliced', f'Message {said}: ' + ' '.join(f'word{said}x{i}' for i in range(80)))   # a turn that fails fails the part
-            settle(port, 'spliced')
+            say(port, name, f'Message {said}: ' + ' '.join(f'word{said}x{i}' for i in range(80)))   # a turn that fails fails the part
+            settle(port, name)
     try:
         configure(root, f'https://localhost:{mock_port}/v1', 4000, 400, 200)   # its splices go to /kv/splice
         everything = json.loads(Path(root, 'settings.json').read_text())
@@ -1329,46 +1329,77 @@ def spliced(tls, ca) -> str:
             raise SystemExit('the provider ticked to splice does not')
         call(port, '/api/sessions', {'name': 'spliced'})
         call(port, '/api/s/spliced/settings', {'system': system})
-        turns(16, 0)
-        wire, memory = seen['wire'], lambda r: 'Write the memory' in json.dumps(r['messages'][-1]) or 'consolidate' in json.dumps(r['messages'][-1])
+        memory = lambda r: 'Write the memory' in json.dumps(r['messages'][-1]) or 'consolidate' in json.dumps(r['messages'][-1])
         texts = lambda r: [c['text'] if 'text' in c else c['content'] for m in r['messages'] for b in m['content'] for c in [b, *(b['content'] if isinstance(b.get('content'), list) else [])] if c['type'] == 'text' or isinstance(c.get('content'), str)]
-        main, splices, merged = None, {'main': 0, 'memory': 0}, 0
-        for i, (kind, sent) in enumerate(wire):
-            if kind == 'messages':
-                if not memory(sent):
-                    extends = main is not None and unmarked(sent['messages'][:len(main['messages'])]) == unmarked(main['messages'])
-                    if main is not None and (wire[i - 1][0] == 'splice') == extends:
-                        raise SystemExit(f'a request that {"goes on from" if extends else "does not go on from"} the last one was {"" if extends else "not "}spliced first')
-                    main = sent
-                elif sent.get('system') != system:
-                    raise SystemExit(f'a memory request\'s system prompt: {sent.get("system")!r}')
-                continue
-            request, sources, pieces = sent['request'], sent['sources'], sent['pieces']
-            following = wire[i + 1][1] if i + 1 < len(wire) and wire[i + 1][0] == 'messages' else {}
-            if sent['format'] != 'anthropic' or any(request.get(k) != following.get(k) for k in ('messages', 'system', 'tools')) or not pieces:
-                raise SystemExit(f'a splice of {len(pieces)} pieces in {sent["format"]} for a request other than the one sent next')
-            splices['memory' if memory(request) else 'main'] += 1
-            for piece in pieces:
-                source, everywhere = sources[piece['src']], [text for text in texts(request) if piece['anchor'] in text]
-                folded = 'reply' in source and memory(request) and piece['anchor'].startswith(('Message ', 'Reply '))   # a merge's message from its L1's reply
-                merged += folded
-                if 'reply' in source and (not source['reply'].startswith('I remember stretch') or piece['anchor'] != source['reply'].strip() and not folded):
-                    raise SystemExit(f'a piece {piece["anchor"][:40]!r} from the reply {source["reply"][:40]!r}')
-                if 'request' in source and unmarked(source['request']['messages']) != unmarked(main['messages']):
-                    raise SystemExit('a piece from a request other than the session\'s last')
-                if len(everywhere) != 1 or everywhere[0].count(piece['anchor']) != 1:
-                    raise SystemExit(f'a piece starts at {piece["anchor"][:40]!r}, in the request {len(everywhere)} times')
-            if not memory(request) and (not any('reply' in s for s in sources) or any('reply' in sources[p['src']] and p['anchor'] in json.dumps(main) for p in pieces)):
-                raise SystemExit('a fold\'s splice copies no memory, or one the last request showed')
-            changed = next(k for k, m in enumerate(request['messages']) if k >= len(main['messages']) or unmarked(m) != unmarked(main['messages'][k]))
-            after = [text.strip() for text in texts({'messages': request['messages'][changed:]})]
-            if not memory(request) and (missing := {text for text in after if (text in json.dumps(main) or text.startswith('I remember')) and texts(request).count(text) == 1} - {p['anchor'] for p in pieces}):
-                raise SystemExit(f'a fold\'s splice copies none of {sorted(missing)[0][:40]!r} and {len(missing) - 1} more of its new memories and the texts the last request had')
-            raw = [text.strip() for text in texts(request) if text.startswith(('Message ', 'Reply '))]
-            if memory(request) and (missing := {text for text in raw if raw.count(text) == 1} - {p['anchor'] for p in pieces}):
-                raise SystemExit(f'a memory request\'s splice copies none of {sorted(missing)[0][:40]!r} and {len(missing) - 1} more of its messages')
-        if not splices['main'] or not splices['memory'] or not merged or splices['memory'] != sum(1 for kind, r in wire if kind == 'messages' and memory(r)):
-            raise SystemExit(f'splices before {splices["main"]} folded requests and {splices["memory"]} memory requests, of {sum(1 for kind, r in wire if kind == "messages" and memory(r))}; {merged} messages from L1s')
+        asks = re.compile(r'\[CM\] Recall memory L(\d+)-\d+\.')
+
+        def recalled(r):
+            """A memory request's recall answers: those it recalls, and a merge's members, which a merge into
+            L<n> shows as pairs a level below n (an L1's request shows none)."""
+            into, kept, members = re.search(r'into a single L(\d+) memory', json.dumps(r['messages'][-1])), [], []
+            for question, answer in zip(r['messages'], r['messages'][1:]):
+                for b in question['content']:
+                    if b['type'] == 'text' and (asked := asks.fullmatch(b['text'])):
+                        said = '\n'.join(a['text'] for a in answer['content'] if a['type'] == 'text').strip()
+                        (members if into and int(asked[1]) < int(into[1]) else kept).append(said)
+            return kept, members
+
+        def check(wire):
+            """The requests and splices in `wire`, one session's, checked: what was spliced, the members of
+            merges shown as recall pairs, and the merges that showed their chunks raw."""
+            main, splices, merged, raw = None, {'main': 0, 'memory': 0}, 0, 0
+            for i, (kind, sent) in enumerate(wire):
+                if kind == 'messages':
+                    if not memory(sent):
+                        extends = main is not None and unmarked(sent['messages'][:len(main['messages'])]) == unmarked(main['messages'])
+                        if main is not None and (wire[i - 1][0] == 'splice') == extends:
+                            raise SystemExit(f'a request that {"goes on from" if extends else "does not go on from"} the last one was {"" if extends else "not "}spliced first')
+                        main = sent
+                        continue
+                    if sent.get('system') != system:
+                        raise SystemExit(f'a memory request\'s system prompt: {sent.get("system")!r}')
+                    raw += 'consolidate' in json.dumps(sent['messages'][-1]) and any(t.startswith('Message ') for t in texts(sent))
+                    if (wire[i - 1][0] == 'splice') != bool(recalled(sent)[0]):
+                        raise SystemExit(f'a memory request that recalls {len(recalled(sent)[0])} memories was {"" if wire[i - 1][0] == "splice" else "not "}spliced first')
+                    continue
+                request, sources, pieces = sent['request'], sent['sources'], sent['pieces']
+                following = wire[i + 1][1] if i + 1 < len(wire) and wire[i + 1][0] == 'messages' else {}
+                if sent['format'] != 'anthropic' or any(request.get(k) != following.get(k) for k in ('messages', 'system', 'tools')) or not pieces:
+                    raise SystemExit(f'a splice of {len(pieces)} pieces in {sent["format"]} for a request other than the one sent next')
+                splices['memory' if memory(request) else 'main'] += 1
+                for piece in pieces:
+                    source, everywhere = sources[piece['src']], [text for text in texts(request) if piece['anchor'] in text]
+                    if 'reply' in source and (not source['reply'].startswith('I remember stretch') or piece['anchor'] != source['reply'].strip()):
+                        raise SystemExit(f'a piece {piece["anchor"][:40]!r} from the reply {source["reply"][:40]!r}')
+                    if 'request' in source and unmarked(source['request']['messages']) != unmarked(main['messages']):
+                        raise SystemExit('a piece from a request other than the session\'s last')
+                    if len(everywhere) != 1 or everywhere[0].count(piece['anchor']) != 1:
+                        raise SystemExit(f'a piece starts at {piece["anchor"][:40]!r}, in the request {len(everywhere)} times')
+                if not memory(request) and (not any('reply' in s for s in sources) or any('reply' in sources[p['src']] and p['anchor'] in json.dumps(main) for p in pieces)):
+                    raise SystemExit('a fold\'s splice copies no memory, or one the last request showed')
+                changed = next(k for k, m in enumerate(request['messages']) if k >= len(main['messages']) or unmarked(m) != unmarked(main['messages'][k]))
+                after = [text.strip() for text in texts({'messages': request['messages'][changed:]})]
+                if not memory(request) and (missing := {text for text in after if (text in json.dumps(main) or text.startswith('I remember')) and texts(request).count(text) == 1} - {p['anchor'] for p in pieces}):
+                    raise SystemExit(f'a fold\'s splice copies none of {sorted(missing)[0][:40]!r} and {len(missing) - 1} more of its new memories and the texts the last request had')
+                if memory(request):
+                    kept, members = recalled(request)
+                    merged += len(members)
+                    if {p['anchor'] for p in pieces} != set(kept) or any('reply' not in sources[p['src']] for p in pieces):
+                        raise SystemExit(f'a memory request\'s splice copies {sorted(p["anchor"][:30] for p in pieces)}, not the {len(kept)} memories it recalls ({len(members)} merged, prefilled)')
+            return splices, merged, raw
+        turns(16, 0)
+        wire = seen['wire']
+        splices, merged, _ = check(wire)
+        if not splices['main'] or not splices['memory'] or not merged:
+            raise SystemExit(f'splices before {splices["main"]} folded requests and {splices["memory"]} memory requests; {merged} members of merges prefilled')
+        seen['wire'] = []                                                # merged by count, a merge shows its L1s' chunks raw, prefilled too
+        call(port, '/api/sessions', {'name': 'counted'})
+        call(port, '/api/s/counted/settings', {'system': system, 'config': {'merge_by_count': True, 'merge_threshold': 3}})
+        turns(16, 0, 'counted')
+        _, _, counted = check(seen['wire'])
+        seen['wire'] = wire
+        if not counted:
+            raise SystemExit('no merge by count showed its chunks raw')
         seen['splice down'], called = True, len(wire)                    # down: the turns go on as before
         turns(4, 16)
         seen['splice down'], imaging = False, len(wire)                  # an image in the context
@@ -1389,7 +1420,7 @@ def spliced(tls, ca) -> str:
         if len(logged) != sum(kind == 'splice' for kind, _ in wire) or not down or any(s['error'] != 'HTTP 500: {"error": "the splicer is down"}' for s in down) \
                 or any((s['placed'], s['built'], s['t_ms']) != (s['pieces'], 100, 3) for s in logged if 'error' not in s) or len(down) != sum(kind == 'splice' for kind, _ in wire[called:imaging]):
             raise SystemExit(f'the costs log keeps splices {logged[:3]}, {len(down)} of them failed')
-        return f'{splices["main"]} folded requests and {splices["memory"]} memory requests spliced first ({merged} pieces of merges from L1s), {len(down)} splices failed'
+        return f'{splices["main"]} folded requests and {splices["memory"]} memory requests spliced first ({merged} members of merges prefilled), {len(down)} splices failed'
     finally:
         app.terminate()
         mock.shutdown()
