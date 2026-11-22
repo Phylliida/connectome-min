@@ -31,10 +31,13 @@ Through the gateway, a request goes upstream as it came, but for this connection
 answer streams back as it comes, the exchange recorded without credentials. A Claude Code session
 (a fake one, fake_claude.py) takes its turns in Claude Code, in its sandbox, through the gateway,
 the page asking before its calls; and a long one's requests fold there, to a model that refuses
-reasoning whose conversation changed.
+reasoning whose conversation changed. Pages hear each memory's request as it goes (its prefill, then
+its reasoning and its text, with their tokens, and which of those due it is), and a page that comes
+in during one hears at once where it is.
 
-The ten parts (the chat, the tool calls, the large contexts, the companion, the lifted memories,
-the channels, the boards, the gateway, Claude Code, its fold) run at once, in processes of their own, each with its own mock; the first to fail stops the rest.
+The parts (the chat, the tool calls, the large contexts, the companion, the lifted memories, the
+channels, the boards, the gateway, Claude Code, its fold, splicing, moved forks, messages queued
+during a call, a memory's progress) run at once, in processes of their own, each with its own mock; the first to fail stops the rest.
 
     python3 tests/test_app.py [turns]
 """
@@ -45,6 +48,7 @@ import itertools
 import json
 import multiprocessing
 import os
+import queue
 import re
 import signal
 import ssl
@@ -155,6 +159,9 @@ class Mock(BaseHTTPRequestHandler):
         elif 'a long story' in last:
             seen['chat'] += 1
             blocks, stop = [{'type': 'text', 'text': 'Once upon a time'}], 'max_tokens'
+        elif memory and seen.get('memory fails once'):              # a failure that may pass, once: the memory's request is tried again
+            seen['memory fails once'] = False
+            return self.answer(529, {'type': 'error', 'error': {'type': 'overloaded_error', 'message': 'Overloaded'}})
         elif 'memory' in last and ('Write the memory' in last or 'consolidate' in last) and seen['forgetful']:   # memories down, at once
             return self.answer(400, {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'No memories today'}})
         elif 'memory' in last and ('Write the memory' in last or 'consolidate' in last):
@@ -188,7 +195,10 @@ class Mock(BaseHTTPRequestHandler):
             seen['heads'].append((memory, ' '.join(b.get('text', '') for b in messages[0]['content']), 'your own compressed memory' in json.dumps(messages)))
         cut = 'cut off once' in last and last not in seen['cut']
         seen['cut'] += [last] * cut
-        self.stream(blocks, prompt, 0.25 if 'slowly' in last else 0.01 if memory else 0, stop, cut)   # a memory takes a moment, as a page may see
+        held = memory and seen.get('held')                       # a memory's request waits where the test lets it go on: before its reply, and amid its reasoning
+        if held:
+            held.get()
+        self.stream(blocks, prompt, 0.25 if 'slowly' in last else 0.01 if memory else 0, stop, cut, held)   # a memory takes a moment, as a page may see
 
     def splice(self):
         """A KV splice (KV-SPLICE.md), its pieces all placed, or, while seen says the splicer is down,
@@ -199,10 +209,10 @@ class Mock(BaseHTTPRequestHandler):
             return self.answer(500, {'error': 'the splicer is down'})
         self.answer(200, {'built': 100, 'prefix': 40, 'copied': 50, 'prefilled': 10, 'pieces': [{'placed': True}] * len(call['pieces']), 't_ms': 3})
 
-    def stream(self, blocks, input_tokens, pause, stop, cut=False):
+    def stream(self, blocks, input_tokens, pause, stop, cut=False, held=None):
         """The reply as server-sent events, its text in five pieces `pause` seconds apart and a tool
-        call's input in three, the same, the stream ending there if `cut`; chunked or until the close,
-        by turns."""
+        call's input in three, the same, the stream ending there if `cut`, and waiting after its
+        reasoning's second piece for `held` if given; chunked or until the close, by turns."""
         chunked = (seen['chat'] + seen['memory']) % 2 == 0
         self.protocol_version = 'HTTP/1.1' if chunked else 'HTTP/1.0'
         self.send_response(200)
@@ -230,6 +240,8 @@ class Mock(BaseHTTPRequestHandler):
             event('content_block_start', index=i, content_block={'type': block['type'], key: '', **({'signature': ''} if key == 'thinking' else {})})
             words, n = block[key], len(block[key])
             for k in range(5):
+                if held and key == 'thinking' and k == 2:
+                    held.get()
                 time.sleep(pause)
                 event('content_block_delta', index=i, delta={'type': f'{key}_delta', key: words[k * n // 5:(k + 1) * n // 5]})
             if key == 'thinking':
@@ -413,7 +425,7 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
     until its memories have formed: the reply's text and reasoning, and when each piece of text arrived.
     A call that asks to run gets the answer `answers` has for its tool, else allow. The calls as the
     replies stream them in, each its tool and its input's JSON, go to seen['calls']."""
-    pieces, thoughts, times, last, end, logged, calls, heard, after = [], [], [], {}, {}, 0, [], [], {}
+    pieces, thoughts, times, last, end, logged, calls, heard, after, remembered = [], [], [], {}, {}, 0, [], [], {}, []
     r, events = following(port, name)                                   # no turn here goes 10 s without an event
     with r:
         start, mine = next(events).get('state', {}).get('messages'), False   # the session and its log's length (none if it can't be read)
@@ -447,6 +459,9 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
             if 'input' in last:
                 calls[-1][1] += last['input']
             seen['forming'] |= last.get('forming', False)
+            if 'memory' in last:
+                seen.setdefault('memories heard', {}).setdefault(name, []).append(last['memory'])
+                remembered.append(last['memory'])
             end = last if 'end' in last else end
             if 'approve' in last:                                           # a call of the reply just logged, or a subagent's, which the log doesn't have
                 asked = last['approve']
@@ -460,6 +475,8 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
                 call(port, f'/api/s/{name}/approve', {'id': asked['id'], 'answer': 'answer', **choice} if isinstance(choice, dict) else {'id': asked['id'], 'answer': choice})
             thoughts.append(last.get('thinking', ''))
     seen['calls'] = calls
+    if (ks := [m['k'] for m in remembered if m['stage'] == 'prefill']) and (ks[0] != 1 or ks != sorted(ks)):   # the job's memories, counted from its first
+        raise SystemExit(f'{name}: a job\'s memories were numbered {ks}')
     if end.get('end', 'never ended') is not None:
         raise SystemExit(f'{name}: "{(text or "(continue)")[:40]}" got {end or last}')
     # the session is read after the messages the page has, so a message that joins in between comes
@@ -469,6 +486,33 @@ def say(port, name, text, answers=None) -> tuple[str, str, list[float]]:
             or not after['state']['running'] and first + len(heard) != after['state']['messages']:
         raise SystemExit(f'{name}: a page following the session heard the messages {heard} after {start}, then {str(after)[:80]}')   # each once, as they joined the log
     return ''.join(pieces), ''.join(thoughts), times
+
+
+STAGES = ['prefill', 'thinking', 'generating']
+
+
+def misreported(heard, layers):
+    """Why the progress of memories forming that a page heard (Memory in work.rs) is wrong, if it is:
+    each request, from its prefill (its prompt estimated, no tokens yet), goes on through its reasoning
+    to its text, never back, its tokens growing within a stage; it's the kth of those due; it forms an
+    L1 or a merge of 2 memories or more; and once its text came, that memory is in its layer (`layers`,
+    the session's records by layer)."""
+    requests = [[m] if m['stage'] == 'prefill' else [] for m in heard[:1]]
+    for m in heard[1:]:
+        if m['stage'] == 'prefill':
+            requests.append([m])
+        else:
+            requests[-1].append(m)
+    for request in requests:
+        first, key = request[0], lambda m: (m['k'], m['of'], m['level'], m['first'], m['last'], m['merges'], m['prompt'])
+        steps = [(STAGES.index(m['stage']), m['tokens']) for m in request]
+        if first['stage'] != 'prefill' or first['tokens'] != 0 or first['prompt'] <= 0 or any(key(m) != key(first) for m in request) or steps != sorted(steps) \
+                or any(t <= 0 for stage, t in steps[1:]) or not 1 <= first['k'] <= first['of'] or (first['level'] == 1) != (first['merges'] == 0) or first['merges'] == 1 \
+                or not first['first'] <= first['last'] or any(not 0 <= m['elapsed'] < 60 for m in request):
+            return f'a memory\'s request went {request}'
+        if steps[-1][0] == 2 and not any((m['first'], m['last']) == (first['first'], first['last']) for m in layers[first['level']]):
+            return f'a memory of messages {first["first"]}–{first["last"]} that the page heard written isn\'t in layer {first["level"]}'
+    return None
 
 
 def settle(port, name):
@@ -877,7 +921,7 @@ def tooled(tls, ca, baseline) -> str:
         # the log stands (the message and the reply that calls logged, none of the reply's pieces), then what the first
         # page hears from there on, but the messages, which each page reads from the log from where it started, and the
         # queue, which a page hears in the session as it comes in and then as it changes
-        outline = lambda events: [e for e in events if not {'text', 'thinking', 'message', 'state', 'queue'} & set(e)]
+        outline = lambda events: [e for e in events if not {'text', 'thinking', 'message', 'state', 'queue', 'memory'} & set(e)]   # of a memory's progress, a page that comes in hears the newest
         kinds = [next(iter(e)) for e in outline(late) if not {'logged', 'forming', 'spent', 'prompt'} & set(e)]
         if outline(first)[-len(outline(late)) + 1:] != outline(late)[1:] or not late[0]['state']['running'] \
                 or outline(late)[:2] != [{'turn': job[0]}, {'logged': state['messages'] + 2}] \
@@ -1560,6 +1604,11 @@ def chatted(turns, tls, ca, baseline) -> str:
             raise SystemExit('no reply streamed its reasoning')
         if not seen['forming']:
             raise SystemExit('the page never saw memories forming')
+        heard = seen.get('memories heard', {}).get('main', [])
+        if why := misreported(heard, layers):
+            raise SystemExit(why)
+        if not any(m['stage'] == 'generating' and m['level'] >= 2 for m in heard):
+            raise SystemExit(f'main\'s pages heard no merge written in {len(heard)} updates: {sorted({(m["level"], m["stage"]) for m in heard})}')
         levels = {level for level, _ in state['frontier'] or []}
         if len(state['layers']) < 3 or not levels - {0}:
             raise SystemExit(f'memories did not form or show: layers {state["layers"]}, frontier {state["frontier"]}')
@@ -2245,6 +2294,11 @@ def clauded(tls, ca) -> str:
         for n in range(3):
             say(port, 'cc', f'part {n}: {story}')
         memories = call(port, '/api/s/cc/layer/1')
+        heard = seen.get('memories heard', {}).get('cc', [])
+        if why := misreported(heard, [call(port, f'/api/s/cc/layer/{n}?from=0') for n in range(len(call(port, '/api/s/cc')['layers']))]):
+            raise SystemExit(f'Claude Code\'s memories: {why}')
+        if {m['stage'] for m in heard} != set(STAGES):
+            raise SystemExit(f'the pages heard Claude Code\'s memories in the stages {sorted({m["stage"] for m in heard})}')
         runs_of = [json.loads(line) for line in Path(work, 'claude-memories.jsonl').read_text().splitlines()]
         flags = {flag: runs_of[0]['args'][runs_of[0]['args'].index(flag) + 1] for flag in ('--model', '--tools', '--system-prompt')}
         told = runs_of[0]['transcript']
@@ -2493,6 +2547,82 @@ def folded(tls, ca) -> str:
         mock.shutdown()
 
 
+def progressed(tls, ca) -> str:
+    """A memory forming, as the pages see it, and as a page that comes in during it (a tab opened again,
+    a reload) sees it at once, from the server: in its prefill, then amid its reasoning (the mock holds
+    its reply at each, so nothing new comes meanwhile), which of those due it is, what it forms, the
+    stage's tokens, and the time the stage has taken, which goes on from there; then its text, and
+    the memory formed; then the job's next, whose request fails once and starts again."""
+    port, root, mock_port = free_port(), tempfile.mkdtemp(), free_port()
+    mock = serve(mock_port, tls)
+    app = launch(root, port, ca, '--no-bash')
+    held, heard = queue.Queue(), []
+
+    def comes_in():
+        """A page that comes in now, and the first memory's progress it hears, which it must hear at once."""
+        r, events = following(port, 'slow', timeout=3)
+        return r, events, next(e['memory'] for e in events if 'memory' in e)
+
+    def heard_until(events, stage, job):
+        """The memories' progress a page hears, to the first in `stage` (None: to the job's end)."""
+        for e in events:
+            if 'memory' in e:
+                heard.append(e['memory'])
+                if e['memory']['stage'] == stage:
+                    return e['memory']
+            if e.get('done') == job:
+                if stage is None:
+                    return None
+                raise SystemExit(f'the job ended before a memory\'s {stage}: {heard}')
+    same = lambda a, b: {k: v for k, v in a.items() if k != 'elapsed'} == {k: v for k, v in b.items() if k != 'elapsed'}
+    try:
+        configure(root, f'https://localhost:{mock_port}/v1', 4000, 400, 200)
+        call(port, '/api/sessions', {'name': 'slow'})
+        seen['forgetful'] = True                                         # the memories due wait, their requests failing
+        for t in range(8):
+            call(port, '/api/s/slow/say', {'text': f'Message {t}: ' + ' '.join(f'word{t}x{i}' for i in range(80))})
+            settle(port, 'slow')
+        seen['forgetful'], seen['held'] = False, held
+        r, events = following(port, 'slow')
+        with r:
+            next(events)
+            job = call(port, '/api/s/slow/say', {'text': 'Message 4: on we go'})['job']
+            prefill = heard_until(events, 'prefill', job)
+            time.sleep(0.3)
+            b, _, came = comes_in()
+            with b:
+                if not same(came, prefill) or came['elapsed'] < prefill['elapsed'] + 0.3 or (prefill['k'], prefill['level']) != (1, 1) or prefill['of'] < 2:
+                    raise SystemExit(f'in its prefill, a memory was {prefill}, and to a page that came in 0.3 s later {came}')
+            held.put('on')                                               # its reply comes, and stops amid its reasoning
+            thinking = heard_until(events, 'thinking', job)
+            time.sleep(0.3)
+            c, c_events, came = comes_in()
+            with c:
+                if came['stage'] != 'thinking' or came['tokens'] < thinking['tokens'] or came['elapsed'] < thinking['elapsed'] + 0.3 or not same({**came, 'tokens': 0}, {**thinking, 'tokens': 0}):
+                    raise SystemExit(f'amid its reasoning, a memory was {thinking}, and to a page that came in 0.3 s later {came}')
+                seen['held'], seen['memory fails once'] = None, True     # the next memory's request fails once, and is tried again
+                held.put('on')
+                heard_until(events, None, job)
+                later = []
+                for e in c_events:                                       # the page that came in goes on with it
+                    if 'memory' in e:
+                        later.append(e['memory'])
+                    if e.get('done') == job:
+                        break
+        state = call(port, '/api/s/slow')
+        layers = [call(port, f'/api/s/slow/layer/{n}?from=0') for n in range(len(state['layers']))]
+        starts = [m['k'] for m in heard if m['stage'] == 'prefill']   # a request tried again starts in prefill again
+        if why := misreported(heard, layers):
+            raise SystemExit(why)
+        if starts != [1, 2, 2] or not any(m['stage'] == 'generating' for m in later) or len(layers[1]) != 2 or {m['of'] for m in heard} != {len(layers[0])}:   # every chunk's: the context can't fold without them, so none is held back
+            raise SystemExit(f'the job\'s memories started as {starts}, of {sorted({m["of"] for m in heard})}, {len(layers[1])} formed of {len(layers[0])} chunks; the page that came in heard {later[-1:]} after')
+        return f'2 memories of {prefill["of"]} due heard in {len(heard)} updates, the second tried again, and by pages that came in during the first\'s prefill and reasoning'
+    finally:
+        seen['held'], seen['memory fails once'] = None, False
+        app.terminate()
+        mock.shutdown()
+
+
 def part(name, run, done):
     """A part of the test in a process group of its own, which its apps and their servers join, so
     that killing the group stops them all: (name, its summary or None, why it failed or None, counts)."""
@@ -2521,7 +2651,7 @@ def main(turns=60):
              'companion': lambda: accompanied((cert, key), ca), 'lifted': lambda: lifted((cert, key), ca), 'channels': lambda: channeled((cert, key), ca),
              'boards': lambda: boarded((cert, key), ca), 'gateway': lambda: gatewayed((cert, key), ca),
              'claude': lambda: clauded((cert, key), ca), 'fold': lambda: folded((cert, key), ca), 'spliced': lambda: spliced((cert, key), ca),
-             'moved': lambda: moved((cert, key), ca), 'queued': lambda: queued((cert, key), ca)}
+             'moved': lambda: moved((cert, key), ca), 'queued': lambda: queued((cert, key), ca), 'progress': lambda: progressed((cert, key), ca)}
     running = [forked.Process(target=part, args=(name, run, done)) for name, run in parts.items()]
     summaries, totals, failure = {}, {'chat': 0, 'memory': 0, 'bytes': 0, 'largest': 0}, None
     try:
@@ -2546,7 +2676,7 @@ def main(turns=60):
         print(failure)
         return 1
     print(f'{totals["chat"]} chat turns and {totals["memory"]} memory requests; {summaries["chat"]}; {totals["bytes"] // 1024} KB of requests streamed '
-          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}; {summaries["gateway"]}; {summaries["claude"]}; {summaries["fold"]}; {summaries["spliced"]}; {summaries["moved"]}; {summaries["queued"]}')
+          f'(largest {totals["largest"] // 1024} KB); {summaries["tools"]}; {summaries["large"]}; {summaries["companion"]}; {summaries["lifted"]}; {summaries["channels"]}; {summaries["boards"]}; {summaries["gateway"]}; {summaries["claude"]}; {summaries["fold"]}; {summaries["spliced"]}; {summaries["moved"]}; {summaries["queued"]}; {summaries["progress"]}')
     return 0
 
 

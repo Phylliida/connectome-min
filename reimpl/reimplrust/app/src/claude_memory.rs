@@ -7,10 +7,11 @@
 //! ""), keeps no session, and may write the memory's max tokens (CLAUDE_CODE_MAX_OUTPUT_TOKENS); it
 //! runs as the session's turns do (Worker::start_claude): in its workspace and sandbox, through the
 //! gateway, but not naming the session, so its requests go as they came (the session's thread, which
-//! folds a turn's, waits on the run). What a run used joins the session's costs, for memories.
+//! folds a turn's, waits on the run). The pages follow the run from its reply's pieces (work::Progress).
+//! What a run used joins the session's costs, for memories.
 
-use crate::{claude::{told_line, Said, SETTINGS}, costs::{self, For}, hub::Event, llm::Usage, tools::POLL, work::Worker};
-use connectome::{emit::Reader, json::{Json, Value}, memory::{Host, Request, INTERRUPTED}, obj};
+use crate::{claude::{told_line, Said, SETTINGS}, costs::{self, For}, hub::Event, llm::{Delta, Piece, Streamed, Usage}, tools::POLL, work::{Progress, Worker}};
+use connectome::{blocks::density_tokens, emit::Reader, json::{Json, Value}, memory::{Host, Request, INTERRUPTED}, obj};
 use std::{collections::HashMap, sync::mpsc::RecvTimeoutError};
 
 /// What the transcript starts with: how it's laid out. The library's own messages in it say what
@@ -32,10 +33,12 @@ impl Host for Remembering<'_, '_> {
     fn complete(&mut self, request: &Request, reader: &mut Reader) -> Result<Value, String> {
         let own = self.worker.app.profile(self.worker.name)?;
         let model = if request.model.is_empty() { own.model } else { request.model.clone() };
-        let args: Vec<String> = ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--setting-sources", "", "--settings", SETTINGS,
+        let args: Vec<String> = ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--setting-sources", "", "--settings", SETTINGS,
             "--strict-mcp-config", "--tools", "", "--system-prompt", "", "--no-session-persistence", "--model", &model].map(String::from).into();
+        let text = transcript(request, reader);
+        let mut progress = Progress::new(self.worker, request, density_tokens(&text), &own.config);
         let mut claude = self.worker.start_claude(&self.command, &args, &[("CLAUDE_CODE_MAX_OUTPUT_TOKENS", request.max_tokens.to_string())])?;
-        let asked = obj! {"content" => vec![obj! {"type" => "text", "text" => transcript(request, reader)}]};
+        let asked = obj! {"content" => vec![obj! {"type" => "text", "text" => text}]};
         let initialize = obj! {"type" => "control_request", "request_id" => "initialize", "request" => obj! {"subtype" => "initialize"}};
         let told = claude.send(&initialize).and_then(|()| claude.send(&told_line(&asked)));
         let (mut written, mut limits) = (vec![], None);
@@ -48,6 +51,11 @@ impl Host for Remembering<'_, '_> {
                 Err(RecvTimeoutError::Disconnected) => break Err("Claude Code stopped before it wrote the memory".into()),
             };
             match serde_json::from_str(&line) {
+                Ok(Said::StreamEvent { event, parent_tool_use_id: None }) => match serde_json::from_value(event) {
+                    Ok(Streamed::ContentBlockDelta { delta: Delta::Thinking { thinking } }) => progress.piece(&Piece::Thinking(thinking)),
+                    Ok(Streamed::ContentBlockDelta { delta: Delta::Text { text } }) => progress.piece(&Piece::Text(text)),
+                    _ => {} // its message's start and end, and its blocks' (the whole message comes after them)
+                },
                 Ok(Said::Assistant { message, parent_tool_use_id: None }) => {
                     written.extend(message.content.arr().iter().filter(|b| b.kind() == "text").cloned()); // its reasoning stays out
                 }

@@ -40,7 +40,10 @@ The page draws itself with Preact, its templates written with htm, as a function
 the session as the server has it, its log's messages, and the turn it follows, which only the page's
 actions change. A turn it follows goes through phases the line under the chat shows (waiting for the
 model, streaming, asking whether a call may run, running a call, which its card says too, its
-request tried again, and why, forming memories); its reply streams in below the log and is drawn at
+request tried again, and why, forming memories: which memory of those due, the layer and messages
+it covers, and where its request is, in prefill (its prompt's estimated tokens), thinking or
+generating (the tokens come so far), and for how long, as in "Forming memory 2 of 5 (L1, messages
+230–251): thinking · ~392 tokens · 0:41"); its reply streams in below the log and is drawn at
 most once a frame, its finished markdown blocks once. Opening a session shows its log's newest 200
 messages; scrolling up, two views from the top, loads the 200 before them, until the first, so
 they're there before the view gets to them, and the messages in view stay where they are as they go
@@ -311,13 +314,14 @@ them): the log's newest messages, read from disk, then the session, then whateve
 turn after turn: each message as it joins the log, and of each turn (numbered: sending a message, or
 Continue, answers with its job's number, and the turn's events start with `{"turn": n}` and end with
 `{"done": n}`) only what the log doesn't hold yet (a reply streaming in, the questions whether its
-calls may run, their results, memories forming), which is all the app keeps of a turn. The page
+calls may run, their results, memories forming, and of a memory's request only where it is now:
+`{"memory"}`, `work::Memory`), which is all the app keeps of a turn. The page
 shows each call as a card on its reply, its tool and input as the reply writes it, which its result
 then joins; an edit's card shows its change as a diff, colored in the file's language. A turn runs
 on its session's thread whether any page follows it or not, and a message sent while it runs waits
 for it. Any number of pages can follow a session, each hearing everything, and any of them can
 answer a call's question; a page that comes in during a turn (after a reload, or on another device)
-hears the turn so far. A page out of view lets go of its stream (a browser keeps only a few
+hears the turn so far, a memory forming where it is, its time counted on from the server's. A page out of view lets go of its stream (a browser keeps only a few
 connections to a server open) and catches up once back in view, and a page whose server restarted
 follows its session again on its own. If a session's files are
 edited into something the library can't read, its stream says so, and reads them again at the next

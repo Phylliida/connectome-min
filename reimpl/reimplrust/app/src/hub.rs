@@ -4,7 +4,7 @@
 //! time one is told something), each session's pages and what they hear (Live), and the pages
 //! following each channel.
 
-use crate::{api::Shown, boards, claude::Limits, channels::{self, Post, Posted}, companion::Heard, costs::{Fold, Spent}, llm::Piece, settings::{self, Formed, SessionSettings, Settings}, work::{work, DENIED, STOPPED}, App};
+use crate::{api::Shown, boards, claude::Limits, channels::{self, Post, Posted}, companion::Heard, costs::{Fold, Spent}, llm::Piece, settings::{self, Formed, SessionSettings, Settings}, work::{work, Memory, DENIED, STOPPED}, App};
 use connectome::json::Value;
 use serde::Serialize;
 use std::{collections::{HashMap, VecDeque}, sync::mpsc::{channel, Receiver, SendError, Sender}};
@@ -158,6 +158,8 @@ pub enum Event {
     Result(Value),
     /// Memories start or stop forming.
     Forming(bool),
+    /// A memory forming, as its request goes; a turn keeps only the newest, for a page that comes in.
+    Memory(Memory),
     /// The turn has ended: null once its reply has joined the log, else why it failed. Its memories
     /// form after it.
     End(Option<String>),
@@ -474,10 +476,14 @@ impl Live {
     /// Whether a turn runs that has yet to hand over its end.
     fn turning(&self) -> bool { self.turn.as_ref().is_some_and(|t| !t.ended) }
 
-    /// An event to the pages, kept for those that come later while a turn runs.
+    /// An event to the pages, kept for those that come later while a turn runs (of a memory's progress,
+    /// only the newest).
     fn send(&mut self, event: Event) {
         self.pages.retain(|page| page.send(event.clone()).is_ok());
         if let Some(turn) = &mut self.turn {
+            if let Event::Memory(_) = event {
+                turn.events.retain(|e| !matches!(e, Event::Memory(_)));
+            }
             turn.events.push(event);
         }
     }

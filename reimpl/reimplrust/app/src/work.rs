@@ -12,9 +12,10 @@
 //! (Worker::stopped). A Claude Code session's turn is Claude Code's instead (claude.rs).
 
 use crate::{api::brief, boards, channels, claude, claude_memory::Remembering, companion::{self, Heard, How}, costs::{self, For}, hub::{Asking, Event, Job, Msg, Routed}, llm::{carried, Llm, Piece, Source, RETRIES}, settings::{self, Sandbox, SessionSettings}, tools::{self, ask, bash, edit, image, mcp, search, Toolbox}, App};
-use connectome::{blocks::{density_tokens, At}, drive::{append, current, drive}, emit::{answer, select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
-use connectome::{memory::{stalled, Host, Request, INTERRUPTED}, planner::Node, store::Session, turns::Turn};
-use std::{cell::{Cell, RefCell}, collections::{HashMap, HashSet, VecDeque}, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::Duration};
+use connectome::{blocks::{density_tokens, raw_tokens, At}, config::Config, drive::{append, current, drive}, emit::{answer, select, Fit, Reader, Refusal}, json::{self, sparse, Json, Value}, obj};
+use connectome::{memory::{l1s_due, stalled, Host, Request, INTERRUPTED}, planner::Node, store::Session, turns::Turn};
+use serde::Serialize;
+use std::{cell::{Cell, RefCell}, collections::{HashMap, HashSet, VecDeque}, panic::{catch_unwind, AssertUnwindSafe}, path::{Path, PathBuf}, sync::mpsc::{channel, Receiver, Sender, TryRecvError}, time::{Duration, Instant}};
 
 /// A message from `who` of `text`, as the log keeps it.
 pub fn said(who: &str, text: String) -> Value { obj! {"participant" => who, "content" => vec![obj! {"type" => "text", "text" => text}]} }
@@ -103,14 +104,13 @@ impl Setup {
 /// serves both), and the agent's tools, which the library sends with tool choice "none" so a memory's
 /// request can carry tool blocks. On a provider that splices, the memories a request recalls are first
 /// copied into its cache from the replies that wrote them (splice); what it summarizes, a chunk's
-/// messages or a merge's members, is prefilled (see pieces). A request its turn's user stops ends at
-/// once, as never made (INTERRUPTED).
-struct Summarizer<'a> {
+/// messages or a merge's members, is prefilled (see pieces). The pages follow each request as it goes
+/// (Progress). A request its turn's user stops ends at once, as never made (INTERRUPTED).
+struct Summarizer<'a, 'w> {
     setup: &'a Setup,
-    stopped: tools::Stopped<'a>,
+    worker: &'a Worker<'w>,
     ended: Option<(String, f64)>, // how its last reply ended, and the tokens it had
-    s: &'a Session,
-    spliced: Vec<Value>, // what the splices before its requests came to
+    spliced: Vec<Value>,          // what the splices before its requests came to
 }
 
 /// What forming memories came to: one formed (or a stub), none could, a reply without a memory in it or
@@ -122,21 +122,116 @@ enum Formed {
     Failed(String),
 }
 
-impl Host for Summarizer<'_> {
+impl Host for Summarizer<'_, '_> {
     fn tools(&self) -> Option<&Value> { self.setup.definitions.as_ref() }
 
     fn system(&self) -> Option<&str> { self.setup.system.as_deref() }
 
     fn complete(&mut self, request: &Request, reader: &mut Reader) -> Result<Value, String> {
+        let (worker, s) = (self.worker, &self.worker.s);
         let model = if request.model.is_empty() { &self.setup.settings.model } else { &request.model };
         let none = request.tools.as_ref().map(|_| obj! {"type" => "none"});
         let head = sparse(obj! {"model" => model.as_str(), "max_tokens" => request.max_tokens, "system" => request.system.as_deref(), "tools" => request.tools.clone(), "tool_choice" => none});
-        self.spliced.extend(splice(self.setup, self.s, &head, &request.messages, 0, Copying::Memory(&request.recalled), reader));
-        let reply = self.setup.llm.messages(head, &request.messages, reader, false, |_| !(self.stopped)(), self.stopped, |_, _| {});
+        // its prompt as the library prices its blocks, read on their own, and as every request's system prompt and tools
+        let mut pricing = Reader::new(s, true);
+        let prompt = request.messages.iter().flat_map(|t| &t.content).map(|b| raw_tokens(&pricing.load(b))).sum::<f64>() + self.setup.overhead;
+        let progress = RefCell::new(Progress::new(worker, request, prompt, &self.setup.settings.config));
+        self.spliced.extend(splice(self.setup, s, &head, &request.messages, 0, Copying::Memory(&request.recalled), reader));
+        let piece = |piece| {
+            progress.borrow_mut().piece(&piece);
+            !worker.stopped()
+        };
+        let reply = self.setup.llm.messages(head, &request.messages, reader, false, piece, &|| worker.stopped(), |_, _| progress.borrow_mut().again());
         self.ended = reply.as_ref().ok().map(|r| (r["stopReason"].as_str().unwrap_or("nothing").to_string(), request.max_tokens));
-        if (self.stopped)() { Err(INTERRUPTED.into()) } else { reply }
+        if worker.stopped() { Err(INTERRUPTED.into()) } else { reply }
     }
 }
+
+/// How often the pages hear a memory's tokens grow while its stage stays the same.
+const TELL_EVERY: Duration = Duration::from_millis(250);
+
+/// A memory forming, as the pages show it (Event::Memory): the kth of its job's memories, of `of`,
+/// those formed in the job so far and those due now: the L1s due, this one among them, or for a merge,
+/// which is due only once no L1 is, itself (a merge their memories make due adds one once it is); its
+/// layer, the messages it covers, and how many memories it merges (0 for an L1); its request's prompt
+/// in tokens, estimated; and where its reply is: `prefill` until any of it comes (from when the request
+/// is sent, or tried again), then `thinking` while its reasoning comes and `generating` while its text
+/// does, with that stage's tokens so far, estimated from its text, and the seconds since the stage
+/// began, counted as a page is told, so a page that comes in counts on from there.
+#[derive(Clone, Serialize)]
+pub struct Memory {
+    k: u64,
+    of: u64,
+    level: u64,
+    first: u64,
+    last: u64,
+    merges: usize,
+    prompt: f64,
+    stage: &'static str,
+    tokens: f64,
+    #[serde(rename = "elapsed", serialize_with = "seconds_since")]
+    since: Instant,
+}
+
+fn seconds_since<S: serde::Serializer>(since: &Instant, s: S) -> Result<S::Ok, S::Error> { s.serialize_f64(since.elapsed().as_secs_f64()) }
+
+/// A memory's request as it goes, which the pages hear (Event::Memory) as it starts, as its reply's
+/// stage changes, and meanwhile at most every TELL_EVERY; the text of the stage it's in, which its
+/// tokens are estimated from.
+pub struct Progress<'a, 'w> {
+    worker: &'a Worker<'w>,
+    memory: Memory,
+    text: String,
+    told: Instant,
+}
+
+impl<'a, 'w> Progress<'a, 'w> {
+    /// `request`, whose prompt is `prompt` tokens, starting: in prefill.
+    pub fn new(worker: &'a Worker<'w>, request: &Request, prompt: f64, cfg: &Config) -> Progress<'a, 'w> {
+        let formed = memories(&worker.s) - worker.remembered;
+        let ((level, _), (first, last)) = (request.forms, request.covers);
+        let merges = if level == 1 { 0 } else { request.members.len() };
+        let memory = Memory { k: formed + 1, of: formed + l1s_due(&worker.s, cfg).max(1), level, first, last, merges, prompt, stage: "prefill", tokens: 0.0, since: Instant::now() };
+        let mut progress = Progress { worker, memory, text: String::new(), told: Instant::now() };
+        progress.tell();
+        progress
+    }
+
+    /// A piece of the reply: of its reasoning (thinking) or its text (generating); a call's pass, as a
+    /// memory's request calls none.
+    pub fn piece(&mut self, piece: &Piece) {
+        let (stage, more) = match piece {
+            Piece::Thinking(more) => ("thinking", more),
+            Piece::Text(more) => ("generating", more),
+            Piece::Calling(_) | Piece::Input(_) => return,
+        };
+        let moved = stage != self.memory.stage;
+        if moved {
+            (self.memory.stage, self.memory.since) = (stage, Instant::now());
+            self.text.clear();
+        }
+        self.text.push_str(more);
+        if moved || self.told.elapsed() >= TELL_EVERY {
+            self.memory.tokens = density_tokens(&self.text);
+            self.tell();
+        }
+    }
+
+    /// The request is tried again: in prefill again.
+    pub fn again(&mut self) {
+        (self.memory.stage, self.memory.since, self.memory.tokens) = ("prefill", Instant::now(), 0.0);
+        self.text.clear();
+        self.tell();
+    }
+
+    fn tell(&mut self) {
+        self.told = Instant::now();
+        self.worker.event(Event::Memory(self.memory.clone()));
+    }
+}
+
+/// The memories a session has, of every layer.
+fn memories(s: &Session) -> u64 { (1..).map(|n| s.count(&format!("layer{n}"))).take_while(|&c| c > 0).sum() }
 
 /// The last request a session's steps sent: its fields and turns, the cached conversation a splice
 /// copies the session's messages from. The session's thread keeps it while it runs.
@@ -282,7 +377,10 @@ pub fn work(app: &App, name: &str, jobs: Receiver<(u64, Job)>) {
         });
         let Some((id, job)) = next else { return };
         let (stop, halt) = channel();
-        let done = catch_unwind(AssertUnwindSafe(|| Worker { app, name, s: app.session(name), halt, jobs: &jobs, taken: &taken, later: &later, sent: &sent }.run(id, job, stop)));
+        let done = catch_unwind(AssertUnwindSafe(|| {
+            let s = app.session(name);
+            Worker { app, name, remembered: memories(&s), s, halt, jobs: &jobs, taken: &taken, later: &later, sent: &sent }.run(id, job, stop)
+        }));
         if done.is_err() {
             app.tell(name, Msg::Event(Event::Forming(false)));
             app.tell(name, Msg::Event(Event::End(Some("the session's thread failed; the server's output says why".into()))));
@@ -303,6 +401,7 @@ pub struct Worker<'a> {
     pub taken: &'a Cell<u64>, // how many jobs the thread has taken from `jobs`
     pub later: &'a RefCell<VecDeque<(u64, Job)>>,
     sent: &'a RefCell<Option<Sent>>, // the last request the session's steps sent
+    remembered: u64,                  // the memories the session had as the job began, for the pages' count of those it forms (Memory)
 }
 
 impl Worker<'_> {
@@ -597,7 +696,7 @@ impl Worker<'_> {
                 (drive(&self.s, &mut remembering, cfg), remembering.ended, vec![])
             }
             None => {
-                let mut summarizer = Summarizer { setup, stopped: &|| self.stopped(), ended: None, s: &self.s, spliced: vec![] };
+                let mut summarizer = Summarizer { setup, worker: self, ended: None, spliced: vec![] };
                 (drive(&self.s, &mut summarizer, cfg), summarizer.ended, summarizer.spliced)
             }
         };

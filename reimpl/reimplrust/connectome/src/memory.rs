@@ -75,6 +75,9 @@ pub struct Request {
     pub max_tokens: f64,
     pub tools: Option<Value>,
     pub recalled: Vec<Node>, // the memories its recall pairs before the task show, oldest first (not a merge's members)
+    pub forms: Node,         // the memory it forms: its layer, and its index there
+    pub members: Vec<Node>,  // what that memory holds: its chunk (layer 0) for an L1, else the memories it merges
+    pub covers: (u64, u64),  // the first and last message they cover
 }
 
 impl Request {
@@ -131,6 +134,12 @@ fn next(session: &Session, cfg: &Config) -> Option<(Node, Vec<Node>)> {
         return Some(first);
     }
     [cfg.min_merge_memories, 2].into_iter().find_map(|least| lift(session, least, cfg)).filter(|&(target, _)| !blocked(session, target, cfg))
+}
+
+/// How many L1s are due now: the chunks past the holdback that have none.
+pub fn l1s_due(session: &Session, cfg: &Config) -> u64 {
+    let holdback = if escalated(session) { 0 } else { cfg.l1_holdback_chunks };
+    session.count("layer0").saturating_sub(holdback).saturating_sub(session.count("layer1"))
 }
 
 /// Why the memory due doesn't form, if it's held back: memories stopped forming at a refusal, or it
@@ -280,7 +289,7 @@ fn quiet(session: &Session, p: u64, cfg: &Config) -> Option<Value> {
 fn l1_request(session: &Session, p: u64, host: &dyn Host, cfg: &Config) -> Option<Request> {
     let (first, last) = span(session, &[(0, p)], cfg);
     let task = [vec![say(MARKER)], raw(session, first, last), vec![say(&INSTRUCTION.replace("{target}", &number(cfg.summary_target_tokens)))]];
-    let request = ask(session, first, task.concat(), host, cfg);
+    let request = ask(session, (1, p), vec![(0, p)], task.concat(), host, cfg);
     let tools_used = request.messages.iter().flat_map(|t| &t.content).any(|b| b.kind == "tool_use" || b.kind == "tool_result");
     (host.carries_tool_blocks() || !tools_used).then_some(request)
 }
@@ -311,14 +320,16 @@ fn merge_request(session: &Session, level: u64, members: &[Node], host: &dyn Hos
     };
     let instruction = MERGE_INSTRUCTION.replace("{seen}", &seen).replace("{level}", &level.to_string()).replace("{target}", &number(cfg.summary_target_tokens));
     shown.push(say(&instruction));
-    ask(session, span(session, members, cfg).0, shown, host, cfg)
+    ask(session, (level, session.count(&format!("layer{level}"))), members.to_vec(), shown, host, cfg)
 }
 
-/// The request for `task`: the head, then recall pairs, oldest first, for the newest unmerged memories
-/// before message `before` that fit the recall budget at their tokens plus 50 (capRecallPairs);
-/// normalized for the provider, images capped; cache seams follow unless the budget left a memory out.
-fn ask(session: &Session, before: u64, task: Vec<Turn>, host: &dyn Host, cfg: &Config) -> Request {
-    let (prior, mut used) = (unmerged(session, before, cfg), 0.0);
+/// The request for `task`, which forms memory `forms` of `members`: the head, then recall pairs, oldest
+/// first, for the newest unmerged memories before the stretch they cover that fit the recall budget at
+/// their tokens plus 50 (capRecallPairs); normalized for the provider, images capped; cache seams follow
+/// unless the budget left a memory out.
+fn ask(session: &Session, forms: Node, members: Vec<Node>, task: Vec<Turn>, host: &dyn Host, cfg: &Config) -> Request {
+    let covers = span(session, &members, cfg);
+    let (prior, mut used) = (unmerged(session, covers.0, cfg), 0.0);
     let fits = |&&(_, tokens): &&(Node, f64)| used + tokens + 50.0 <= cfg.recall_budget_tokens && { used += tokens + 50.0; true };
     let mut kept: Vec<Node> = prior.iter().rev().filter(fits).map(|&(node, _)| node).collect();
     kept.reverse();
@@ -336,6 +347,9 @@ fn ask(session: &Session, before: u64, task: Vec<Turn>, host: &dyn Host, cfg: &C
         max_tokens: cfg.compression_max_tokens.filter(|&c| c > 0.0).unwrap_or_else(|| 16000f64.max(js_round(cfg.summary_target_tokens * 1.5))),
         tools: host.tools().cloned(),
         recalled: kept,
+        forms,
+        members,
+        covers,
     }
 }
 
@@ -598,7 +612,10 @@ mod tests {
         assert_eq!(lifted(&session, 3, &cfg), None);   // three at least, and two wait
         assert_eq!(due(&session, &Config { min_merge_memories: 3, ..cfg.clone() }), Some(((3, 2), vec![(2, 4), (1, 10)])));   // so two, to fold
         // its request: what each merged, one level deeper (L2 4's L1s as recall pairs), and L1 10 as its own recall pair
-        let request = merge_request(&session, 3, &[(2, 4), (1, 10)], &host, &cfg).value(|b| b.at.value()).to_string();
+        let merge = merge_request(&session, 3, &[(2, 4), (1, 10)], &host, &cfg);
+        assert_eq!((merge.forms, &merge.members[..], merge.covers.0), ((3, 2), &[(2, 4), (1, 10)][..], session.read("layer2", 4)["first"].u64()));
+        assert_eq!(merge.covers.1, session.read("layer1", 10)["last"].u64());
+        let request = merge.value(|b| b.at.value()).to_string();
         let at = |needle: &str| request.find(needle).unwrap_or_else(|| panic!("{needle} is not in {request}"));
         let chunk = format!("[\"messages\",{},0]", session.read("layer0", 10)["first"].u64());
         assert!(!request.contains(&chunk), "L1 10's chunk is shown raw: {request}");

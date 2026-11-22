@@ -392,8 +392,17 @@ const PHASES = {
   waiting: () => 'Waiting for the model…', streaming: () => '', asking: () => [...(page.live?.asked.values() ?? [])].some((c) => QUESTIONS.includes(c.tool)) ? 'Waiting for your answers…' : 'Waiting for you to allow or deny the call…', denied: () => 'Denied.',
   running: ({ running }) => running?.tool === 'message' ? `Messaging ${state?.settings?.companion ?? state?.settings?.accompanies ?? 'its partner'}…` : `Running ${running?.tool ?? 'the call'}…`,
   retrying: ({ retry: { n, of, why } }) => `${why.length > 160 ? why.slice(0, 160) + '…' : why}: trying again (${n} of ${of})…`,
-  forming: () => 'Forming memories…', stopping: () => 'Stopping…', ended: () => '',
+  forming: ({ memory }) => memory ? remembering(memory) : 'Forming memories…', stopping: () => 'Stopping…', ended: () => '',
 };
+// a memory forming (Memory in work.rs): which of those due it is, what it holds, and where its request
+// is, the stage's time counted on from what the server last said (`at`, when the page heard it)
+function remembering(m) {
+  const seconds = Math.floor(m.elapsed + (performance.now() - m.at) / 1000);
+  const which = m.of > 1 ? `memory ${m.k} of ${m.of}` : 'a memory';
+  const what = m.level === 1 ? `L1, messages ${m.first}–${m.last}` : `L${m.level} of ${m.merges} memories, messages ${m.first}–${m.last}`;
+  const size = m.stage === 'prefill' ? m.prompt : m.tokens;
+  return `Forming ${which} (${what}): ${m.stage} · ~${size < 10000 ? Math.round(size).toLocaleString() : tokens(size)} tokens · ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
 function status() {
   if (page.error || page.broken) return [page.error || page.broken, true];
   if (!current()) return ['', false];
@@ -1233,6 +1242,7 @@ const until = (at) => {
 };
 const ago = (at) => { const minutes = Math.round((Date.now() / 1000 - at) / 60); return minutes < 1 ? 'just now' : minutes < 120 ? `${minutes} min ago` : `${Math.round(minutes / 60)} h ago`; };
 setInterval(() => state?.limits && draw(), 30000);   // the limits' countdowns go on between events
+setInterval(() => page.live?.memory && page.live.phase === 'forming' && redraw(), 1000);   // and a memory's clock
 // what requests cost, in dollars, if their provider said
 const dollars = (used) => !used ? 'none yet' : used.cost == null ? 'not reported' : '$' + used.cost.toFixed(used.cost < 1 ? 4 : 2);
 
@@ -1728,8 +1738,8 @@ async function watch(name, signal) {
 // at which the page shows them in place of what it had; then each message as it joins the log, and each
 // turn from its start ({"turn"}) to its job's end ({"done"}). A turn (page.live) goes through phases,
 // which the line under the chat shows: waiting for the model, streaming, asking whether a call may run
-// (then running or denied, once answered), running a call, the request tried again, forming memories,
-// ended. Its reply streams in below the log
+// (then running or denied, once answered), running a call, the request tried again, forming memories
+// (each memory's request as it goes: {"memory"}), ended. Its reply streams in below the log
 // until the log has it. A stream that ends unasked (the server restarted) is followed again shortly.
 async function follow(name, signal) {
   let caught = [];   // the log's newest messages, until the page has caught up
@@ -1760,7 +1770,7 @@ async function follow(name, signal) {
       if (!s.running) page.live = null;
     },
     broken: (why) => { page.broken = why; },
-    turn: (job) => { [page.live, page.error] = [{ job, phase: 'waiting', reply: null, asked: new Map(), results: [], running: null, retry: null, ended: false }, null]; },
+    turn: (job) => { [page.live, page.error] = [{ job, phase: 'waiting', reply: null, asked: new Map(), results: [], running: null, retry: null, ended: false, memory: null }, null]; },
     done: () => {
       page.live = null;
       listSessions();
@@ -1800,7 +1810,8 @@ async function follow(name, signal) {
       page.live.results.push(b);
       if (page.live.running?.id === b.toolUseId) page.live.running = null;
     },
-    forming: (forming) => { page.live.phase = forming ? 'forming' : page.live.ended ? 'ended' : 'waiting'; },
+    forming: (forming) => { Object.assign(page.live, { phase: forming ? 'forming' : page.live.ended ? 'ended' : 'waiting', memory: null }); },
+    memory: (memory) => { Object.assign(page.live, { phase: page.live.phase === 'stopping' ? 'stopping' : 'forming', memory: { ...memory, at: performance.now() } }); },
     // the turn has ended (`why` it failed, if it did); its memories form after it
     end: (why) => {
       Object.assign(page.live, { phase: 'ended', reply: null, ended: true });

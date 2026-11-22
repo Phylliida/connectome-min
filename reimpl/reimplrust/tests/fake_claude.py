@@ -30,7 +30,8 @@ had its answer.
 Run with --no-session-persistence, as a memory's run is, it writes what it was run with and told
 (its arguments, CLAUDE_CODE_MAX_OUTPUT_TOKENS, the transcript, when, and the status of a request to
 its ANTHROPIC_BASE_URL, as Claude Code makes them) into claude-memories.jsonl instead, and
-answers with a memory (and reasoning, which isn't the memory's): how many parts the user said in it.
+answers with a memory (and reasoning, which isn't the memory's): how many parts the user said in it,
+streamed in pieces if it's run with --include-partial-messages.
 Each run says the plan's limits as it starts (a rate_limit_event): 26% of the 5-hour window, 7% of the
 7-day one.
 
@@ -223,8 +224,15 @@ if remembering:
     with open('claude-memories.jsonl', 'a') as runs:
         runs.write(json.dumps({'args': args, 'max_tokens': os.environ.get('CLAUDE_CODE_MAX_OUTPUT_TOKENS'), 'transcript': transcript, 'at': time.time(), 'gateway': gateway()}) + '\n')
     memory = f'I remember {transcript.count(chr(10) + "[user]")} parts the user said.'
-    say({'type': 'assistant', 'message': {'id': 'msg_memory', 'role': 'assistant', 'content': [{'type': 'thinking', 'thinking': 'Let me recall.', 'signature': 'c2ln'}]}, 'parent_tool_use_id': None, 'session_id': session})
-    say({'type': 'assistant', 'message': {'id': 'msg_memory', 'role': 'assistant', 'content': [{'type': 'text', 'text': memory}]}, 'parent_tool_use_id': None, 'session_id': session})
+    blocks = [{'type': 'thinking', 'thinking': 'Let me recall.', 'signature': 'c2ln'}, {'type': 'text', 'text': memory}]
+    if '--include-partial-messages' in args:                     # its stream, each block whole after its pieces
+        start(300)
+        for i, block in enumerate(blocks):
+            said = block.get('thinking', block.get('text'))
+            streamed(i, block, [said[:len(said) // 2], said[len(said) // 2:]])
+    else:
+        for block in blocks:
+            say({'type': 'assistant', 'message': {'id': 'msg_memory', 'role': 'assistant', 'content': [block]}, 'parent_tool_use_id': None, 'session_id': session})
     say({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': memory, 'stop_reason': 'end_turn', 'session_id': session, 'total_cost_usd': 0.002,
          'usage': {'input_tokens': 300, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0, 'output_tokens': 20}})
     while inbox.get() is not None:
