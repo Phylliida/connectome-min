@@ -285,11 +285,17 @@ fn l1_request(session: &Session, p: u64, host: &dyn Host, cfg: &Config) -> Optio
 }
 
 /// executeMerge's request for a memory of layer `level` that merges `members`: what they hold, one
-/// level deeper (an L1's chunk's messages raw, a higher memory's members as recall pairs), then the
-/// merge instruction.
+/// level deeper (a higher memory's members as recall pairs), then the merge instruction. An L1 shows
+/// as its own recall pair, not its chunk's messages raw as the library shows it (but under
+/// merge_by_count): a chunk raw is read again in full, 15k tokens at a first run's preset, ~6 minutes
+/// of prefill per member on Kimi-K3.
 fn merge_request(session: &Session, level: u64, members: &[Node], host: &dyn Host, cfg: &Config) -> Request {
     let groups = Recorded::new(session, cfg);
-    let deeper: Vec<Node> = members.iter().flat_map(|&(n, id)| if n == 1 { vec![(0, id)] } else { groups.members((n, id)) }).collect();
+    let deeper: Vec<Node> = members.iter().flat_map(|&(n, id)| match n {
+        1 if cfg.merge_by_count => vec![(0, id)],
+        1 => vec![(1, id)],
+        _ => groups.members((n, id)),
+    }).collect();
     let mut shown: Vec<Turn> = deeper.chunk_by(|a, b| (a.0 == 0) == (b.0 == 0)).flat_map(|run| match run[0].0 {
         0 => { let (first, last) = span(session, run, cfg); raw(session, first, last) }
         _ => pairs(session, run, cfg),
@@ -589,11 +595,12 @@ mod tests {
         assert_eq!(lifted(&session, 2, &Config { target_chunk_tokens: 10.0, ..cfg.clone() }), Some(vec![(2, 4), (1, 10)]));   // two at least
         assert_eq!(lifted(&session, 3, &cfg), None);   // three at least, and two wait
         assert_eq!(due(&session, &Config { min_merge_memories: 3, ..cfg.clone() }), Some(((3, 2), vec![(2, 4), (1, 10)])));   // so two, to fold
-        // its request: what each merged, one level deeper (L2 4's L1s as recall pairs, L1 10's chunk raw)
+        // its request: what each merged, one level deeper (L2 4's L1s as recall pairs), and L1 10 as its own recall pair
         let request = merge_request(&session, 3, &[(2, 4), (1, 10)], &host, &cfg).value(|b| b.at.value()).to_string();
         let at = |needle: &str| request.find(needle).unwrap_or_else(|| panic!("{needle} is not in {request}"));
         let chunk = format!("[\"messages\",{},0]", session.read("layer0", 10)["first"].u64());
-        let order = [at("Recall memory L1-8."), at("Recall memory L1-9."), at(&chunk), at("the L1 memories and the slices of recent experience (raw conversation) above")];
+        assert!(!request.contains(&chunk), "L1 10's chunk is shown raw: {request}");
+        let order = [at("Recall memory L1-8."), at("Recall memory L1-9."), at("Recall memory L1-10."), at("the L1 memories above")];
         assert!(order.is_sorted() && at("a single L3 memory") > order[3], "{request}");
         assert_eq!(drive(&session, &mut host, &cfg), Ok(true));
         assert_eq!(session.read("layer3", 2)["merges"], json!([[2, 4, 4], [1, 10, 10]]));

@@ -13,7 +13,9 @@ autobiographical compaction) and a web app around it.
   has taken yet, short of a group, and with enough layers those and the tail outgrow the window with
   nothing left to fold, so the oldest of them past the top layer's, across layers, the fewest (again at
   least `min_merge_memories`) that hold `target_chunk_tokens`, merge into a memory one layer above the highest it takes (`memory.rs`,
-  `lifted`), even past a memory that keeps failing, which would hold back any other. `merge_by_count` merges `merge_threshold` at a time and never lifts, as the port does
+  `lifted`), even past a memory that keeps failing, which would hold back any other. A merge shows an L1 it takes as the L1's recall pair, not its chunk raw as the library does, so it doesn't
+  read the chunk again (15k tokens at a first run's preset). `merge_by_count` merges `merge_threshold` at a time, shows
+  an L1 as its chunk raw and never lifts, as the port does
   (the differential test runs that way); a memory without `merges` is read as such a group, so a
   session that merged by count goes on by tokens from where it was. The head (`head_window_tokens`, the
   library's `headWindowTokens`; 0 in the library's settings, 10k in a first run's preset): the oldest messages, up to that many tokens, stay raw at
